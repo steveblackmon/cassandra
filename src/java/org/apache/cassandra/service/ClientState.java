@@ -17,71 +17,173 @@
  */
 package org.apache.cassandra.service;
 
-import java.util.*;
+import java.net.SocketAddress;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.commons.lang.StringUtils;
+import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.auth.AuthenticatedUser;
-import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.auth.Resources;
+import org.apache.cassandra.auth.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.cql.CQLStatement;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.thrift.AuthenticationException;
-import org.apache.cassandra.thrift.InvalidRequestException;
+import org.apache.cassandra.cql3.QueryHandler;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.exceptions.AuthenticationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.schema.LegacySchemaTables;
+import org.apache.cassandra.thrift.ThriftValidation;
+import org.apache.cassandra.tracing.TraceKeyspace;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.SemanticVersion;
 
 /**
- * A container for per-client, thread-local state that Avro/Thrift threads must hold.
- * TODO: Kill thrift exceptions
+ * State related to a client connection.
  */
 public class ClientState
 {
-    private static final int MAX_CACHE_PREPARED = 10000;    // Enough to keep buggy clients from OOM'ing us
     private static final Logger logger = LoggerFactory.getLogger(ClientState.class);
-    public static final SemanticVersion DEFAULT_CQL_VERSION = org.apache.cassandra.cql.QueryProcessor.CQL_VERSION;
+    public static final SemanticVersion DEFAULT_CQL_VERSION = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
+
+    private static final Set<IResource> READABLE_SYSTEM_RESOURCES = new HashSet<>();
+    private static final Set<IResource> PROTECTED_AUTH_RESOURCES = new HashSet<>();
+    private static final Set<String> ALTERABLE_SYSTEM_KEYSPACES = new HashSet<>();
+    private static final Set<IResource> DROPPABLE_SYSTEM_TABLES = new HashSet<>();
+    static
+    {
+        // We want these system cfs to be always readable to authenticated users since many tools rely on them
+        // (nodetool, cqlsh, bulkloader, etc.)
+        for (String cf : Iterables.concat(Arrays.asList(SystemKeyspace.LOCAL, SystemKeyspace.PEERS), LegacySchemaTables.ALL))
+            READABLE_SYSTEM_RESOURCES.add(DataResource.table(SystemKeyspace.NAME, cf));
+
+        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthenticator().protectedResources());
+        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());
+        PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());
+
+        // allow users with sufficient privileges to alter KS level options on AUTH_KS and
+        // TRACING_KS, and also to drop legacy tables (users, credentials, permissions) from
+        // AUTH_KS
+        ALTERABLE_SYSTEM_KEYSPACES.add(AuthKeyspace.NAME);
+        ALTERABLE_SYSTEM_KEYSPACES.add(TraceKeyspace.NAME);
+        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(AuthKeyspace.NAME, PasswordAuthenticator.LEGACY_CREDENTIALS_TABLE));
+        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(AuthKeyspace.NAME, CassandraRoleManager.LEGACY_USERS_TABLE));
+        DROPPABLE_SYSTEM_TABLES.add(DataResource.table(AuthKeyspace.NAME, CassandraAuthorizer.USER_PERMISSIONS));
+    }
 
     // Current user for the session
-    private AuthenticatedUser user;
-    private String keyspace;
-    // Reusable array for authorization
-    private final List<Object> resource = new ArrayList<Object>();
-    private SemanticVersion cqlVersion = DEFAULT_CQL_VERSION;
+    private volatile AuthenticatedUser user;
+    private volatile String keyspace;
 
-    // An LRU map of prepared statements
-    private final Map<Integer, CQLStatement> prepared = new LinkedHashMap<Integer, CQLStatement>(16, 0.75f, true) {
-        protected boolean removeEldestEntry(Map.Entry<Integer, CQLStatement> eldest) {
-            return size() > MAX_CACHE_PREPARED;
+    private static final QueryHandler cqlQueryHandler;
+    static
+    {
+        QueryHandler handler = QueryProcessor.instance;
+        String customHandlerClass = System.getProperty("cassandra.custom_query_handler_class");
+        if (customHandlerClass != null)
+        {
+            try
+            {
+                handler = (QueryHandler)FBUtilities.construct(customHandlerClass, "QueryHandler");
+                logger.info("Using {} as query handler for native protocol queries (as requested with -Dcassandra.custom_query_handler_class)", customHandlerClass);
+            }
+            catch (Exception e)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.info("Cannot use class {} as query handler ({}), ignoring by defaulting on normal query handling", customHandlerClass, e.getMessage());
+            }
         }
-    };
+        cqlQueryHandler = handler;
+    }
 
-    private final Map<Integer, org.apache.cassandra.cql3.CQLStatement> cql3Prepared = new LinkedHashMap<Integer, org.apache.cassandra.cql3.CQLStatement>(16, 0.75f, true) {
-        protected boolean removeEldestEntry(Map.Entry<Integer, org.apache.cassandra.cql3.CQLStatement> eldest) {
-            return size() > MAX_CACHE_PREPARED;
-        }
-    };
+    // isInternal is used to mark ClientState as used by some internal component
+    // that should have an ability to modify system keyspace.
+    public final boolean isInternal;
 
-    private long clock;
+    // The remote address of the client - null for internal clients.
+    private final SocketAddress remoteAddress;
+
+    // The biggest timestamp that was returned by getTimestamp/assigned to a query
+    private final AtomicLong lastTimestampMicros = new AtomicLong(0);
 
     /**
-     * Construct a new, empty ClientState: can be reused after logout() or reset().
+     * Construct a new, empty ClientState for internal calls.
      */
-    public ClientState()
+    private ClientState()
     {
-        reset();
+        this.isInternal = true;
+        this.remoteAddress = null;
     }
 
-    public Map<Integer, CQLStatement> getPrepared()
+    protected ClientState(SocketAddress remoteAddress)
     {
-        return prepared;
+        this.isInternal = false;
+        this.remoteAddress = remoteAddress;
+        if (!DatabaseDescriptor.getAuthenticator().requireAuthentication())
+            this.user = AuthenticatedUser.ANONYMOUS_USER;
     }
 
-    public Map<Integer, org.apache.cassandra.cql3.CQLStatement> getCQL3Prepared()
+    /**
+     * @return a ClientState object for internal C* calls (not limited by any kind of auth).
+     */
+    public static ClientState forInternalCalls()
     {
-        return cql3Prepared;
+        return new ClientState();
+    }
+
+    /**
+     * @return a ClientState object for external clients (thrift/native protocol users).
+     */
+    public static ClientState forExternalCalls(SocketAddress remoteAddress)
+    {
+        return new ClientState(remoteAddress);
+    }
+
+    /**
+     * This clock guarantees that updates for the same ClientState will be ordered
+     * in the sequence seen, even if multiple updates happen in the same millisecond.
+     */
+    public long getTimestamp()
+    {
+        while (true)
+        {
+            long current = System.currentTimeMillis() * 1000;
+            long last = lastTimestampMicros.get();
+            long tstamp = last >= current ? last + 1 : current;
+            if (lastTimestampMicros.compareAndSet(last, tstamp))
+                return tstamp;
+        }
+    }
+
+    /**
+     * Can be use when a timestamp has been assigned by a query, but that timestamp is
+     * not directly one returned by getTimestamp() (see SP.beginAndRepairPaxos()).
+     * This ensure following calls to getTimestamp() will return a timestamp strictly
+     * greated than the one provided to this method.
+     */
+    public void updateLastTimestamp(long tstampMicros)
+    {
+        while (true)
+        {
+            long last = lastTimestampMicros.get();
+            if (tstampMicros <= last || lastTimestampMicros.compareAndSet(last, tstampMicros))
+                return;
+        }
+    }
+
+    public static QueryHandler getCQLQueryHandler()
+    {
+        return cqlQueryHandler;
+    }
+
+    public SocketAddress getRemoteAddress()
+    {
+        return remoteAddress;
     }
 
     public String getRawKeyspace()
@@ -92,184 +194,139 @@ public class ClientState
     public String getKeyspace() throws InvalidRequestException
     {
         if (keyspace == null)
-            throw new InvalidRequestException("no keyspace has been specified");
+            throw new InvalidRequestException("No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename");
         return keyspace;
     }
 
     public void setKeyspace(String ks) throws InvalidRequestException
     {
-        if (Schema.instance.getKSMetaData(ks) == null)
+        // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
+        // call set_keyspace() before calling login(), and we have to handle that.
+        if (user != null && Schema.instance.getKSMetaData(ks) == null)
             throw new InvalidRequestException("Keyspace '" + ks + "' does not exist");
         keyspace = ks;
     }
 
-    public String getSchedulingValue()
+    /**
+     * Attempts to login the given user.
+     */
+    public void login(AuthenticatedUser user) throws AuthenticationException
     {
-        switch(DatabaseDescriptor.getRequestSchedulerId())
+        // Login privilege is not inherited via granted roles, so just
+        // verify that the role with the credentials that were actually
+        // supplied has it
+        if (user.isAnonymous() || DatabaseDescriptor.getRoleManager().canLogin(user.getPrimaryRole()))
+            this.user = user;
+        else
+            throw new AuthenticationException(String.format("%s is not permitted to log in", user.getName()));
+    }
+
+    public void hasAllKeyspacesAccess(Permission perm) throws UnauthorizedException
+    {
+        if (isInternal)
+            return;
+        validateLogin();
+        ensureHasPermission(perm, DataResource.root());
+    }
+
+    public void hasKeyspaceAccess(String keyspace, Permission perm) throws UnauthorizedException, InvalidRequestException
+    {
+        hasAccess(keyspace, perm, DataResource.keyspace(keyspace));
+    }
+
+    public void hasColumnFamilyAccess(String keyspace, String columnFamily, Permission perm)
+    throws UnauthorizedException, InvalidRequestException
+    {
+        ThriftValidation.validateColumnFamily(keyspace, columnFamily);
+        hasAccess(keyspace, perm, DataResource.table(keyspace, columnFamily));
+    }
+
+    private void hasAccess(String keyspace, Permission perm, DataResource resource)
+    throws UnauthorizedException, InvalidRequestException
+    {
+        validateKeyspace(keyspace);
+        if (isInternal)
+            return;
+        validateLogin();
+        preventSystemKSSchemaModification(keyspace, resource, perm);
+        if ((perm == Permission.SELECT) && READABLE_SYSTEM_RESOURCES.contains(resource))
+            return;
+        if (PROTECTED_AUTH_RESOURCES.contains(resource))
+            if ((perm == Permission.CREATE) || (perm == Permission.ALTER) || (perm == Permission.DROP))
+                throw new UnauthorizedException(String.format("%s schema is protected", resource));
+        ensureHasPermission(perm, resource);
+    }
+
+    public void ensureHasPermission(Permission perm, IResource resource) throws UnauthorizedException
+    {
+        for (IResource r : Resources.chain(resource))
+            if (authorize(r).contains(perm))
+                return;
+
+        throw new UnauthorizedException(String.format("User %s has no %s permission on %s or any of its parents",
+                                                      user.getName(),
+                                                      perm,
+                                                      resource));
+    }
+
+    private void preventSystemKSSchemaModification(String keyspace, DataResource resource, Permission perm) throws UnauthorizedException
+    {
+        // we only care about schema modification.
+        if (!((perm == Permission.ALTER) || (perm == Permission.DROP) || (perm == Permission.CREATE)))
+            return;
+
+        // prevent system keyspace modification
+        if (SystemKeyspace.NAME.equalsIgnoreCase(keyspace))
+            throw new UnauthorizedException(keyspace + " keyspace is not user-modifiable.");
+
+        // allow users with sufficient privileges to alter KS level options on AUTH_KS and
+        // TRACING_KS, and also to drop legacy tables (users, credentials, permissions) from
+        // AUTH_KS
+        if (ALTERABLE_SYSTEM_KEYSPACES.contains(resource.getKeyspace().toLowerCase())
+           && ((perm == Permission.ALTER && !resource.isKeyspaceLevel())
+               || (perm == Permission.DROP && !DROPPABLE_SYSTEM_TABLES.contains(resource))))
         {
-            case keyspace: return keyspace;
+            throw new UnauthorizedException(String.format("Cannot %s %s", perm, resource));
         }
-        return "default";
     }
 
-    /**
-     * Attempts to login this client with the given credentials map.
-     */
-    public void login(Map<? extends CharSequence,? extends CharSequence> credentials) throws AuthenticationException
-    {
-        AuthenticatedUser user = DatabaseDescriptor.getAuthenticator().authenticate(credentials);
-        if (logger.isDebugEnabled())
-            logger.debug("logged in: {}", user);
-        this.user = user;
-    }
-
-    public void logout()
-    {
-        if (logger.isDebugEnabled())
-            logger.debug("logged out: {}", user);
-        reset();
-    }
-
-    private void resourceClear()
-    {
-        resource.clear();
-        resource.add(Resources.ROOT);
-        resource.add(Resources.KEYSPACES);
-    }
-
-    public void reset()
-    {
-        user = DatabaseDescriptor.getAuthenticator().defaultUser();
-        keyspace = null;
-        resourceClear();
-        prepared.clear();
-        cql3Prepared.clear();
-    }
-
-    /**
-     * Confirms that the client thread has the given Permission for the Keyspace list.
-     */
-    public void hasKeyspaceSchemaAccess(Permission perm) throws InvalidRequestException
-    {
-        validateLogin();
-
-        resourceClear();
-        Set<Permission> perms = DatabaseDescriptor.getAuthority().authorize(user, resource);
-
-        hasAccess(user, perms, perm, resource);
-    }
-
-    /**
-     * Confirms that the client thread has the given Permission for the ColumnFamily list of
-     * the current keyspace.
-     */
-    public void hasColumnFamilySchemaAccess(Permission perm) throws InvalidRequestException
-    {
-        validateLogin();
-        validateKeyspace();
-
-        // hardcode disallowing messing with system keyspace
-        if (keyspace.equalsIgnoreCase(Table.SYSTEM_TABLE) && perm == Permission.WRITE)
-            throw new InvalidRequestException("system keyspace is not user-modifiable");
-
-        resourceClear();
-        resource.add(keyspace);
-        Set<Permission> perms = DatabaseDescriptor.getAuthority().authorize(user, resource);
-
-        hasAccess(user, perms, perm, resource);
-    }
-
-    /**
-     * Confirms that the client thread has the given Permission in the context of the given
-     * ColumnFamily and the current keyspace.
-     */
-    public void hasColumnFamilyAccess(String columnFamily, Permission perm) throws InvalidRequestException
-    {
-        hasColumnFamilyAccess(keyspace, columnFamily, perm);
-    }
-
-    public void hasColumnFamilyAccess(String keyspace, String columnFamily, Permission perm) throws InvalidRequestException
-    {
-        validateLogin();
-        validateKeyspace();
-
-        resourceClear();
-        resource.add(keyspace);
-        resource.add(columnFamily);
-        Set<Permission> perms = DatabaseDescriptor.getAuthority().authorize(user, resource);
-
-        hasAccess(user, perms, perm, resource);
-    }
-
-    private void validateLogin() throws InvalidRequestException
+    public void validateLogin() throws UnauthorizedException
     {
         if (user == null)
-            throw new InvalidRequestException("You have not logged in");
+            throw new UnauthorizedException("You have not logged in");
     }
 
-    private void validateKeyspace() throws InvalidRequestException
+    public void ensureNotAnonymous() throws UnauthorizedException
+    {
+        validateLogin();
+        if (user.isAnonymous())
+            throw new UnauthorizedException("You have to be logged in and not anonymous to perform this request");
+    }
+
+    public void ensureIsSuper(String message) throws UnauthorizedException
+    {
+        if (DatabaseDescriptor.getAuthenticator().requireAuthentication() && (user == null || !user.isSuper()))
+            throw new UnauthorizedException(message);
+    }
+
+    private static void validateKeyspace(String keyspace) throws InvalidRequestException
     {
         if (keyspace == null)
             throw new InvalidRequestException("You have not set a keyspace for this session");
     }
 
-    private static void hasAccess(AuthenticatedUser user, Set<Permission> perms, Permission perm, List<Object> resource) throws InvalidRequestException
+    public AuthenticatedUser getUser()
     {
-        if (perms.contains(perm))
-            return;
-        throw new InvalidRequestException(String.format("%s does not have permission %s for %s",
-                                                        user,
-                                                        perm,
-                                                        Resources.toString(resource)));
-    }
-
-    /**
-     * This clock guarantees that updates from a given client will be ordered in the sequence seen,
-     * even if multiple updates happen in the same millisecond.  This can be useful when a client
-     * wants to perform multiple updates to a single column.
-     */
-    public long getTimestamp()
-    {
-        long current = System.currentTimeMillis() * 1000;
-        clock = clock >= current ? clock + 1 : current;
-        return clock;
-    }
-
-    public void setCQLVersion(String str) throws InvalidRequestException
-    {
-        SemanticVersion version;
-        try
-        {
-            version = new SemanticVersion(str);
-        }
-        catch (IllegalArgumentException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-
-        SemanticVersion cql = org.apache.cassandra.cql.QueryProcessor.CQL_VERSION;
-        SemanticVersion cql3 = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
-
-        if (version.isSupportedBy(cql))
-            cqlVersion = cql;
-        else if (version.isSupportedBy(cql3))
-            cqlVersion = cql3;
-        else
-            throw new InvalidRequestException(String.format("Provided version %s is not supported by this server (supported: %s)",
-                                                            version,
-                                                            StringUtils.join(getCQLSupportedVersion(), ", ")));
-    }
-
-    public SemanticVersion getCQLVersion()
-    {
-        return cqlVersion;
+        return user;
     }
 
     public static SemanticVersion[] getCQLSupportedVersion()
     {
-        SemanticVersion cql = org.apache.cassandra.cql.QueryProcessor.CQL_VERSION;
-        SemanticVersion cql3 = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
+        return new SemanticVersion[]{ QueryProcessor.CQL_VERSION };
+    }
 
-        return new SemanticVersion[]{ cql, cql3 };
+    private Set<Permission> authorize(IResource resource)
+    {
+        return AuthenticatedUser.getPermissions(user, resource);
     }
 }

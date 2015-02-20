@@ -25,12 +25,18 @@ import java.util.Map;
 
 import com.google.common.collect.ImmutableMap;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.FileUtils;
 
 public class MessageIn<T>
 {
+    private static final Logger logger = LoggerFactory.getLogger(MessageIn.class);
+
     public final InetAddress from;
     public final T payload;
     public final Map<String, byte[]> parameters;
@@ -51,7 +57,7 @@ public class MessageIn<T>
         return new MessageIn<T>(from, payload, parameters, verb, version);
     }
 
-    public static <T2> MessageIn<T2> read(DataInput in, int version, String id) throws IOException
+    public static <T2> MessageIn<T2> read(DataInput in, int version, int id) throws IOException
     {
         InetAddress from = CompactEndpointSerializationHelper.deserialize(in);
 
@@ -99,9 +105,24 @@ public class MessageIn<T>
         return MessagingService.verbStages.get(verb);
     }
 
+    public boolean doCallbackOnFailure()
+    {
+        return parameters.containsKey(MessagingService.FAILURE_CALLBACK_PARAM);
+    }
+
+    public boolean isFailureResponse()
+    {
+        return parameters.containsKey(MessagingService.FAILURE_RESPONSE_PARAM);
+    }
+
+    public long getTimeout()
+    {
+        return DatabaseDescriptor.getTimeout(verb);
+    }
+
     public String toString()
     {
-        StringBuilder sbuf = new StringBuilder("");
+        StringBuilder sbuf = new StringBuilder();
         sbuf.append("FROM:").append(from).append(" TYPE:").append(getMessageType()).append(" VERB:").append(verb);
         return sbuf.toString();
     }

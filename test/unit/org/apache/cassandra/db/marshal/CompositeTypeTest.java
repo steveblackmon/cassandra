@@ -19,25 +19,30 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 import static org.junit.Assert.fail;
+import static org.junit.Assert.assertEquals;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.composites.CellNames;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.*;
 
-public class CompositeTypeTest extends SchemaLoader
+public class CompositeTypeTest
 {
-    private static final String cfName = "StandardComposite";
+    private static final String KEYSPACE1 = "CompositeTypeTest";
+    private static final String CF_STANDARDCOMPOSITE = "StandardComposite";
     private static final CompositeType comparator;
     static
     {
@@ -46,7 +51,6 @@ public class CompositeTypeTest extends SchemaLoader
         subComparators.add(TimeUUIDType.instance);
         subComparators.add(IntegerType.instance);
         comparator = CompositeType.getInstance(subComparators);
-
     }
 
     private static final int UUID_COUNT = 3;
@@ -54,7 +58,18 @@ public class CompositeTypeTest extends SchemaLoader
     static
     {
         for (int i = 0; i < UUID_COUNT; ++i)
-            uuids[i] = UUIDGen.makeType1UUIDFromHost(FBUtilities.getBroadcastAddress());
+            uuids[i] = UUIDGen.getTimeUUID();
+    }
+
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        AbstractType<?> composite = CompositeType.getInstance(Arrays.asList(new AbstractType<?>[]{BytesType.instance, TimeUUIDType.instance, IntegerType.instance}));
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    CFMetaData.denseCFMetaData(KEYSPACE1, CF_STANDARDCOMPOSITE, composite));
     }
 
     @Test
@@ -144,7 +159,7 @@ public class CompositeTypeTest extends SchemaLoader
         }
         catch (MarshalException e)
         {
-            assert e.toString().contains("TimeUUID should be 16 or 0 bytes");
+            assert e.toString().contains("should be 16 or 0 bytes");
         }
 
         key = createCompositeKey("test1", UUID.randomUUID(), 42, false);
@@ -162,8 +177,8 @@ public class CompositeTypeTest extends SchemaLoader
     @Test
     public void testFullRound() throws Exception
     {
-        Table table = Table.open("Keyspace1");
-        ColumnFamilyStore cfs = table.getColumnFamilyStore(cfName);
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARDCOMPOSITE);
 
         ByteBuffer cname1 = createCompositeKey("test1", null, -1, false);
         ByteBuffer cname2 = createCompositeKey("test1", uuids[0], 24, false);
@@ -172,23 +187,23 @@ public class CompositeTypeTest extends SchemaLoader
         ByteBuffer cname5 = createCompositeKey("test2", uuids[1], 42, false);
 
         ByteBuffer key = ByteBufferUtil.bytes("k");
-        RowMutation rm = new RowMutation("Keyspace1", key);
+        Mutation rm = new Mutation(KEYSPACE1, key);
         addColumn(rm, cname5);
         addColumn(rm, cname1);
         addColumn(rm, cname4);
         addColumn(rm, cname2);
         addColumn(rm, cname3);
-        rm.apply();
+        rm.applyUnsafe();
 
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("k"), new QueryPath(cfName, null, null)));
+        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("k"), CF_STANDARDCOMPOSITE, System.currentTimeMillis()));
 
-        Iterator<IColumn> iter = cf.getSortedColumns().iterator();
+        Iterator<Cell> iter = cf.getSortedColumns().iterator();
 
-        assert iter.next().name().equals(cname1);
-        assert iter.next().name().equals(cname2);
-        assert iter.next().name().equals(cname3);
-        assert iter.next().name().equals(cname4);
-        assert iter.next().name().equals(cname5);
+        assert iter.next().name().toByteBuffer().equals(cname1);
+        assert iter.next().name().toByteBuffer().equals(cname2);
+        assert iter.next().name().toByteBuffer().equals(cname3);
+        assert iter.next().name().toByteBuffer().equals(cname4);
+        assert iter.next().name().toByteBuffer().equals(cname5);
     }
 
     @Test
@@ -200,6 +215,7 @@ public class CompositeTypeTest extends SchemaLoader
             fail("Shouldn't work");
         }
         catch (ConfigurationException e) {}
+        catch (SyntaxException e) {}
 
         try
         {
@@ -207,6 +223,7 @@ public class CompositeTypeTest extends SchemaLoader
             fail("Shouldn't work");
         }
         catch (ConfigurationException e) {}
+        catch (SyntaxException e) {}
     }
 
     @Test
@@ -220,9 +237,41 @@ public class CompositeTypeTest extends SchemaLoader
         assert !TypeParser.parse("CompositeType(IntegerType)").isCompatibleWith(TypeParser.parse("CompositeType(BytesType)"));
     }
 
-    private void addColumn(RowMutation rm, ByteBuffer cname)
+    @Test
+    public void testEscapeUnescape()
     {
-        rm.add(new QueryPath(cfName, null , cname), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+        List<AbstractType<?>> subComparators = new ArrayList<AbstractType<?>>(){{;
+            add(UTF8Type.instance);
+            add(UTF8Type.instance);
+        }};
+        CompositeType comp = CompositeType.getInstance(subComparators);
+
+        String[][] inputs = new String[][]{
+            new String[]{ "foo", "bar" },
+            new String[]{ "", "" },
+            new String[]{ "foo\\", "bar" },
+            new String[]{ "foo\\:", "bar" },
+            new String[]{ "foo:", "bar" },
+            new String[]{ "foo", "b:ar" },
+            new String[]{ "foo!", "b:ar" },
+        };
+
+        for (String[] input : inputs)
+        {
+            CompositeType.Builder builder = new CompositeType.Builder(comp);
+            for (String part : input)
+                builder.add(UTF8Type.instance.fromString(part));
+
+            ByteBuffer value = comp.fromString(comp.getString(builder.build()));
+            ByteBuffer[] splitted = comp.split(value);
+            for (int i = 0; i < splitted.length; i++)
+                assertEquals(input[i], UTF8Type.instance.getString(splitted[i]));
+        }
+    }
+
+    private void addColumn(Mutation rm, ByteBuffer cname)
+    {
+        rm.add(CF_STANDARDCOMPOSITE, CellNames.simpleDense(cname), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
     }
 
     private ByteBuffer createCompositeKey(String s, UUID uuid, int i, boolean lastIsOne)

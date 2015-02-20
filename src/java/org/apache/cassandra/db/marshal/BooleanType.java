@@ -19,62 +19,54 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.cql.jdbc.JdbcBoolean;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.BooleanSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class BooleanType extends AbstractType<Boolean>
 {
-  public static final BooleanType instance = new BooleanType();
+    private static final Logger logger = LoggerFactory.getLogger(BooleanType.class);
 
-  BooleanType() {} // singleton
+    public static final BooleanType instance = new BooleanType();
 
-  public Boolean compose(ByteBuffer bytes)
-  {
-      return JdbcBoolean.instance.compose(bytes);
-  }
+    BooleanType() {} // singleton
 
-  public ByteBuffer decompose(Boolean value)
-  {
-      return JdbcBoolean.instance.decompose(value);
-  }
+    public int compare(ByteBuffer o1, ByteBuffer o2)
+    {
+        if (!o1.hasRemaining() || !o2.hasRemaining())
+            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
 
-  public int compare(ByteBuffer o1, ByteBuffer o2)
-  {
-      if ((o1 == null) || (o1.remaining() != 1))
-        return ((o2 == null) || (o2.remaining() != 1)) ? 0 : -1;
-      if ((o2 == null) || (o2.remaining() != 1))
-        return 1;
+        // False is 0, True is anything else, makes False sort before True.
+        byte b1 = o1.get(o1.position());
+        byte b2 = o2.get(o2.position());
+        if (b1 == 0)
+            return b2 == 0 ? 0 : -1;
+        return b2 == 0 ? 1 : 0;
+    }
 
-      return o1.compareTo(o2);
-  }
+    public ByteBuffer fromString(String source) throws MarshalException
+    {
 
-  public String getString(ByteBuffer bytes)
-  {
-      try
-      {
-          return JdbcBoolean.instance.getString(bytes);
-      }
-      catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-      {
-          throw new MarshalException(e.getMessage());
-      }
-  }
+        if (source.isEmpty()|| source.equalsIgnoreCase(Boolean.FALSE.toString()))
+            return decompose(false);
 
-  public ByteBuffer fromString(String source) throws MarshalException
-  {
+        if (source.equalsIgnoreCase(Boolean.TRUE.toString()))
+            return decompose(true);
 
-      if (source.isEmpty()|| source.equalsIgnoreCase(Boolean.FALSE.toString()))
-          return decompose(false);
+        throw new MarshalException(String.format("unable to make boolean from '%s'", source));
+    }
 
-      if (source.equalsIgnoreCase(Boolean.TRUE.toString()))
-          return decompose(true);
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.BOOLEAN;
+    }
 
-      throw new MarshalException(String.format("unable to make boolean from '%s'", source));
-
- }
-
-  public void validate(ByteBuffer bytes) throws MarshalException
-  {
-      if (bytes.remaining() != 1 && bytes.remaining() != 0)
-          throw new MarshalException(String.format("Expected 1 or 0 byte value (%d)", bytes.remaining()));
-  }
+    public TypeSerializer<Boolean> getSerializer()
+    {
+        return BooleanSerializer.instance;
+    }
 }

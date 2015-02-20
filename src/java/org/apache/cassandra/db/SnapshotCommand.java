@@ -18,10 +18,10 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 
@@ -59,20 +59,20 @@ public class SnapshotCommand
 
 class SnapshotCommandSerializer implements IVersionedSerializer<SnapshotCommand>
 {
-    public void serialize(SnapshotCommand snapshot_command, DataOutput dos, int version) throws IOException
+    public void serialize(SnapshotCommand snapshot_command, DataOutputPlus out, int version) throws IOException
     {
-        dos.writeUTF(snapshot_command.keyspace);
-        dos.writeUTF(snapshot_command.column_family);
-        dos.writeUTF(snapshot_command.snapshot_name);
-        dos.writeBoolean(snapshot_command.clear_snapshot);
+        out.writeUTF(snapshot_command.keyspace);
+        out.writeUTF(snapshot_command.column_family);
+        out.writeUTF(snapshot_command.snapshot_name);
+        out.writeBoolean(snapshot_command.clear_snapshot);
     }
 
-    public SnapshotCommand deserialize(DataInput dis, int version) throws IOException
+    public SnapshotCommand deserialize(DataInput in, int version) throws IOException
     {
-        String keyspace = dis.readUTF();
-        String column_family = dis.readUTF();
-        String snapshot_name = dis.readUTF();
-        boolean clear_snapshot = dis.readBoolean();
+        String keyspace = in.readUTF();
+        String column_family = in.readUTF();
+        String snapshot_name = in.readUTF();
+        boolean clear_snapshot = in.readBoolean();
         return new SnapshotCommand(keyspace, column_family, snapshot_name, clear_snapshot);
     }
 

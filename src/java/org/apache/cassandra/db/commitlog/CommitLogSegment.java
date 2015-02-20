@@ -18,17 +18,24 @@
 package org.apache.cassandra.db.commitlog;
 
 import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.channels.FileChannel;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.zip.Checksum;
-import java.util.HashMap;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,13 +43,16 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamily;
-import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.CLibrary;
 import org.apache.cassandra.utils.PureJavaCrc32;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.WaitQueue;
 
 /*
- * A single commit log file on disk. Manages creation of the file and writing row mutations to disk,
+ * A single commit log file on disk. Manages creation of the file and writing mutations to disk,
  * as well as tracking the last mutation position of any "dirty" CFs covered by the segment file. Segment
  * files are initially allocated to a fixed size and can grow to accomidate a larger value if necessary.
  */
@@ -50,32 +60,69 @@ public class CommitLogSegment
 {
     private static final Logger logger = LoggerFactory.getLogger(CommitLogSegment.class);
 
-    static final String FILENAME_PREFIX = "CommitLog-";
-    static final String FILENAME_EXTENSION = ".log";
-    private static final Pattern COMMIT_LOG_FILE_PATTERN = Pattern.compile(FILENAME_PREFIX + "(\\d+)" + FILENAME_EXTENSION);
+    private final static long idBase;
+    private final static AtomicInteger nextId = new AtomicInteger(1);
+    static
+    {
+        long maxId = Long.MIN_VALUE;
+        for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).listFiles())
+        {
+            if (CommitLogDescriptor.isValid(file.getName()))
+                maxId = Math.max(CommitLogDescriptor.fromFileName(file.getName()).id, maxId);
+        }
+        idBase = Math.max(System.currentTimeMillis(), maxId + 1);
+    }
 
-    // The commit log entry overhead in bytes (int: length + long: head checksum + long: tail checksum)
-    static final int ENTRY_OVERHEAD_SIZE = 4 + 8 + 8;
+    // The commit log entry overhead in bytes (int: length + int: head checksum + int: tail checksum)
+    public static final int ENTRY_OVERHEAD_SIZE = 4 + 4 + 4;
 
-    // cache which cf is dirty in this segment to avoid having to lookup all ReplayPositions to decide if we can delete this segment
-    private final HashMap<Integer, Integer> cfLastWrite = new HashMap<Integer, Integer>();
+    // The commit log (chained) sync marker/header size in bytes (int: length + int: checksum [segmentId, position])
+    static final int SYNC_MARKER_SIZE = 4 + 4;
+
+    // The OpOrder used to order appends wrt sync
+    private final OpOrder appendOrder = new OpOrder();
+
+    private final AtomicInteger allocatePosition = new AtomicInteger();
+
+    // Everything before this offset has been synced and written.  The SYNC_MARKER_SIZE bytes after
+    // each sync are reserved, and point forwards to the next such offset.  The final
+    // sync marker in a segment will be zeroed out, or point to EOF.
+    private volatile int lastSyncedOffset;
+
+    // the amount of the tail of the file we have allocated but not used - this is used when we discard a log segment
+    // to ensure nobody writes to it after we've decided we're done with it
+    private int discardedTailFrom;
+
+    // a signal for writers to wait on to confirm the log message they provided has been written to disk
+    private final WaitQueue syncComplete = new WaitQueue();
+
+    // a map of Cf->dirty position; this is used to permit marking Cfs clean whilst the log is still in use
+    private final NonBlockingHashMap<UUID, AtomicInteger> cfDirty = new NonBlockingHashMap<>(1024);
+
+    // a map of Cf->clean position; this is used to permit marking Cfs clean whilst the log is still in use
+    private final ConcurrentHashMap<UUID, AtomicInteger> cfClean = new ConcurrentHashMap<>();
 
     public final long id;
 
     private final File logFile;
-    private final RandomAccessFile logFileAccessor;
-
-    private boolean needsSync = false;
+    private final FileChannel channel;
+    private final int fd;
 
     private final MappedByteBuffer buffer;
-    private boolean closed;
+
+    public final CommitLogDescriptor descriptor;
 
     /**
      * @return a newly minted segment file
      */
-    public static CommitLogSegment freshSegment()
+    static CommitLogSegment freshSegment()
     {
         return new CommitLogSegment(null);
+    }
+
+    static long getNextId()
+    {
+        return idBase + nextId.getAndIncrement();
     }
 
     /**
@@ -85,9 +132,9 @@ public class CommitLogSegment
      */
     CommitLogSegment(String filePath)
     {
-        id = System.nanoTime();
-        logFile = new File(DatabaseDescriptor.getCommitLogLocation(), FILENAME_PREFIX + id + FILENAME_EXTENSION);
-        boolean isCreating = true;
+        id = getNextId();
+        descriptor = new CommitLogDescriptor(id);
+        logFile = new File(DatabaseDescriptor.getCommitLogLocation(), descriptor.fileName());
 
         try
         {
@@ -100,78 +147,212 @@ public class CommitLogSegment
                     logger.debug("Re-using discarded CommitLog segment for {} from {}", id, filePath);
                     if (!oldFile.renameTo(logFile))
                         throw new IOException("Rename from " + filePath + " to " + id + " failed");
-                    isCreating = false;
+                }
+                else
+                {
+                    logger.debug("Creating new CommitLog segment: {}", logFile);
                 }
             }
 
-            // Open the initial the segment file
-            logFileAccessor = new RandomAccessFile(logFile, "rw");
+            // Extend or truncate the file size to the standard segment size as we may have restarted after a segment
+            // size configuration change, leaving "incorrectly" sized segments on disk.
+            // NOTE: while we're using RAF to easily adjust file size, we need to avoid using RAF
+            // for grabbing the FileChannel due to FILE_SHARE_DELETE flag bug on windows.
+            // See: https://bugs.openjdk.java.net/browse/JDK-6357433 and CASSANDRA-8308
+            if (logFile.length() != DatabaseDescriptor.getCommitLogSegmentSize())
+            {
+                try (RandomAccessFile raf = new RandomAccessFile(logFile, "rw"))
+                {
+                    raf.setLength(DatabaseDescriptor.getCommitLogSegmentSize());
+                }
+                catch (IOException e)
+                {
+                    throw new FSWriteError(e, logFile);
+                }
+            }
 
-            if (isCreating)
-                logger.debug("Creating new commit log segment {}", logFile.getPath());
+            channel = FileChannel.open(logFile.toPath(), StandardOpenOption.WRITE, StandardOpenOption.READ);
 
-            // Map the segment, extending or truncating it to the standard segment size
-            logFileAccessor.setLength(DatabaseDescriptor.getCommitLogSegmentSize());
+            fd = CLibrary.getfd(channel);
+            buffer = channel.map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
 
-            buffer = logFileAccessor.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
-            buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
-            buffer.position(0);
+            CommitLogDescriptor.writeHeader(buffer, descriptor);
 
-            needsSync = true;
+            // mark the initial sync marker as uninitialised
+            buffer.putInt(CommitLogDescriptor.HEADER_SIZE, 0);
+            buffer.putLong(CommitLogDescriptor.HEADER_SIZE + 4, 0);
+            allocatePosition.set(CommitLogDescriptor.HEADER_SIZE + SYNC_MARKER_SIZE);
+            lastSyncedOffset = CommitLogDescriptor.HEADER_SIZE;
         }
         catch (IOException e)
         {
-            throw new IOError(e);
+            throw new FSWriteError(e, logFile);
         }
     }
 
     /**
-     * Extracts the commit log ID from filename
-     *
-     * @param   filename  the filename of the commit log file
-     * @return the extracted commit log ID
+     * Allocate space in this buffer for the provided mutation, and return the allocated Allocation object.
+     * Returns null if there is not enough space in this segment, and a new segment is needed.
      */
-    public static long idFromFilename(String filename)
+    Allocation allocate(Mutation mutation, int size)
     {
-        Matcher matcher = COMMIT_LOG_FILE_PATTERN.matcher(filename);
+        final OpOrder.Group opGroup = appendOrder.start();
         try
         {
-            if (matcher.matches())
-                return Long.valueOf(matcher.group(1));
-            else
-                return -1L;
+            int position = allocate(size);
+            if (position < 0)
+            {
+                opGroup.close();
+                return null;
+            }
+            markDirty(mutation, position);
+            return new Allocation(this, opGroup, position, (ByteBuffer) buffer.duplicate().position(position).limit(position + size));
         }
-        catch (NumberFormatException e)
+        catch (Throwable t)
         {
-            return -1L;
+            opGroup.close();
+            throw t;
+        }
+    }
+
+    // allocate bytes in the segment, or return -1 if not enough space
+    private int allocate(int size)
+    {
+        while (true)
+        {
+            int prev = allocatePosition.get();
+            int next = prev + size;
+            if (next >= buffer.capacity())
+                return -1;
+            if (allocatePosition.compareAndSet(prev, next))
+                return prev;
+        }
+    }
+
+    // ensures no more of this segment is writeable, by allocating any unused section at the end and marking it discarded
+    void discardUnusedTail()
+    {
+        // we guard this with the OpOrdering instead of synchronised due to potential dead-lock with CLSM.advanceAllocatingFrom()
+        // this actually isn't strictly necessary, as currently all calls to discardUnusedTail occur within a block
+        // already protected by this OpOrdering, but to prevent future potential mistakes, we duplicate the protection here
+        // so that the contract between discardUnusedTail() and sync() is more explicit.
+        try (OpOrder.Group group = appendOrder.start())
+        {
+            while (true)
+            {
+                int prev = allocatePosition.get();
+                // we set allocatePosition past buffer.capacity() to make sure we always set discardedTailFrom
+                int next = buffer.capacity() + 1;
+                if (prev == next)
+                    return;
+                if (allocatePosition.compareAndSet(prev, next))
+                {
+                    discardedTailFrom = prev;
+                    return;
+                }
+            }
         }
     }
 
     /**
-     * @param   filename  the filename to check
-     * @return true if filename could be a commit log based on it's filename
+     * Wait for any appends or discardUnusedTail() operations started before this method was called
      */
-    public static boolean possibleCommitLogFile(String filename)
+    void waitForModifications()
     {
-        return COMMIT_LOG_FILE_PATTERN.matcher(filename).matches();
+        // issue a barrier and wait for it
+        appendOrder.awaitNewBarrier();
+    }
+
+    /**
+     * Forces a disk flush for this segment file.
+     */
+    synchronized void sync()
+    {
+        try
+        {
+            // check we have more work to do
+            if (allocatePosition.get() <= lastSyncedOffset + SYNC_MARKER_SIZE)
+                return;
+
+            // allocate a new sync marker; this is both necessary in itself, but also serves to demarcate
+            // the point at which we can safely consider records to have been completely written to
+            int nextMarker;
+            nextMarker = allocate(SYNC_MARKER_SIZE);
+            boolean close = false;
+            if (nextMarker < 0)
+            {
+                // ensure no more of this CLS is writeable, and mark ourselves for closing
+                discardUnusedTail();
+                close = true;
+
+                // wait for modifications guards both discardedTailFrom, and any outstanding appends
+                waitForModifications();
+
+                if (discardedTailFrom < buffer.capacity() - SYNC_MARKER_SIZE)
+                {
+                    // if there's room in the discard section to write an empty header, use that as the nextMarker
+                    nextMarker = discardedTailFrom;
+                }
+                else
+                {
+                    // not enough space left in the buffer, so mark the next sync marker as the EOF position
+                    nextMarker = buffer.capacity();
+                }
+            }
+            else
+            {
+                waitForModifications();
+            }
+
+            assert nextMarker > lastSyncedOffset;
+
+            // write previous sync marker to point to next sync marker
+            // we don't chain the crcs here to ensure this method is idempotent if it fails
+            int offset = lastSyncedOffset;
+            final PureJavaCrc32 crc = new PureJavaCrc32();
+            crc.updateInt((int) (id & 0xFFFFFFFFL));
+            crc.updateInt((int) (id >>> 32));
+            crc.updateInt(offset);
+            buffer.putInt(offset, nextMarker);
+            buffer.putInt(offset + 4, crc.getCrc());
+
+            // zero out the next sync marker so replayer can cleanly exit
+            if (nextMarker < buffer.capacity())
+            {
+                buffer.putInt(nextMarker, 0);
+                buffer.putInt(nextMarker + 4, 0);
+            }
+
+            // actually perform the sync and signal those waiting for it
+            buffer.force();
+
+            if (close)
+                nextMarker = buffer.capacity();
+
+            lastSyncedOffset = nextMarker;
+            syncComplete.signalAll();
+
+            CLibrary.trySkipCache(fd, offset, nextMarker);
+            if (close)
+                internalClose();
+        }
+        catch (Exception e) // MappedByteBuffer.force() does not declare IOException but can actually throw it
+        {
+            throw new FSWriteError(e, getPath());
+        }
+    }
+
+    public boolean isStillAllocating()
+    {
+        return allocatePosition.get() < buffer.capacity();
     }
 
     /**
      * Completely discards a segment file by deleting it. (Potentially blocking operation)
      */
-    public void discard(boolean deleteFile)
+    void delete()
     {
-        // TODO shouldn't we close the file when we're done writing to it, which comes (potentially) much earlier than it's eligible for recyling?
-        close();
-        try
-        {
-            if (deleteFile)
-                FileUtils.deleteWithConfirm(logFile);
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+       FileUtils.deleteWithConfirm(logFile);
     }
 
     /**
@@ -179,21 +360,16 @@ public class CommitLogSegment
      *
      * @return a new CommitLogSegment representing the newly reusable segment.
      */
-    public CommitLogSegment recycle()
+    CommitLogSegment recycle()
     {
-        // writes an end-of-segment marker at the very beginning of the file and closes it
-        buffer.position(0);
-        buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
-        buffer.position(0);
-
         try
         {
             sync();
         }
-        catch (IOException e)
+        catch (FSWriteError e)
         {
-            // This is a best effort thing anyway
-            logger.warn("I/O error flushing " + this + " " + e);
+            logger.error("I/O error flushing {} {}", this, e.getMessage());
+            throw e;
         }
 
         close();
@@ -202,87 +378,11 @@ public class CommitLogSegment
     }
 
     /**
-     * @return true if there is room to write() @param mutation to this segment
-     */
-    public boolean hasCapacityFor(RowMutation mutation)
-    {
-        long totalSize = RowMutation.serializer.serializedSize(mutation, MessagingService.current_version) + ENTRY_OVERHEAD_SIZE;
-        return totalSize <= buffer.remaining();
-    }
-
-    /**
-     * mark all of the column families we're modifying as dirty at this position
-     */
-    private void markDirty(RowMutation rowMutation, ReplayPosition repPos)
-    {
-        for (ColumnFamily columnFamily : rowMutation.getColumnFamilies())
-        {
-            // check for null cfm in case a cl write goes through after the cf is
-            // defined but before a new segment is created.
-            CFMetaData cfm = Schema.instance.getCFMetaData(columnFamily.id());
-            if (cfm == null)
-            {
-                logger.error("Attempted to write commit log entry for unrecognized column family: " + columnFamily.id());
-            }
-            else
-            {
-                markCFDirty(cfm.cfId, repPos.position);
-            }
-        }
-    }
-
-   /**
-     * Appends a row mutation onto the commit log.  Requres that hasCapacityFor has already been checked.
-     *
-     * @param   rowMutation   the mutation to append to the commit log.
-     * @return  the position of the appended mutation
-     */
-    public ReplayPosition write(RowMutation rowMutation) throws IOException
-    {
-        assert !closed;
-        ReplayPosition repPos = getContext();
-        markDirty(rowMutation, repPos);
-
-        Checksum checksum = new PureJavaCrc32();
-        byte[] serializedRow = rowMutation.getSerializedBuffer(MessagingService.current_version);
-
-        checksum.update(serializedRow.length);
-        buffer.putInt(serializedRow.length);
-        buffer.putLong(checksum.getValue());
-
-        buffer.put(serializedRow);
-        checksum.update(serializedRow, 0, serializedRow.length);
-        buffer.putLong(checksum.getValue());
-
-        if (buffer.remaining() >= 4)
-        {
-            // writes end of segment marker and rewinds back to position where it starts
-            buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
-            buffer.position(buffer.position() - CommitLog.END_OF_SEGMENT_MARKER_SIZE);
-        }
-
-        needsSync = true;
-        return repPos;
-    }
-
-    /**
-     * Forces a disk flush for this segment file.
-     */
-    public void sync() throws IOException
-    {
-        if (needsSync)
-        {
-            buffer.force();
-            needsSync = false;
-        }
-    }
-
-    /**
      * @return the current ReplayPosition for this log segment
      */
     public ReplayPosition getContext()
     {
-        return new ReplayPosition(id, buffer.position());
+        return new ReplayPosition(id, allocatePosition.get());
     }
 
     /**
@@ -301,34 +401,59 @@ public class CommitLogSegment
         return logFile.getName();
     }
 
-    /**
-     * Close the segment file.
-     */
-    public void close()
+    void waitForFinalSync()
     {
-        if (closed)
-            return;
-
-        try
+        while (true)
         {
-            logFileAccessor.close();
-            closed = true;
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
+            WaitQueue.Signal signal = syncComplete.register();
+            if (lastSyncedOffset < buffer.capacity())
+            {
+                signal.awaitUninterruptibly();
+            }
+            else
+            {
+                signal.cancel();
+                break;
+            }
         }
     }
 
     /**
-     * Records the CF as dirty at a certain position.
-     *
-     * @param cfId      the column family ID that is now dirty
-     * @param position  the position the last write for this CF was written at
+     * Close the segment file.
      */
-    private void markCFDirty(Integer cfId, Integer position)
+    synchronized void close()
     {
-        cfLastWrite.put(cfId, position);
+        discardUnusedTail();
+        waitForModifications();
+        lastSyncedOffset = buffer.capacity();
+        internalClose();
+    }
+
+    void internalClose()
+    {
+        try
+        {
+            if (FileUtils.isCleanerAvailable())
+                FileUtils.clean(buffer);
+            channel.close();
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
+    }
+
+    void markDirty(Mutation mutation, int allocatedPosition)
+    {
+        for (ColumnFamily columnFamily : mutation.getColumnFamilies())
+        {
+            // check for deleted CFS
+            CFMetaData cfm = columnFamily.metadata();
+            if (cfm.isPurged())
+                logger.error("Attempted to write commit log entry for unrecognized table: {}", columnFamily.id());
+            else
+                ensureAtleast(cfDirty, cfm.cfId, allocatedPosition);
+        }
     }
 
     /**
@@ -339,30 +464,94 @@ public class CommitLogSegment
      * @param cfId    the column family ID that is now clean
      * @param context the optional clean offset
      */
-    public void markClean(Integer cfId, ReplayPosition context)
+    public synchronized void markClean(UUID cfId, ReplayPosition context)
     {
-        Integer lastWritten = cfLastWrite.get(cfId);
+        if (!cfDirty.containsKey(cfId))
+            return;
+        if (context.segment == id)
+            markClean(cfId, context.position);
+        else if (context.segment > id)
+            markClean(cfId, Integer.MAX_VALUE);
+    }
 
-        if (lastWritten != null && (!contains(context) || lastWritten < context.position))
+    private void markClean(UUID cfId, int position)
+    {
+        ensureAtleast(cfClean, cfId, position);
+        removeCleanFromDirty();
+    }
+
+    private static void ensureAtleast(ConcurrentMap<UUID, AtomicInteger> map, UUID cfId, int value)
+    {
+        AtomicInteger i = map.get(cfId);
+        if (i == null)
         {
-            cfLastWrite.remove(cfId);
+            AtomicInteger i2 = map.putIfAbsent(cfId, i = new AtomicInteger());
+            if (i2 != null)
+                i = i2;
+        }
+        while (true)
+        {
+            int cur = i.get();
+            if (cur > value)
+                break;
+            if (i.compareAndSet(cur, value))
+                break;
+        }
+    }
+
+    private void removeCleanFromDirty()
+    {
+        // if we're still allocating from this segment, don't touch anything since it can't be done thread-safely
+        if (isStillAllocating())
+            return;
+
+        Iterator<Map.Entry<UUID, AtomicInteger>> iter = cfClean.entrySet().iterator();
+        while (iter.hasNext())
+        {
+            Map.Entry<UUID, AtomicInteger> clean = iter.next();
+            UUID cfId = clean.getKey();
+            AtomicInteger cleanPos = clean.getValue();
+            AtomicInteger dirtyPos = cfDirty.get(cfId);
+            if (dirtyPos != null && dirtyPos.intValue() <= cleanPos.intValue())
+            {
+                cfDirty.remove(cfId);
+                iter.remove();
+            }
         }
     }
 
     /**
      * @return a collection of dirty CFIDs for this segment file.
      */
-    public Collection<Integer> getDirtyCFIDs()
+    public synchronized Collection<UUID> getDirtyCFIDs()
     {
-        return cfLastWrite.keySet();
+        if (cfClean.isEmpty() || cfDirty.isEmpty())
+            return cfDirty.keySet();
+
+        List<UUID> r = new ArrayList<>(cfDirty.size());
+        for (Map.Entry<UUID, AtomicInteger> dirty : cfDirty.entrySet())
+        {
+            UUID cfId = dirty.getKey();
+            AtomicInteger dirtyPos = dirty.getValue();
+            AtomicInteger cleanPos = cfClean.get(cfId);
+            if (cleanPos == null || cleanPos.intValue() < dirtyPos.intValue())
+                r.add(dirty.getKey());
+        }
+        return r;
     }
 
     /**
      * @return true if this segment is unused and safe to recycle or delete
      */
-    public boolean isUnused()
+    public synchronized boolean isUnused()
     {
-        return cfLastWrite.isEmpty();
+        // if room to allocate, we're still in use as the active allocatingFrom,
+        // so we don't want to race with updates to cfClean with removeCleanFromDirty
+        if (isStillAllocating())
+            return false;
+
+        removeCleanFromDirty();
+        return cfDirty.isEmpty();
     }
 
     /**
@@ -380,7 +569,7 @@ public class CommitLogSegment
     public String dirtyString()
     {
         StringBuilder sb = new StringBuilder();
-        for (Integer cfId : cfLastWrite.keySet())
+        for (UUID cfId : getDirtyCFIDs())
         {
             CFMetaData m = Schema.instance.getCFMetaData(cfId);
             sb.append(m == null ? "<deleted>" : m.cfName).append(" (").append(cfId).append("), ");
@@ -394,8 +583,70 @@ public class CommitLogSegment
         return "CommitLogSegment(" + getPath() + ')';
     }
 
-    public int position()
+    public static class CommitLogSegmentFileComparator implements Comparator<File>
     {
-        return buffer.position();
+        public int compare(File f, File f2)
+        {
+            CommitLogDescriptor desc = CommitLogDescriptor.fromFileName(f.getName());
+            CommitLogDescriptor desc2 = CommitLogDescriptor.fromFileName(f2.getName());
+            return Long.compare(desc.id, desc2.id);
+        }
+    }
+
+    /**
+     * A simple class for tracking information about the portion of a segment that has been allocated to a log write.
+     * The constructor leaves the fields uninitialized for population by CommitlogManager, so that it can be
+     * stack-allocated by escape analysis in CommitLog.add.
+     */
+    static class Allocation
+    {
+
+        private final CommitLogSegment segment;
+        private final OpOrder.Group appendOp;
+        private final int position;
+        private final ByteBuffer buffer;
+
+        Allocation(CommitLogSegment segment, OpOrder.Group appendOp, int position, ByteBuffer buffer)
+        {
+            this.segment = segment;
+            this.appendOp = appendOp;
+            this.position = position;
+            this.buffer = buffer;
+        }
+
+        CommitLogSegment getSegment()
+        {
+            return segment;
+        }
+
+        ByteBuffer getBuffer()
+        {
+            return buffer;
+        }
+
+        // markWritten() MUST be called once we are done with the segment or the CL will never flush
+        // but must not be called more than once
+        void markWritten()
+        {
+            appendOp.close();
+        }
+
+        void awaitDiskSync()
+        {
+            while (segment.lastSyncedOffset < position)
+            {
+                WaitQueue.Signal signal = segment.syncComplete.register(CommitLog.instance.metrics.waitingOnCommit.time());
+                if (segment.lastSyncedOffset < position)
+                    signal.awaitUninterruptibly();
+                else
+                    signal.cancel();
+            }
+        }
+
+        public ReplayPosition getReplayPosition()
+        {
+            return new ReplayPosition(segment.id, buffer.limit());
+        }
+
     }
 }

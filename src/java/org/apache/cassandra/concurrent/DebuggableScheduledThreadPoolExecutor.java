@@ -19,6 +19,8 @@ package org.apache.cassandra.concurrent;
 
 import java.util.concurrent.*;
 
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
 /**
  * Like DebuggableThreadPoolExecutor, DebuggableScheduledThreadPoolExecutor always
  * logs exceptions from the tasks it is given, even if Future.get is never called elsewhere.
@@ -31,6 +33,11 @@ public class DebuggableScheduledThreadPoolExecutor extends ScheduledThreadPoolEx
     public DebuggableScheduledThreadPoolExecutor(int corePoolSize, String threadPoolName, int priority)
     {
         super(corePoolSize, new NamedThreadFactory(threadPoolName, priority));
+    }
+
+    public DebuggableScheduledThreadPoolExecutor(int corePoolSize, ThreadFactory threadFactory)
+    {
+        super(corePoolSize, threadFactory);
     }
 
     public DebuggableScheduledThreadPoolExecutor(String threadPoolName)
@@ -74,9 +81,10 @@ public class DebuggableScheduledThreadPoolExecutor extends ScheduledThreadPoolEx
             {
                 runnable.run();
             }
-            catch (Throwable e)
+            catch (Throwable t)
             {
-                DebuggableThreadPoolExecutor.handleOrLog(e);
+                JVMStabilityInspector.inspectThrowable(t);
+                DebuggableThreadPoolExecutor.handleOrLog(t);
             }
         }
     }

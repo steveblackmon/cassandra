@@ -19,12 +19,13 @@ package org.apache.cassandra.locator;
 
 import java.net.InetAddress;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.Token;
 
 
@@ -36,9 +37,9 @@ import org.apache.cassandra.dht.Token;
  */
 public class SimpleStrategy extends AbstractReplicationStrategy
 {
-    public SimpleStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+    public SimpleStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
-        super(table, tokenMetadata, snitch, configOptions);
+        super(keyspaceName, tokenMetadata, snitch, configOptions);
     }
 
     public List<InetAddress> calculateNaturalEndpoints(Token token, TokenMetadata metadata)
@@ -54,7 +55,9 @@ public class SimpleStrategy extends AbstractReplicationStrategy
         Iterator<Token> iter = TokenMetadata.ringIterator(tokens, token, false);
         while (endpoints.size() < replicas && iter.hasNext())
         {
-            endpoints.add(metadata.getEndpoint(iter.next()));
+            InetAddress ep = metadata.getEndpoint(iter.next());
+            if (!endpoints.contains(ep))
+                endpoints.add(ep);
         }
         return endpoints;
     }
@@ -66,11 +69,14 @@ public class SimpleStrategy extends AbstractReplicationStrategy
 
     public void validateOptions() throws ConfigurationException
     {
-        if (configOptions == null || configOptions.get("replication_factor") == null)
-        {
+        String rf = configOptions.get("replication_factor");
+        if (rf == null)
             throw new ConfigurationException("SimpleStrategy requires a replication_factor strategy option.");
-        }
-        warnOnUnexpectedOptions(Arrays.<String>asList("replication_factor"));
-        validateReplicationFactor(configOptions.get("replication_factor"));
+        validateReplicationFactor(rf);
+    }
+
+    public Collection<String> recognizedOptions()
+    {
+        return Collections.<String>singleton("replication_factor");
     }
 }

@@ -21,20 +21,23 @@ import java.lang.reflect.Constructor;
 import java.net.InetAddress;
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.RingPosition;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.service.AbstractWriteResponseHandler;
 import org.apache.cassandra.service.DatacenterSyncWriteResponseHandler;
 import org.apache.cassandra.service.DatacenterWriteResponseHandler;
-import org.apache.cassandra.service.IWriteResponseHandler;
 import org.apache.cassandra.service.WriteResponseHandler;
-import org.apache.cassandra.thrift.ConsistencyLevel;
 import org.apache.cassandra.utils.FBUtilities;
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
@@ -45,40 +48,49 @@ public abstract class AbstractReplicationStrategy
 {
     private static final Logger logger = LoggerFactory.getLogger(AbstractReplicationStrategy.class);
 
-    public final String table;
+    @VisibleForTesting
+    final String keyspaceName;
+    private Keyspace keyspace;
     public final Map<String, String> configOptions;
     private final TokenMetadata tokenMetadata;
 
+    // track when the token range changes, signaling we need to invalidate our endpoint cache
+    private volatile long lastInvalidatedVersion = 0;
+
     public IEndpointSnitch snitch;
 
-    AbstractReplicationStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+    AbstractReplicationStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
-        assert table != null;
+        assert keyspaceName != null;
         assert snitch != null;
         assert tokenMetadata != null;
         this.tokenMetadata = tokenMetadata;
         this.snitch = snitch;
-        this.tokenMetadata.register(this);
-        this.configOptions = configOptions;
-        this.table = table;
+        this.configOptions = configOptions == null ? Collections.<String, String>emptyMap() : configOptions;
+        this.keyspaceName = keyspaceName;
+        // lazy-initialize keyspace itself since we don't create them until after the replication strategies
     }
 
     private final Map<Token, ArrayList<InetAddress>> cachedEndpoints = new NonBlockingHashMap<Token, ArrayList<InetAddress>>();
 
     public ArrayList<InetAddress> getCachedEndpoints(Token t)
     {
+        long lastVersion = tokenMetadata.getRingVersion();
+
+        if (lastVersion > lastInvalidatedVersion)
+        {
+            synchronized (this)
+            {
+                if (lastVersion > lastInvalidatedVersion)
+                {
+                    logger.debug("clearing cached endpoints");
+                    cachedEndpoints.clear();
+                    lastInvalidatedVersion = lastVersion;
+                }
+            }
+        }
+
         return cachedEndpoints.get(t);
-    }
-
-    public void cacheEndpoint(Token t, ArrayList<InetAddress> addr)
-    {
-        cachedEndpoints.put(t, addr);
-    }
-
-    public void clearEndpointCache()
-    {
-        logger.debug("clearing cached endpoints");
-        cachedEndpoints.clear();
     }
 
     /**
@@ -95,10 +107,11 @@ public abstract class AbstractReplicationStrategy
         ArrayList<InetAddress> endpoints = getCachedEndpoints(keyToken);
         if (endpoints == null)
         {
-            TokenMetadata tokenMetadataClone = tokenMetadata.cloneOnlyTokenMap();
-            keyToken = TokenMetadata.firstToken(tokenMetadataClone.sortedTokens(), searchToken);
-            endpoints = new ArrayList<InetAddress>(calculateNaturalEndpoints(searchToken, tokenMetadataClone));
-            cacheEndpoint(keyToken, endpoints);
+            TokenMetadata tm = tokenMetadata.cachedOnlyTokenMap();
+            // if our cache got invalidated, it's possible there is a new token to account for too
+            keyToken = TokenMetadata.firstToken(tm.sortedTokens(), searchToken);
+            endpoints = new ArrayList<InetAddress>(calculateNaturalEndpoints(searchToken, tm));
+            cachedEndpoints.put(keyToken, endpoints);
         }
 
         return new ArrayList<InetAddress>(endpoints);
@@ -114,18 +127,25 @@ public abstract class AbstractReplicationStrategy
      */
     public abstract List<InetAddress> calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata);
 
-    public IWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> writeEndpoints, ConsistencyLevel consistency_level)
+    public AbstractWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> naturalEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistency_level, Runnable callback, WriteType writeType)
     {
-        if (consistency_level == ConsistencyLevel.LOCAL_QUORUM)
+        if (consistency_level.isDatacenterLocal())
         {
             // block for in this context will be localnodes block.
-            return DatacenterWriteResponseHandler.create(writeEndpoints, consistency_level, table);
+            return new DatacenterWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
         }
-        else if (consistency_level == ConsistencyLevel.EACH_QUORUM)
+        else if (consistency_level == ConsistencyLevel.EACH_QUORUM && (this instanceof NetworkTopologyStrategy))
         {
-            return DatacenterSyncWriteResponseHandler.create(writeEndpoints, consistency_level, table);
+            return new DatacenterSyncWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
         }
-        return WriteResponseHandler.create(writeEndpoints, consistency_level, table);
+        return new WriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, getKeyspace(), callback, writeType);
+    }
+
+    private Keyspace getKeyspace()
+    {
+        if (keyspace == null)
+            keyspace = Keyspace.open(keyspaceName);
+        return keyspace;
     }
 
     /**
@@ -176,63 +196,97 @@ public abstract class AbstractReplicationStrategy
 
     public Multimap<InetAddress, Range<Token>> getAddressRanges()
     {
-        return getAddressRanges(tokenMetadata);
+        return getAddressRanges(tokenMetadata.cloneOnlyTokenMap());
     }
 
     public Collection<Range<Token>> getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddress pendingAddress)
     {
-        TokenMetadata temp = metadata.cloneOnlyTokenMap();
-        temp.updateNormalToken(pendingToken, pendingAddress);
-        return getAddressRanges(temp).get(pendingAddress);
+        return getPendingAddressRanges(metadata, Arrays.asList(pendingToken), pendingAddress);
     }
 
-    public void invalidateCachedTokenEndpointValues()
+    public Collection<Range<Token>> getPendingAddressRanges(TokenMetadata metadata, Collection<Token> pendingTokens, InetAddress pendingAddress)
     {
-        clearEndpointCache();
+        TokenMetadata temp = metadata.cloneOnlyTokenMap();
+        temp.updateNormalTokens(pendingTokens, pendingAddress);
+        return getAddressRanges(temp).get(pendingAddress);
     }
 
     public abstract void validateOptions() throws ConfigurationException;
 
-    public static AbstractReplicationStrategy createReplicationStrategy(String table,
-                                                                        Class<? extends AbstractReplicationStrategy> strategyClass,
-                                                                        TokenMetadata tokenMetadata,
-                                                                        IEndpointSnitch snitch,
-                                                                        Map<String, String> strategyOptions)
-            throws ConfigurationException
+    /*
+     * The options recognized by the strategy.
+     * The empty collection means that no options are accepted, but null means
+     * that any option is accepted.
+     */
+    public Collection<String> recognizedOptions()
+    {
+        // We default to null for backward compatibility sake
+        return null;
+    }
+
+    private static AbstractReplicationStrategy createInternal(String keyspaceName,
+                                                              Class<? extends AbstractReplicationStrategy> strategyClass,
+                                                              TokenMetadata tokenMetadata,
+                                                              IEndpointSnitch snitch,
+                                                              Map<String, String> strategyOptions)
+        throws ConfigurationException
     {
         AbstractReplicationStrategy strategy;
         Class [] parameterTypes = new Class[] {String.class, TokenMetadata.class, IEndpointSnitch.class, Map.class};
         try
         {
             Constructor<? extends AbstractReplicationStrategy> constructor = strategyClass.getConstructor(parameterTypes);
-            strategy = constructor.newInstance(table, tokenMetadata, snitch, strategyOptions);
+            strategy = constructor.newInstance(keyspaceName, tokenMetadata, snitch, strategyOptions);
         }
         catch (Exception e)
         {
-            throw new RuntimeException(e);
+            throw new ConfigurationException("Error constructing replication strategy class", e);
         }
-
-        // Throws Config Exception if strat_opts don't contain required info
-        strategy.validateOptions();
-
         return strategy;
     }
 
-    public static AbstractReplicationStrategy createReplicationStrategy(String table,
-                                                                        String strategyClassName,
+    public static AbstractReplicationStrategy createReplicationStrategy(String keyspaceName,
+                                                                        Class<? extends AbstractReplicationStrategy> strategyClass,
                                                                         TokenMetadata tokenMetadata,
                                                                         IEndpointSnitch snitch,
                                                                         Map<String, String> strategyOptions)
-            throws ConfigurationException
     {
-        Class<AbstractReplicationStrategy> c = getClass(strategyClassName);
-        return createReplicationStrategy(table, c, tokenMetadata, snitch, strategyOptions);
+        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
+
+        // Because we used to not properly validate unrecognized options, we only log a warning if we find one.
+        try
+        {
+            strategy.validateExpectedOptions();
+        }
+        catch (ConfigurationException e)
+        {
+            logger.warn("Ignoring {}", e.getMessage());
+        }
+
+        strategy.validateOptions();
+        return strategy;
+    }
+
+    public static void validateReplicationStrategy(String keyspaceName,
+                                                   Class<? extends AbstractReplicationStrategy> strategyClass,
+                                                   TokenMetadata tokenMetadata,
+                                                   IEndpointSnitch snitch,
+                                                   Map<String, String> strategyOptions) throws ConfigurationException
+    {
+        AbstractReplicationStrategy strategy = createInternal(keyspaceName, strategyClass, tokenMetadata, snitch, strategyOptions);
+        strategy.validateExpectedOptions();
+        strategy.validateOptions();
     }
 
     public static Class<AbstractReplicationStrategy> getClass(String cls) throws ConfigurationException
     {
         String className = cls.contains(".") ? cls : "org.apache.cassandra.locator." + cls;
-        return FBUtilities.classForName(className, "replication strategy");
+        Class<AbstractReplicationStrategy> strategyClass = FBUtilities.classForName(className, "replication strategy");
+        if (!AbstractReplicationStrategy.class.isAssignableFrom(strategyClass))
+        {
+            throw new ConfigurationException(String.format("Specified replication strategy class (%s) is not derived from AbstractReplicationStrategy", className));
+        }
+        return strategyClass;
     }
 
     protected void validateReplicationFactor(String rf) throws ConfigurationException
@@ -250,12 +304,16 @@ public abstract class AbstractReplicationStrategy
         }
     }
 
-    protected void warnOnUnexpectedOptions(Collection<String> expectedOptions)
+    private void validateExpectedOptions() throws ConfigurationException
     {
+        Collection expectedOptions = recognizedOptions();
+        if (expectedOptions == null)
+            return;
+
         for (String key : configOptions.keySet())
         {
             if (!expectedOptions.contains(key))
-                logger.warn("Unrecognized strategy option {" + key + "} passed to " + getClass().getSimpleName() + " for keyspace " + table);
+                throw new ConfigurationException(String.format("Unrecognized strategy option {%s} passed to %s for keyspace %s", key, getClass().getSimpleName(), keyspaceName));
         }
     }
 }

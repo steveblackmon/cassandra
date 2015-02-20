@@ -21,29 +21,26 @@ import java.util.Collections;
 import java.util.List;
 
 import org.apache.cassandra.db.RowPosition;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.Pair;
 
 /**
  * AbstractBounds containing both its endpoints: [left, right].  Used by "classic" by-key range scans.
  */
-public class Bounds<T extends RingPosition> extends AbstractBounds<T>
+public class Bounds<T extends RingPosition<T>> extends AbstractBounds<T>
 {
     public Bounds(T left, T right)
     {
-        this(left, right, StorageService.getPartitioner());
-    }
-
-    Bounds(T left, T right, IPartitioner partitioner)
-    {
-        super(left, right, partitioner);
+        super(left, right);
         // unlike a Range, a Bounds may not wrap
-        assert left.compareTo(right) <= 0 || right.isMinimum(partitioner) : "[" + left + "," + right + "]";
+        assert left.compareTo(right) <= 0 || right.isMinimum() : "[" + left + "," + right + "]";
     }
 
     public boolean contains(T position)
     {
-        return Range.contains(left, right, position) || left.equals(position);
+        // Range.contains doesnt work correctly if left == right (unless both
+        // are minimum) because for Range that means a wrapping range that select
+        // the whole ring. So we must explicitely handle this case
+        return left.equals(position) || ((right.isMinimum() || !left.equals(right)) && Range.contains(left, right, position));
     }
 
     public Pair<AbstractBounds<T>, AbstractBounds<T>> split(T position)
@@ -53,9 +50,15 @@ public class Bounds<T extends RingPosition> extends AbstractBounds<T>
         if (position.equals(right))
             return null;
 
-        AbstractBounds<T> lb = new Bounds<T>(left, position, partitioner);
-        AbstractBounds<T> rb = new Range<T>(position, right, partitioner);
-        return new Pair<AbstractBounds<T>, AbstractBounds<T>>(lb, rb);
+        AbstractBounds<T> lb = new Bounds<T>(left, position);
+        AbstractBounds<T> rb = new Range<T>(position, right);
+        return Pair.create(lb, rb);
+    }
+
+    public boolean intersects(Bounds<T> that)
+    {
+        // We either contains one of the that bounds, or we are fully contained into that.
+        return contains(that.left) || contains(that.right) || that.contains(left);
     }
 
     public List<? extends AbstractBounds<T>> unwrap()
@@ -69,7 +72,7 @@ public class Bounds<T extends RingPosition> extends AbstractBounds<T>
     {
         if (!(o instanceof Bounds))
             return false;
-        Bounds<T> rhs = (Bounds<T>)o;
+        Bounds<?> rhs = (Bounds<?>)o;
         return left.equals(rhs.left) && right.equals(rhs.right);
     }
 
@@ -79,21 +82,38 @@ public class Bounds<T extends RingPosition> extends AbstractBounds<T>
         return "[" + left + "," + right + "]";
     }
 
+    protected String getOpeningString()
+    {
+        return "[";
+    }
+
+    protected String getClosingString()
+    {
+        return "]";
+    }
+
     /**
      * Compute a bounds of keys corresponding to a given bounds of token.
      */
-    public static Bounds<RowPosition> makeRowBounds(Token left, Token right, IPartitioner partitioner)
+    public static Bounds<RowPosition> makeRowBounds(Token left, Token right)
     {
-        return new Bounds<RowPosition>(left.minKeyBound(partitioner), right.maxKeyBound(partitioner), partitioner);
+        return new Bounds<RowPosition>(left.minKeyBound(), right.maxKeyBound());
     }
 
+    @SuppressWarnings("unchecked")
     public AbstractBounds<RowPosition> toRowBounds()
     {
-        return (left instanceof Token) ? makeRowBounds((Token)left, (Token)right, partitioner) : (Bounds<RowPosition>)this;
+        return (left instanceof Token) ? makeRowBounds((Token)left, (Token)right) : (Bounds<RowPosition>)this;
     }
 
+    @SuppressWarnings("unchecked")
     public AbstractBounds<Token> toTokenBounds()
     {
-        return (left instanceof RowPosition) ? new Bounds<Token>(((RowPosition)left).getToken(), ((RowPosition)right).getToken(), partitioner) : (Bounds<Token>)this;
+        return (left instanceof RowPosition) ? new Bounds<Token>(((RowPosition)left).getToken(), ((RowPosition)right).getToken()) : (Bounds<Token>)this;
+    }
+
+    public AbstractBounds<T> withNewRight(T newRight)
+    {
+        return new Bounds<T>(left, newRight);
     }
 }

@@ -17,48 +17,48 @@
  */
 package org.apache.cassandra.cache;
 
-import java.io.DataOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.UUID;
 
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.ObjectSizes;
 
 public class RowCacheKey implements CacheKey, Comparable<RowCacheKey>
 {
-    public final int cfId;
+    public final UUID cfId;
     public final byte[] key;
 
-    public RowCacheKey(int cfId, DecoratedKey key)
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new RowCacheKey(null, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+
+    public RowCacheKey(UUID cfId, byte[] key)
     {
-        this(cfId, key.key);
+        this.cfId = cfId;
+        this.key = key;
     }
 
-    public RowCacheKey(int cfId, ByteBuffer key)
+    public RowCacheKey(UUID cfId, DecoratedKey key)
+    {
+        this(cfId, key.getKey());
+    }
+
+    public RowCacheKey(UUID cfId, ByteBuffer key)
     {
         this.cfId = cfId;
         this.key = ByteBufferUtil.getArray(key);
         assert this.key != null;
     }
 
-    public void write(DataOutputStream out) throws IOException
+    public UUID getCFId()
     {
-        ByteBufferUtil.writeWithLength(key, out);
+        return cfId;
     }
 
-    public Pair<String, String> getPathInfo()
+    public long unsharedHeapSize()
     {
-        return Schema.instance.getCF(cfId);
-    }
-
-    public int serializedSize()
-    {
-        return key.length + TypeSizes.NATIVE.sizeof(key.length);
+        return EMPTY_SIZE + ObjectSizes.sizeOfArray(key);
     }
 
     @Override
@@ -69,26 +69,25 @@ public class RowCacheKey implements CacheKey, Comparable<RowCacheKey>
 
         RowCacheKey that = (RowCacheKey) o;
 
-        if (cfId != that.cfId) return false;
-        return Arrays.equals(key, that.key);
+        return cfId.equals(that.cfId) && Arrays.equals(key, that.key);
     }
 
     @Override
     public int hashCode()
     {
-        int result = cfId;
+        int result = cfId.hashCode();
         result = 31 * result + (key != null ? Arrays.hashCode(key) : 0);
         return result;
     }
 
     public int compareTo(RowCacheKey otherKey)
     {
-        return (cfId < otherKey.cfId) ? -1 : ((cfId == otherKey.cfId) ?  FBUtilities.compareUnsigned(key, otherKey.key, 0, 0, key.length, otherKey.key.length) : 1);
+        return (cfId.compareTo(otherKey.cfId) < 0) ? -1 : ((cfId.equals(otherKey.cfId)) ?  FBUtilities.compareUnsigned(key, otherKey.key, 0, 0, key.length, otherKey.key.length) : 1);
     }
 
     @Override
     public String toString()
     {
-        return String.format("RowCacheKey(cfId:%d, key:%s)", cfId, key);
+        return String.format("RowCacheKey(cfId:%s, key:%s)", cfId, Arrays.toString(key));
     }
 }

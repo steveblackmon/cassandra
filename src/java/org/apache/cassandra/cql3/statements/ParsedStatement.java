@@ -21,40 +21,49 @@ import java.util.Collections;
 import java.util.List;
 
 import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.thrift.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 
 public abstract class ParsedStatement
 {
-    private int boundTerms;
+    private VariableSpecifications variables;
 
-    public int getBoundsTerms()
+    public VariableSpecifications getBoundVariables()
     {
-        return boundTerms;
+        return variables;
     }
 
     // Used by the parser and preparable statement
-    public void setBoundTerms(int boundTerms)
+    public void setBoundVariables(List<ColumnIdentifier> boundNames)
     {
-        this.boundTerms = boundTerms;
+        this.variables = new VariableSpecifications(boundNames);
     }
 
-    public abstract Prepared prepare() throws InvalidRequestException;
+    public abstract Prepared prepare() throws RequestValidationException;
 
     public static class Prepared
     {
         public final CQLStatement statement;
-        public final List<AbstractType<?>> boundTypes;
+        public final List<ColumnSpecification> boundNames;
 
-        public Prepared(CQLStatement statement, List<AbstractType<?>> boundTypes)
+        public Prepared(CQLStatement statement, List<ColumnSpecification> boundNames)
         {
             this.statement = statement;
-            this.boundTypes = boundTypes;
+            this.boundNames = boundNames;
+        }
+
+        public Prepared(CQLStatement statement, VariableSpecifications names)
+        {
+            this(statement, names.getSpecifications());
         }
 
         public Prepared(CQLStatement statement)
         {
-            this(statement, Collections.<AbstractType<?>>emptyList());
+            this(statement, Collections.<ColumnSpecification>emptyList());
         }
+    }
+
+    public boolean usesFunction(String ksName, String functionName)
+    {
+        return false;
     }
 }

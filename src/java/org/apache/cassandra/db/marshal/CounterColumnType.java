@@ -19,20 +19,42 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.CounterSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class CounterColumnType extends AbstractCommutativeType
+public class CounterColumnType extends AbstractType<Long>
 {
     public static final CounterColumnType instance = new CounterColumnType();
 
     CounterColumnType() {} // singleton
 
+    public boolean isCounter()
+    {
+        return true;
+    }
+
+    public boolean isByteOrderComparable()
+    {
+        throw new AssertionError();
+    }
+
+    @Override
+    public Long compose(ByteBuffer bytes)
+    {
+        return CounterContext.instance().total(bytes);
+    }
+
+    @Override
+    public ByteBuffer decompose(Long value)
+    {
+        return ByteBufferUtil.bytes(value);
+    }
+
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        if (o1 == null)
-            return null == o2 ?  0 : -1;
-
         return ByteBufferUtil.compareUnsigned(o1, o2);
     }
 
@@ -41,22 +63,18 @@ public class CounterColumnType extends AbstractCommutativeType
         return ByteBufferUtil.bytesToHex(bytes);
     }
 
-    /**
-     * create commutative column
-     */
-    public Column createColumn(ByteBuffer name, ByteBuffer value, long timestamp)
-    {
-        return new CounterUpdateColumn(name, value, timestamp);
-    }
-
     public ByteBuffer fromString(String source)
     {
         return ByteBufferUtil.hexToBytes(source);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public CQL3Type asCQL3Type()
     {
-        if (bytes.remaining() != 8 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("Expected 8 or 0 byte long (%d)", bytes.remaining()));
+        return CQL3Type.Native.COUNTER;
+    }
+
+    public TypeSerializer<Long> getSerializer()
+    {
+        return CounterSerializer.instance;
     }
 }

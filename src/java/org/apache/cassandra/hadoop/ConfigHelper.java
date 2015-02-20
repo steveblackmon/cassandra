@@ -21,17 +21,13 @@ package org.apache.cassandra.hadoop;
  */
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-import org.apache.cassandra.io.compress.CompressionParameters;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.compress.CompressionParameters;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Hex;
@@ -40,11 +36,8 @@ import org.apache.thrift.TBase;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
+import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TTransport;
-import org.apache.thrift.transport.TTransportException;
-
 
 public class ConfigHelper
 {
@@ -57,7 +50,7 @@ public class ConfigHelper
     private static final String OUTPUT_KEYSPACE_USERNAME_CONFIG = "cassandra.output.keyspace.username";
     private static final String OUTPUT_KEYSPACE_PASSWD_CONFIG = "cassandra.output.keyspace.passwd";
     private static final String INPUT_COLUMNFAMILY_CONFIG = "cassandra.input.columnfamily";
-    private static final String OUTPUT_COLUMNFAMILY_CONFIG = "cassandra.output.columnfamily";
+    private static final String OUTPUT_COLUMNFAMILY_CONFIG = "mapreduce.output.basename"; //this must == OutputFormat.BASE_OUTPUT_NAME
     private static final String INPUT_PREDICATE_CONFIG = "cassandra.input.predicate";
     private static final String INPUT_KEYRANGE_CONFIG = "cassandra.input.keyRange";
     private static final String INPUT_SPLIT_SIZE_CONFIG = "cassandra.input.split.size";
@@ -73,9 +66,10 @@ public class ConfigHelper
     private static final String WRITE_CONSISTENCY_LEVEL = "cassandra.consistencylevel.write";
     private static final String OUTPUT_COMPRESSION_CLASS = "cassandra.output.compression.class";
     private static final String OUTPUT_COMPRESSION_CHUNK_LENGTH = "cassandra.output.compression.length";
+    private static final String OUTPUT_LOCAL_DC_ONLY = "cassandra.output.local.dc.only";
+    private static final String THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB = "cassandra.thrift.framed.size_mb";
 
     private static final Logger logger = LoggerFactory.getLogger(ConfigHelper.class);
-
 
     /**
      * Set the keyspace and column family for the input of this job.
@@ -88,13 +82,10 @@ public class ConfigHelper
     public static void setInputColumnFamily(Configuration conf, String keyspace, String columnFamily, boolean widerows)
     {
         if (keyspace == null)
-        {
             throw new UnsupportedOperationException("keyspace may not be null");
-        }
+
         if (columnFamily == null)
-        {
-            throw new UnsupportedOperationException("columnfamily may not be null");
-        }
+            throw new UnsupportedOperationException("table may not be null");
 
         conf.set(INPUT_KEYSPACE_CONFIG, keyspace);
         conf.set(INPUT_COLUMNFAMILY_CONFIG, columnFamily);
@@ -114,25 +105,41 @@ public class ConfigHelper
     }
 
     /**
-     * Set the keyspace and column family for the output of this job.
+     * Set the keyspace for the output of this job.
      *
      * @param conf Job configuration you are about to run
+     * @param keyspace
+     */
+    public static void setOutputKeyspace(Configuration conf, String keyspace)
+    {
+        if (keyspace == null)
+            throw new UnsupportedOperationException("keyspace may not be null");
+
+        conf.set(OUTPUT_KEYSPACE_CONFIG, keyspace);
+    }
+
+    /**
+     * Set the column family for the output of this job.
+     *
+     * @param conf         Job configuration you are about to run
+     * @param columnFamily
+     */
+    public static void setOutputColumnFamily(Configuration conf, String columnFamily)
+    {
+    	conf.set(OUTPUT_COLUMNFAMILY_CONFIG, columnFamily);
+    }
+
+    /**
+     * Set the column family for the output of this job.
+     *
+     * @param conf         Job configuration you are about to run
      * @param keyspace
      * @param columnFamily
      */
     public static void setOutputColumnFamily(Configuration conf, String keyspace, String columnFamily)
     {
-        if (keyspace == null)
-        {
-            throw new UnsupportedOperationException("keyspace may not be null");
-        }
-        if (columnFamily == null)
-        {
-            throw new UnsupportedOperationException("columnfamily may not be null");
-        }
-
-        conf.set(OUTPUT_KEYSPACE_CONFIG, keyspace);
-        conf.set(OUTPUT_COLUMNFAMILY_CONFIG, columnFamily);
+    	setOutputKeyspace(conf, keyspace);
+    	setOutputColumnFamily(conf, columnFamily);
     }
 
     /**
@@ -263,7 +270,7 @@ public class ConfigHelper
     public static KeyRange getInputKeyRange(Configuration conf)
     {
         String str = conf.get(INPUT_KEYRANGE_CONFIG);
-        return null != str ? keyRangeFromString(str) : null;
+        return str == null ? null : keyRangeFromString(str);
     }
 
     private static KeyRange keyRangeFromString(String st)
@@ -292,14 +299,36 @@ public class ConfigHelper
         return conf.get(OUTPUT_KEYSPACE_CONFIG);
     }
 
+    public static void setInputKeyspaceUserNameAndPassword(Configuration conf, String username, String password)
+    {
+        setInputKeyspaceUserName(conf, username);
+        setInputKeyspacePassword(conf, password);
+    }
+
+    public static void setInputKeyspaceUserName(Configuration conf, String username)
+    {
+        conf.set(INPUT_KEYSPACE_USERNAME_CONFIG, username);
+    }
+
     public static String getInputKeyspaceUserName(Configuration conf)
     {
     	return conf.get(INPUT_KEYSPACE_USERNAME_CONFIG);
     }
 
+    public static void setInputKeyspacePassword(Configuration conf, String password)
+    {
+        conf.set(INPUT_KEYSPACE_PASSWD_CONFIG, password);
+    }
+
     public static String getInputKeyspacePassword(Configuration conf)
     {
     	return conf.get(INPUT_KEYSPACE_PASSWD_CONFIG);
+    }
+
+    public static void setOutputKeyspaceUserNameAndPassword(Configuration conf, String username, String password)
+    {
+        setOutputKeyspaceUserName(conf, username);
+        setOutputKeyspacePassword(conf, password);
     }
 
     public static void setOutputKeyspaceUserName(Configuration conf, String username)
@@ -327,24 +356,37 @@ public class ConfigHelper
         return conf.get(INPUT_COLUMNFAMILY_CONFIG);
     }
 
-    public static boolean getInputIsWide(Configuration conf)
-    {
-        return Boolean.valueOf(conf.get(INPUT_WIDEROWS_CONFIG));
-    }
-
     public static String getOutputColumnFamily(Configuration conf)
     {
-        return conf.get(OUTPUT_COLUMNFAMILY_CONFIG);
+    	if (conf.get(OUTPUT_COLUMNFAMILY_CONFIG) != null)
+    		return conf.get(OUTPUT_COLUMNFAMILY_CONFIG);
+    	else
+    		throw new UnsupportedOperationException("You must set the output column family using either setOutputColumnFamily or by adding a named output with MultipleOutputs");
+    }
+
+    public static boolean getInputIsWide(Configuration conf)
+    {
+        return Boolean.parseBoolean(conf.get(INPUT_WIDEROWS_CONFIG));
     }
 
     public static String getReadConsistencyLevel(Configuration conf)
     {
-        return conf.get(READ_CONSISTENCY_LEVEL, "ONE");
+        return conf.get(READ_CONSISTENCY_LEVEL, "LOCAL_ONE");
+    }
+
+    public static void setReadConsistencyLevel(Configuration conf, String consistencyLevel)
+    {
+        conf.set(READ_CONSISTENCY_LEVEL, consistencyLevel);
     }
 
     public static String getWriteConsistencyLevel(Configuration conf)
     {
-        return conf.get(WRITE_CONSISTENCY_LEVEL, "ONE");
+        return conf.get(WRITE_CONSISTENCY_LEVEL, "LOCAL_ONE");
+    }
+
+    public static void setWriteConsistencyLevel(Configuration conf, String consistencyLevel)
+    {
+        conf.set(WRITE_CONSISTENCY_LEVEL, consistencyLevel);
     }
 
     public static int getInputRpcPort(Configuration conf)
@@ -374,14 +416,7 @@ public class ConfigHelper
 
     public static IPartitioner getInputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(INPUT_PARTITIONER_CONFIG));
     }
 
     public static int getOutputRpcPort(Configuration conf)
@@ -411,14 +446,7 @@ public class ConfigHelper
 
     public static IPartitioner getOutputPartitioner(Configuration conf)
     {
-        try
-        {
-            return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return FBUtilities.newPartitioner(conf.get(OUTPUT_PARTITIONER_CONFIG));
     }
 
     public static String getOutputCompressionClass(Configuration conf)
@@ -441,20 +469,40 @@ public class ConfigHelper
         conf.set(OUTPUT_COMPRESSION_CHUNK_LENGTH, length);
     }
 
+    public static void setThriftFramedTransportSizeInMb(Configuration conf, int frameSizeInMB)
+    {
+        conf.setInt(THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB, frameSizeInMB);
+    }
+
+    /**
+     * @param conf The configuration to use.
+     * @return Value (converts MBs to Bytes) set by {@link #setThriftFramedTransportSizeInMb(Configuration, int)} or default of 15MB
+     */
+    public static int getThriftFramedTransportSize(Configuration conf)
+    {
+        return conf.getInt(THRIFT_FRAMED_TRANSPORT_SIZE_IN_MB, 15) * 1024 * 1024; // 15MB is default in Cassandra
+    }
+
     public static CompressionParameters getOutputCompressionParamaters(Configuration conf)
     {
         if (getOutputCompressionClass(conf) == null)
             return new CompressionParameters(null);
 
-        Map<String, String> options = new HashMap<String, String>();
+        Map<String, String> options = new HashMap<String, String>(2);
         options.put(CompressionParameters.SSTABLE_COMPRESSION, getOutputCompressionClass(conf));
         options.put(CompressionParameters.CHUNK_LENGTH_KB, getOutputCompressionChunkLength(conf));
 
-        try {
-            return CompressionParameters.create(options);
-        } catch (ConfigurationException e) {
-            throw new RuntimeException(e);
-        }
+        return CompressionParameters.create(options);
+    }
+
+    public static boolean getOutputLocalDCOnly(Configuration conf)
+    {
+        return Boolean.parseBoolean(conf.get(OUTPUT_LOCAL_DC_ONLY, "false"));
+    }
+
+    public static void setOutputLocalDCOnly(Configuration conf, boolean localDCOnly)
+    {
+        conf.set(OUTPUT_LOCAL_DC_ONLY, Boolean.toString(localDCOnly));
     }
 
     public static Cassandra.Client getClientFromInputAddressList(Configuration conf) throws IOException
@@ -462,7 +510,7 @@ public class ConfigHelper
         return getClientFromAddressList(conf, ConfigHelper.getInputInitialAddress(conf).split(","), ConfigHelper.getInputRpcPort(conf));
     }
 
-        public static Cassandra.Client getClientFromOutputAddressList(Configuration conf) throws IOException
+    public static Cassandra.Client getClientFromOutputAddressList(Configuration conf) throws IOException
     {
         return getClientFromAddressList(conf, ConfigHelper.getOutputInitialAddress(conf).split(","), ConfigHelper.getOutputRpcPort(conf));
     }
@@ -475,7 +523,7 @@ public class ConfigHelper
         {
             try
             {
-                client = createConnection(address, port, true);
+                client = createConnection(conf, address, port);
                 break;
             }
             catch (IOException ioe)
@@ -495,19 +543,49 @@ public class ConfigHelper
         return client;
     }
 
-    public static Cassandra.Client createConnection(String host, Integer port, boolean framed)
-            throws IOException
+    public static Cassandra.Client createConnection(Configuration conf, String host, Integer port) throws IOException
     {
-        TSocket socket = new TSocket(host, port);
-        TTransport trans = framed ? new TFramedTransport(socket) : socket;
         try
         {
-            trans.open();
+            TTransport transport = getClientTransportFactory(conf).openTransport(host, port);
+            return new Cassandra.Client(new TBinaryProtocol(transport, true, true));
         }
-        catch (TTransportException e)
+        catch (Exception e)
         {
-            throw new IOException("unable to connect to server", e);
+            throw new IOException("Unable to connect to server " + host + ":" + port, e);
         }
-        return new Cassandra.Client(new TBinaryProtocol(trans));
+    }
+
+    public static ITransportFactory getClientTransportFactory(Configuration conf)
+    {
+        String factoryClassName = conf.get(ITransportFactory.PROPERTY_KEY, TFramedTransportFactory.class.getName());
+        ITransportFactory factory = getClientTransportFactory(factoryClassName);
+        Map<String, String> options = getOptions(conf, factory.supportedOptions());
+        factory.setOptions(options);
+        return factory;
+    }
+
+    private static ITransportFactory getClientTransportFactory(String factoryClassName)
+    {
+        try
+        {
+            return (ITransportFactory) Class.forName(factoryClassName).newInstance();
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException("Failed to instantiate transport factory:" + factoryClassName, e);
+        }
+    }
+
+    private static Map<String, String> getOptions(Configuration conf, Set<String> supportedOptions)
+    {
+        Map<String, String> options = new HashMap<>();
+        for (String optionKey : supportedOptions)
+        {
+            String optionValue = conf.get(optionKey);
+            if (optionValue != null)
+                options.put(optionKey, optionValue);
+        }
+        return options;
     }
 }

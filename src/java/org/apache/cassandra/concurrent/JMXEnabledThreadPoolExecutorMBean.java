@@ -17,17 +17,26 @@
  */
 package org.apache.cassandra.concurrent;
 
-public interface JMXEnabledThreadPoolExecutorMBean extends IExecutorMBean
+
+public interface JMXEnabledThreadPoolExecutorMBean
 {
     /**
-     * Get the number of tasks that had blocked before being accepted (or
-     * rejected).
+     * Returns core pool size of thread pool.
      */
-    public int getTotalBlockedTasks();
+    public int getCoreThreads();
 
     /**
-     * Get the number of tasks currently blocked, waiting to be accepted by
-     * the executor (because all threads are busy and the backing queue is full).
+     * Allows user to resize core pool size of the thread pool.
      */
-    public int getCurrentlyBlockedTasks();
+    public void setCoreThreads(int number);
+
+    /**
+     * Returns maximum pool size of thread pool.
+     */
+    public int getMaximumThreads();
+
+    /**
+     * Allows user to resize maximum size of the thread pool.
+     */
+    public void setMaximumThreads(int number);
 }

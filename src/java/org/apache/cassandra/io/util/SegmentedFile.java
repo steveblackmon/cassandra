@@ -19,15 +19,22 @@ package org.apache.cassandra.io.util;
 
 import java.io.DataInput;
 import java.io.DataOutput;
-import java.io.IOError;
+import java.io.File;
 import java.io.IOException;
 import java.nio.MappedByteBuffer;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
+import com.google.common.base.Throwables;
+import com.google.common.util.concurrent.RateLimiter;
+
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.CompressedSequentialWriter;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.RefCounted;
+import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
 
 /**
  * Abstracts a read-only file that has been split into segments, each of which can be represented by an independent
@@ -38,7 +45,7 @@ import org.apache.cassandra.utils.Pair;
  * would need to be longer than 2GB, that segment will not be mmap'd, and a new RandomAccessFile will be created for
  * each access to that segment.
  */
-public abstract class SegmentedFile
+public abstract class SegmentedFile extends SharedCloseableImpl
 {
     public final String path;
     public final long length;
@@ -50,16 +57,59 @@ public abstract class SegmentedFile
     /**
      * Use getBuilder to get a Builder to construct a SegmentedFile.
      */
-    SegmentedFile(String path, long length)
+    SegmentedFile(Cleanup cleanup, String path, long length)
     {
-        this(path, length, length);
+        this(cleanup, path, length, length);
     }
 
-    protected SegmentedFile(String path, long length, long onDiskLength)
+    protected SegmentedFile(Cleanup cleanup, String path, long length, long onDiskLength)
     {
-        this.path = path;
+        super(cleanup);
+        this.path = new File(path).getAbsolutePath();
         this.length = length;
         this.onDiskLength = onDiskLength;
+    }
+
+    public SegmentedFile(SegmentedFile copy)
+    {
+        super(copy);
+        path = copy.path;
+        length = copy.length;
+        onDiskLength = copy.onDiskLength;
+    }
+
+    protected static abstract class Cleanup implements RefCounted.Tidy
+    {
+        final String path;
+        protected Cleanup(String path)
+        {
+            this.path = path;
+        }
+
+        public String name()
+        {
+            return path;
+        }
+    }
+
+    public abstract SegmentedFile sharedCopy();
+
+    public RandomAccessReader createReader()
+    {
+        return RandomAccessReader.open(new File(path), length);
+    }
+
+    public RandomAccessReader createThrottledReader(RateLimiter limiter)
+    {
+        assert limiter != null;
+        return ThrottledReader.open(new File(path), length, limiter);
+    }
+
+    public FileDataInput getSegment(long position)
+    {
+        RandomAccessReader reader = createReader();
+        reader.seek(position);
+        return reader;
     }
 
     /**
@@ -69,28 +119,26 @@ public abstract class SegmentedFile
     {
         return mode == Config.DiskAccessMode.mmap
                ? new MmappedSegmentedFile.Builder()
-               : new BufferedSegmentedFile.Builder();
+               : new BufferedPoolingSegmentedFile.Builder();
     }
 
     public static Builder getCompressedBuilder()
     {
-        return new CompressedSegmentedFile.Builder();
+        return getCompressedBuilder(null);
     }
 
-    public abstract FileDataInput getSegment(long position);
+    public static Builder getCompressedBuilder(CompressedSequentialWriter writer)
+    {
+        return new CompressedPoolingSegmentedFile.Builder(writer);
+    }
 
     /**
      * @return An Iterator over segments, beginning with the segment containing the given position: each segment must be closed after use.
      */
-    public Iterator<FileDataInput> iterator(long position, int bufferSize)
+    public Iterator<FileDataInput> iterator(long position)
     {
         return new SegmentIterator(position);
     }
-
-    /**
-     * Do whatever action is needed to reclaim ressources used by this SegmentedFile.
-     */
-    public abstract void cleanup();
 
     /**
      * Collects potential segmentation points in an underlying file, and builds a SegmentedFile to represent it.
@@ -108,16 +156,31 @@ public abstract class SegmentedFile
          * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk.
          * @param path The file on disk.
          */
-        public abstract SegmentedFile complete(String path);
+        protected abstract SegmentedFile complete(String path, long overrideLength, boolean isFinal);
 
-        public void serializeBounds(DataOutput dos) throws IOException
+        public SegmentedFile complete(String path)
         {
-            dos.writeUTF(DatabaseDescriptor.getDiskAccessMode().name());
+            return complete(path, -1, true);
         }
 
-        public void deserializeBounds(DataInput dis) throws IOException
+        public SegmentedFile complete(String path, boolean isFinal)
         {
-            if (!dis.readUTF().equals(DatabaseDescriptor.getDiskAccessMode().name()))
+            return complete(path, -1, isFinal);
+        }
+
+        public SegmentedFile complete(String path, long overrideLength)
+        {
+            return complete(path, overrideLength, false);
+        }
+
+        public void serializeBounds(DataOutput out) throws IOException
+        {
+            out.writeUTF(DatabaseDescriptor.getDiskAccessMode().name());
+        }
+
+        public void deserializeBounds(DataInput in) throws IOException
+        {
+            if (!in.readUTF().equals(DatabaseDescriptor.getDiskAccessMode().name()))
                 throw new IOException("Cannot deserialize SSTable Summary component because the DiskAccessMode was changed!");
         }
     }
@@ -136,7 +199,8 @@ public abstract class SegmentedFile
     }
 
     /**
-     * A lazy Iterator over segments in forward order from the given position.
+     * A lazy Iterator over segments in forward order from the given position.  It is caller's responsibility
+     * to close the FileDataIntputs when finished.
      */
     final class SegmentIterator implements Iterator<FileDataInput>
     {
@@ -164,7 +228,7 @@ public abstract class SegmentedFile
             }
             catch (IOException e)
             {
-                throw new IOError(e);
+                throw new FSReadError(e, path);
             }
             return segment;
         }

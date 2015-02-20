@@ -18,42 +18,56 @@
 */
 package org.apache.cassandra.db;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
-import java.util.concurrent.ExecutionException;
 import java.util.Set;
 import java.util.HashSet;
 
 import org.apache.cassandra.Util;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.composites.*;
+import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.SimpleStrategy;
 import org.apache.cassandra.utils.FBUtilities;
-import static junit.framework.Assert.assertEquals;
+import static org.junit.Assert.assertEquals;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 
-public class RowIterationTest extends SchemaLoader
+public class RowIterationTest
 {
-    public static final String TABLE1 = "Keyspace2";
+    public static final String KEYSPACE1 = "RowIterationTest";
     public static final InetAddress LOCAL = FBUtilities.getBroadcastAddress();
 
-    @Test
-    public void testRowIteration() throws IOException, ExecutionException, InterruptedException
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
     {
-        Table table = Table.open(TABLE1);
-        ColumnFamilyStore store = table.getColumnFamilyStore("Super3");
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, "Standard3"),
+                                    SchemaLoader.superCFMD(KEYSPACE1, "Super3", LongType.instance));
+    }
+
+    @Test
+    public void testRowIteration()
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore("Super3");
 
         final int ROWS_PER_SSTABLE = 10;
         Set<DecoratedKey> inserted = new HashSet<DecoratedKey>();
         for (int i = 0; i < ROWS_PER_SSTABLE; i++) {
             DecoratedKey key = Util.dk(String.valueOf(i));
-            RowMutation rm = new RowMutation(TABLE1, key.key);
-            rm.add(new QueryPath("Super3", ByteBufferUtil.bytes("sc"), ByteBufferUtil.bytes(String.valueOf(i))), ByteBuffer.wrap(new byte[ROWS_PER_SSTABLE * 10 - i * 2]), i);
-            rm.apply();
+            Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+            rm.add("Super3", CellNames.compositeDense(ByteBufferUtil.bytes("sc"), ByteBufferUtil.bytes(String.valueOf(i))), ByteBuffer.wrap(new byte[ROWS_PER_SSTABLE * 10 - i * 2]), i);
+            rm.applyUnsafe();
             inserted.add(key);
         }
         store.forceBlockingFlush();
@@ -61,49 +75,48 @@ public class RowIterationTest extends SchemaLoader
     }
 
     @Test
-    public void testRowIterationDeletionTime() throws IOException, ExecutionException, InterruptedException
+    public void testRowIterationDeletionTime()
     {
-        Table table = Table.open(TABLE1);
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
         String CF_NAME = "Standard3";
-        ColumnFamilyStore store = table.getColumnFamilyStore(CF_NAME);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_NAME);
         DecoratedKey key = Util.dk("key");
 
         // Delete row in first sstable
-        RowMutation rm = new RowMutation(TABLE1, key.key);
-        rm.delete(new QueryPath(CF_NAME, null, null), 0);
-        rm.add(new QueryPath(CF_NAME, null, ByteBufferUtil.bytes("c")), ByteBufferUtil.bytes("values"), 0L);
-        int tstamp1 = rm.getColumnFamilies().iterator().next().getLocalDeletionTime();
-        rm.apply();
+        Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+        rm.delete(CF_NAME, 0);
+        rm.add(CF_NAME, Util.cellname("c"), ByteBufferUtil.bytes("values"), 0L);
+        rm.applyUnsafe();
         store.forceBlockingFlush();
 
         // Delete row in second sstable with higher timestamp
-        rm = new RowMutation(TABLE1, key.key);
-        rm.delete(new QueryPath(CF_NAME, null, null), 1);
-        rm.add(new QueryPath(CF_NAME, null, ByteBufferUtil.bytes("c")), ByteBufferUtil.bytes("values"), 1L);
-        int tstamp2 = rm.getColumnFamilies().iterator().next().getLocalDeletionTime();
-        rm.apply();
+        rm = new Mutation(KEYSPACE1, key.getKey());
+        rm.delete(CF_NAME, 1);
+        rm.add(CF_NAME, Util.cellname("c"), ByteBufferUtil.bytes("values"), 1L);
+        DeletionInfo delInfo2 = rm.getColumnFamilies().iterator().next().deletionInfo();
+        assert delInfo2.getTopLevelDeletion().markedForDeleteAt == 1L;
+        rm.applyUnsafe();
         store.forceBlockingFlush();
 
-        ColumnFamily cf = Util.getRangeSlice(store).iterator().next().cf;
-        assert cf.getMarkedForDeleteAt() == 1L;
-        assert cf.getLocalDeletionTime() == tstamp2;
+        ColumnFamily cf = Util.getRangeSlice(store).get(0).cf;
+        assert cf.deletionInfo().equals(delInfo2);
     }
 
     @Test
-    public void testRowIterationDeletion() throws IOException, ExecutionException, InterruptedException
+    public void testRowIterationDeletion()
     {
-        Table table = Table.open(TABLE1);
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
         String CF_NAME = "Standard3";
-        ColumnFamilyStore store = table.getColumnFamilyStore(CF_NAME);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_NAME);
         DecoratedKey key = Util.dk("key");
 
         // Delete a row in first sstable
-        RowMutation rm = new RowMutation(TABLE1, key.key);
-        rm.delete(new QueryPath(CF_NAME, null, null), 0);
-        rm.apply();
+        Mutation rm = new Mutation(KEYSPACE1, key.getKey());
+        rm.delete(CF_NAME, 0);
+        rm.applyUnsafe();
         store.forceBlockingFlush();
 
-        ColumnFamily cf = Util.getRangeSlice(store).iterator().next().cf;
+        ColumnFamily cf = Util.getRangeSlice(store).get(0).cf;
         assert cf != null;
     }
 }

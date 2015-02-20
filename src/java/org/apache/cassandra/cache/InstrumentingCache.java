@@ -17,24 +17,25 @@
  */
 package org.apache.cassandra.cache;
 
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Iterator;
+
+import org.apache.cassandra.metrics.CacheMetrics;
 
 /**
  * Wraps an ICache in requests + hits tracking.
  */
 public class InstrumentingCache<K, V>
 {
-    private final AtomicLong requests = new AtomicLong(0);
-    private final AtomicLong hits = new AtomicLong(0);
-    private final AtomicLong lastRequests = new AtomicLong(0);
-    private final AtomicLong lastHits = new AtomicLong(0);
-    private volatile boolean capacitySetManually;
     private final ICache<K, V> map;
+    private final String type;
 
-    public InstrumentingCache(ICache<K, V> map)
+    private CacheMetrics metrics;
+
+    public InstrumentingCache(String type, ICache<K, V> map)
     {
         this.map = map;
+        this.type = type;
+        this.metrics = new CacheMetrics(type, map);
     }
 
     public void put(K key, V value)
@@ -55,9 +56,9 @@ public class InstrumentingCache<K, V>
     public V get(K key)
     {
         V v = map.get(key);
-        requests.incrementAndGet();
+        metrics.requests.mark();
         if (v != null)
-            hits.incrementAndGet();
+            metrics.hits.mark();
         return v;
     }
 
@@ -71,25 +72,14 @@ public class InstrumentingCache<K, V>
         map.remove(key);
     }
 
-    public int getCapacity()
+    public long getCapacity()
     {
         return map.capacity();
     }
 
-    public boolean isCapacitySetManually()
-    {
-        return capacitySetManually;
-    }
-
-    public void updateCapacity(int capacity)
+    public void setCapacity(long capacity)
     {
         map.setCapacity(capacity);
-    }
-
-    public void setCapacity(int capacity)
-    {
-        updateCapacity(capacity);
-        capacitySetManually = true;
     }
 
     public int size()
@@ -97,51 +87,25 @@ public class InstrumentingCache<K, V>
         return map.size();
     }
 
-    public int weightedSize()
+    public long weightedSize()
     {
         return map.weightedSize();
-    }
-
-    public long getHits()
-    {
-        return hits.get();
-    }
-
-    public long getRequests()
-    {
-        return requests.get();
-    }
-
-    public double getRecentHitRate()
-    {
-        long r = requests.get();
-        long h = hits.get();
-        try
-        {
-            return ((double)(h - lastHits.get())) / (r - lastRequests.get());
-        }
-        finally
-        {
-            lastRequests.set(r);
-            lastHits.set(h);
-        }
     }
 
     public void clear()
     {
         map.clear();
-        requests.set(0);
-        hits.set(0);
+        metrics = new CacheMetrics(type, map);
     }
 
-    public Set<K> getKeySet()
+    public Iterator<K> keyIterator()
     {
-        return map.keySet();
+        return map.keyIterator();
     }
 
-    public Set<K> hotKeySet(int n)
+    public Iterator<K> hotKeyIterator(int n)
     {
-        return map.hotKeySet(n);
+        return map.hotKeyIterator(n);
     }
 
     public boolean containsKey(K key)
@@ -149,8 +113,8 @@ public class InstrumentingCache<K, V>
         return map.containsKey(key);
     }
 
-    public boolean isPutCopying()
+    public CacheMetrics getMetrics()
     {
-        return map.isPutCopying();
+        return metrics;
     }
 }

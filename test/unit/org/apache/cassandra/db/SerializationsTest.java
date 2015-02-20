@@ -19,66 +19,80 @@
 package org.apache.cassandra.db;
 
 import org.apache.cassandra.AbstractSerializationsTester;
+import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.composites.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.util.DataOutputStreamAndChannel;
+import org.apache.cassandra.locator.SimpleStrategy;
 import org.apache.cassandra.net.CallbackInfo;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.cassandra.thrift.SliceRange;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.HashMap;
+import java.util.*;
 
 public class SerializationsTest extends AbstractSerializationsTester
 {
+    Statics statics = new Statics();
+
+    private static final String KEYSPACE1 = "Keyspace1";
+    private ByteBuffer startCol = ByteBufferUtil.bytes("Start");
+    private ByteBuffer stopCol = ByteBufferUtil.bytes("Stop");
+    private Composite emptyCol = Composites.EMPTY;
+    public NamesQueryFilter namesPred = new NamesQueryFilter(statics.NamedCols);
+    public NamesQueryFilter namesSCPred = new NamesQueryFilter(statics.NamedSCCols);
+    public SliceQueryFilter emptyRangePred = new SliceQueryFilter(emptyCol, emptyCol, false, 100);
+    public SliceQueryFilter nonEmptyRangePred = new SliceQueryFilter(CellNames.simpleDense(startCol), CellNames.simpleDense(stopCol), true, 100);
+    public SliceQueryFilter nonEmptyRangeSCPred = new SliceQueryFilter(CellNames.compositeDense(statics.SC, startCol), CellNames.compositeDense(statics.SC, stopCol), true, 100);
+
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, "Standard1"),
+                                    SchemaLoader.superCFMD(KEYSPACE1, "Super1", LongType.instance));
+    }
+
     private void testRangeSliceCommandWrite() throws IOException
     {
-        ByteBuffer startCol = ByteBufferUtil.bytes("Start");
-        ByteBuffer stopCol = ByteBufferUtil.bytes("Stop");
-        ByteBuffer emptyCol = ByteBufferUtil.bytes("");
-        SlicePredicate namesPred = new SlicePredicate();
-        namesPred.column_names = Statics.NamedCols;
-        SliceRange emptySliceRange = new SliceRange(emptyCol, emptyCol, false, 100);
-        SliceRange nonEmptySliceRange = new SliceRange(startCol, stopCol, true, 100);
-        SlicePredicate emptyRangePred = new SlicePredicate();
-        emptyRangePred.slice_range = emptySliceRange;
-        SlicePredicate nonEmptyRangePred = new SlicePredicate();
-        nonEmptyRangePred.slice_range = nonEmptySliceRange;
         IPartitioner part = StorageService.getPartitioner();
         AbstractBounds<RowPosition> bounds = new Range<Token>(part.getRandomToken(), part.getRandomToken()).toRowBounds();
 
-        RangeSliceCommand namesCmd = new RangeSliceCommand(Statics.KS, "Standard1", null, namesPred, bounds, 100);
+        RangeSliceCommand namesCmd = new RangeSliceCommand(statics.KS, "Standard1", statics.readTs, namesPred, bounds, 100);
         MessageOut<RangeSliceCommand> namesCmdMsg = namesCmd.createMessage();
-        RangeSliceCommand emptyRangeCmd = new RangeSliceCommand(Statics.KS, "Standard1", null, emptyRangePred, bounds, 100);
+        RangeSliceCommand emptyRangeCmd = new RangeSliceCommand(statics.KS, "Standard1", statics.readTs, emptyRangePred, bounds, 100);
         MessageOut<RangeSliceCommand> emptyRangeCmdMsg = emptyRangeCmd.createMessage();
-        RangeSliceCommand regRangeCmd = new RangeSliceCommand(Statics.KS, "Standard1", null,  nonEmptyRangePred, bounds, 100);
+        RangeSliceCommand regRangeCmd = new RangeSliceCommand(statics.KS, "Standard1", statics.readTs, nonEmptyRangePred, bounds, 100);
         MessageOut<RangeSliceCommand> regRangeCmdMsg = regRangeCmd.createMessage();
-        RangeSliceCommand namesCmdSup = new RangeSliceCommand(Statics.KS, "Super1", Statics.SC, namesPred, bounds, 100);
+        RangeSliceCommand namesCmdSup = new RangeSliceCommand(statics.KS, "Super1", statics.readTs, namesSCPred, bounds, 100);
         MessageOut<RangeSliceCommand> namesCmdSupMsg = namesCmdSup.createMessage();
-        RangeSliceCommand emptyRangeCmdSup = new RangeSliceCommand(Statics.KS, "Super1", Statics.SC, emptyRangePred, bounds, 100);
+        RangeSliceCommand emptyRangeCmdSup = new RangeSliceCommand(statics.KS, "Super1", statics.readTs, emptyRangePred, bounds, 100);
         MessageOut<RangeSliceCommand> emptyRangeCmdSupMsg = emptyRangeCmdSup.createMessage();
-        RangeSliceCommand regRangeCmdSup = new RangeSliceCommand(Statics.KS, "Super1", Statics.SC,  nonEmptyRangePred, bounds, 100);
+        RangeSliceCommand regRangeCmdSup = new RangeSliceCommand(statics.KS, "Super1", statics.readTs, nonEmptyRangeSCPred, bounds, 100);
         MessageOut<RangeSliceCommand> regRangeCmdSupMsg = regRangeCmdSup.createMessage();
-        
-        DataOutputStream out = getOutput("db.RangeSliceCommand.bin");
+
+        DataOutputStreamAndChannel out = getOutput("db.RangeSliceCommand.bin");
         namesCmdMsg.serialize(out, getVersion());
         emptyRangeCmdMsg.serialize(out, getVersion());
         regRangeCmdMsg.serialize(out, getVersion());
@@ -104,16 +118,16 @@ public class SerializationsTest extends AbstractSerializationsTester
 
         DataInputStream in = getInput("db.RangeSliceCommand.bin");
         for (int i = 0; i < 6; i++)
-            MessageIn.read(in, getVersion(), "id");
+            MessageIn.read(in, getVersion(), -1);
         in.close();
     }
 
     private void testSliceByNamesReadCommandWrite() throws IOException
     {
-        SliceByNamesReadCommand standardCmd = new SliceByNamesReadCommand(Statics.KS, Statics.Key, Statics.StandardPath, Statics.NamedCols);
-        SliceByNamesReadCommand superCmd = new SliceByNamesReadCommand(Statics.KS, Statics.Key, Statics.SuperPath, Statics.NamedCols);
+        SliceByNamesReadCommand standardCmd = new SliceByNamesReadCommand(statics.KS, statics.Key, statics.StandardCF, statics.readTs, namesPred);
+        SliceByNamesReadCommand superCmd = new SliceByNamesReadCommand(statics.KS, statics.Key, statics.SuperCF, statics.readTs, namesSCPred);
 
-        DataOutputStream out = getOutput("db.SliceByNamesReadCommand.bin");
+        DataOutputStreamAndChannel out = getOutput("db.SliceByNamesReadCommand.bin");
         SliceByNamesReadCommand.serializer.serialize(standardCmd, out, getVersion());
         SliceByNamesReadCommand.serializer.serialize(superCmd, out, getVersion());
         ReadCommand.serializer.serialize(standardCmd, out, getVersion());
@@ -138,22 +152,24 @@ public class SerializationsTest extends AbstractSerializationsTester
         assert SliceByNamesReadCommand.serializer.deserialize(in, getVersion()) != null;
         assert ReadCommand.serializer.deserialize(in, getVersion()) != null;
         assert ReadCommand.serializer.deserialize(in, getVersion()) != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
         in.close();
     }
 
     private void testSliceFromReadCommandWrite() throws IOException
     {
-        SliceFromReadCommand standardCmd = new SliceFromReadCommand(Statics.KS, Statics.Key, Statics.StandardPath, Statics.Start, Statics.Stop, true, 100);
-        SliceFromReadCommand superCmd = new SliceFromReadCommand(Statics.KS, Statics.Key, Statics.SuperPath, Statics.Start, Statics.Stop, true, 100);
-        DataOutputStream out = getOutput("db.SliceFromReadCommand.bin");
+        SliceFromReadCommand standardCmd = new SliceFromReadCommand(statics.KS, statics.Key, statics.StandardCF, statics.readTs, nonEmptyRangePred);
+        SliceFromReadCommand superCmd = new SliceFromReadCommand(statics.KS, statics.Key, statics.SuperCF, statics.readTs, nonEmptyRangeSCPred);
+        
+        DataOutputStreamAndChannel out = getOutput("db.SliceFromReadCommand.bin");
         SliceFromReadCommand.serializer.serialize(standardCmd, out, getVersion());
         SliceFromReadCommand.serializer.serialize(superCmd, out, getVersion());
         ReadCommand.serializer.serialize(standardCmd, out, getVersion());
         ReadCommand.serializer.serialize(superCmd, out, getVersion());
         standardCmd.createMessage().serialize(out, getVersion());
         superCmd.createMessage().serialize(out, getVersion());
+
         out.close();
 
         // test serializedSize
@@ -172,30 +188,31 @@ public class SerializationsTest extends AbstractSerializationsTester
         assert SliceFromReadCommand.serializer.deserialize(in, getVersion()) != null;
         assert ReadCommand.serializer.deserialize(in, getVersion()) != null;
         assert ReadCommand.serializer.deserialize(in, getVersion()) != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
         in.close();
     }
 
     private void testRowWrite() throws IOException
     {
-        DataOutputStream out = getOutput("db.Row.bin");
-        Row.serializer.serialize(Statics.StandardRow, out, getVersion());
-        Row.serializer.serialize(Statics.SuperRow, out, getVersion());
-        Row.serializer.serialize(Statics.NullRow, out, getVersion());
+        DataOutputStreamAndChannel out = getOutput("db.Row.bin");
+        Row.serializer.serialize(statics.StandardRow, out, getVersion());
+        Row.serializer.serialize(statics.SuperRow, out, getVersion());
+        Row.serializer.serialize(statics.NullRow, out, getVersion());
         out.close();
 
         // test serializedSize
-        testSerializedSize(Statics.StandardRow, Row.serializer);
-        testSerializedSize(Statics.SuperRow, Row.serializer);
-        testSerializedSize(Statics.NullRow, Row.serializer);
+        testSerializedSize(statics.StandardRow, Row.serializer);
+        testSerializedSize(statics.SuperRow, Row.serializer);
+        testSerializedSize(statics.NullRow, Row.serializer);
     }
 
     @Test
     public void testRowRead() throws IOException
     {
-        if (EXECUTE_WRITES)
-            testRowWrite();
+        // Since every table creation generates different CF ID,
+        // we need to generate file every time
+        testRowWrite();
 
         DataInputStream in = getInput("db.Row.bin");
         assert Row.serializer.deserialize(in, getVersion()) != null;
@@ -204,29 +221,24 @@ public class SerializationsTest extends AbstractSerializationsTester
         in.close();
     }
 
-    private void testRowMutationWrite() throws IOException
+    private void testMutationWrite() throws IOException
     {
-        RowMutation emptyRm = new RowMutation(Statics.KS, Statics.Key);
-        RowMutation standardRowRm = new RowMutation(Statics.KS, Statics.StandardRow);
-        RowMutation superRowRm = new RowMutation(Statics.KS, Statics.SuperRow);
-        RowMutation standardRm = new RowMutation(Statics.KS, Statics.Key);
-        standardRm.add(Statics.StandardCf);
-        RowMutation superRm = new RowMutation(Statics.KS, Statics.Key);
-        superRm.add(Statics.SuperCf);
-        Map<Integer, ColumnFamily> mods = new HashMap<Integer, ColumnFamily>();
-        mods.put(Statics.StandardCf.metadata().cfId, Statics.StandardCf);
-        mods.put(Statics.SuperCf.metadata().cfId, Statics.SuperCf);
-        RowMutation mixedRm = new RowMutation(Statics.KS, Statics.Key, mods);
+        Mutation standardRowRm = new Mutation(statics.KS, statics.StandardRow);
+        Mutation superRowRm = new Mutation(statics.KS, statics.SuperRow);
+        Mutation standardRm = new Mutation(statics.KS, statics.Key, statics.StandardCf);
+        Mutation superRm = new Mutation(statics.KS, statics.Key, statics.SuperCf);
+        Map<UUID, ColumnFamily> mods = new HashMap<UUID, ColumnFamily>();
+        mods.put(statics.StandardCf.metadata().cfId, statics.StandardCf);
+        mods.put(statics.SuperCf.metadata().cfId, statics.SuperCf);
+        Mutation mixedRm = new Mutation(statics.KS, statics.Key, mods);
 
-        DataOutputStream out = getOutput("db.RowMutation.bin");
-        RowMutation.serializer.serialize(emptyRm, out, getVersion());
-        RowMutation.serializer.serialize(standardRowRm, out, getVersion());
-        RowMutation.serializer.serialize(superRowRm, out, getVersion());
-        RowMutation.serializer.serialize(standardRm, out, getVersion());
-        RowMutation.serializer.serialize(superRm, out, getVersion());
-        RowMutation.serializer.serialize(mixedRm, out, getVersion());
+        DataOutputStreamAndChannel out = getOutput("db.RowMutation.bin");
+        Mutation.serializer.serialize(standardRowRm, out, getVersion());
+        Mutation.serializer.serialize(superRowRm, out, getVersion());
+        Mutation.serializer.serialize(standardRm, out, getVersion());
+        Mutation.serializer.serialize(superRm, out, getVersion());
+        Mutation.serializer.serialize(mixedRm, out, getVersion());
 
-        emptyRm.createMessage().serialize(out, getVersion());
         standardRowRm.createMessage().serialize(out, getVersion());
         superRowRm.createMessage().serialize(out, getVersion());
         standardRm.createMessage().serialize(out, getVersion());
@@ -236,42 +248,40 @@ public class SerializationsTest extends AbstractSerializationsTester
         out.close();
 
         // test serializedSize
-        testSerializedSize(emptyRm, RowMutation.serializer);
-        testSerializedSize(standardRowRm, RowMutation.serializer);
-        testSerializedSize(superRowRm, RowMutation.serializer);
-        testSerializedSize(standardRm, RowMutation.serializer);
-        testSerializedSize(superRm, RowMutation.serializer);
-        testSerializedSize(mixedRm, RowMutation.serializer);
+        testSerializedSize(standardRowRm, Mutation.serializer);
+        testSerializedSize(superRowRm, Mutation.serializer);
+        testSerializedSize(standardRm, Mutation.serializer);
+        testSerializedSize(superRm, Mutation.serializer);
+        testSerializedSize(mixedRm, Mutation.serializer);
     }
 
     @Test
-    public void testRowMutationRead() throws IOException
+    public void testMutationRead() throws IOException
     {
-        if (EXECUTE_WRITES)
-            testRowMutationWrite();
+        // mutation deserialization requires being able to look up the keyspace in the schema,
+        // so we need to rewrite this each time. plus, CF ID is different for every run.
+        testMutationWrite();
 
         DataInputStream in = getInput("db.RowMutation.bin");
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert RowMutation.serializer.deserialize(in, getVersion()) != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
+        assert Mutation.serializer.deserialize(in, getVersion()) != null;
+        assert Mutation.serializer.deserialize(in, getVersion()) != null;
+        assert Mutation.serializer.deserialize(in, getVersion()) != null;
+        assert Mutation.serializer.deserialize(in, getVersion()) != null;
+        assert Mutation.serializer.deserialize(in, getVersion()) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
         in.close();
     }
 
     private void testTruncateWrite() throws IOException
     {
-        Truncation tr = new Truncation(Statics.KS, "Doesn't Really Matter");
-        TruncateResponse aff = new TruncateResponse(Statics.KS, "Doesn't Matter Either", true);
-        TruncateResponse neg = new TruncateResponse(Statics.KS, "Still Doesn't Matter", false);
-        DataOutputStream out = getOutput("db.Truncation.bin");
+        Truncation tr = new Truncation(statics.KS, "Doesn't Really Matter");
+        TruncateResponse aff = new TruncateResponse(statics.KS, "Doesn't Matter Either", true);
+        TruncateResponse neg = new TruncateResponse(statics.KS, "Still Doesn't Matter", false);
+        DataOutputStreamAndChannel out = getOutput("db.Truncation.bin");
         Truncation.serializer.serialize(tr, out, getVersion());
         TruncateResponse.serializer.serialize(aff, out, getVersion());
         TruncateResponse.serializer.serialize(neg, out, getVersion());
@@ -298,22 +308,22 @@ public class SerializationsTest extends AbstractSerializationsTester
         assert Truncation.serializer.deserialize(in, getVersion()) != null;
         assert TruncateResponse.serializer.deserialize(in, getVersion()) != null;
         assert TruncateResponse.serializer.deserialize(in, getVersion()) != null;
-        assert MessageIn.read(in, getVersion(), "id") != null;
+        assert MessageIn.read(in, getVersion(), -1) != null;
 
         // set up some fake callbacks so deserialization knows that what it's deserializing is a TruncateResponse
-        MessagingService.instance().setCallbackForTests("tr1", new CallbackInfo(null, null, TruncateResponse.serializer));
-        MessagingService.instance().setCallbackForTests("tr2", new CallbackInfo(null, null, TruncateResponse.serializer));
+        MessagingService.instance().setCallbackForTests(1, new CallbackInfo(null, null, TruncateResponse.serializer));
+        MessagingService.instance().setCallbackForTests(2, new CallbackInfo(null, null, TruncateResponse.serializer));
 
-        assert MessageIn.read(in, getVersion(), "tr1") != null;
-        assert MessageIn.read(in, getVersion(), "tr2") != null;
+        assert MessageIn.read(in, getVersion(), 1) != null;
+        assert MessageIn.read(in, getVersion(), 2) != null;
         in.close();
     }
 
     private void testWriteResponseWrite() throws IOException
     {
-        WriteResponse aff = new WriteResponse(Statics.KS, Statics.Key, true);
-        WriteResponse neg = new WriteResponse(Statics.KS, Statics.Key, false);
-        DataOutputStream out = getOutput("db.WriteResponse.bin");
+        WriteResponse aff = new WriteResponse();
+        WriteResponse neg = new WriteResponse();
+        DataOutputStreamAndChannel out = getOutput("db.WriteResponse.bin");
         WriteResponse.serializer.serialize(aff, out, getVersion());
         WriteResponse.serializer.serialize(neg, out, getVersion());
         out.close();
@@ -335,54 +345,62 @@ public class SerializationsTest extends AbstractSerializationsTester
         in.close();
     }
 
-    private static ByteBuffer bb(String s) {
+    private static ByteBuffer bb(String s)
+    {
         return ByteBufferUtil.bytes(s);
+    }
+
+    private static CellName cn(String s)
+    {
+        return CellNames.simpleDense(ByteBufferUtil.bytes(s));
     }
 
     private static class Statics
     {
-        private static final String KS = "Keyspace1";
-        private static final ByteBuffer Key = ByteBufferUtil.bytes("Key01");
-        private static final List<ByteBuffer> NamedCols = new ArrayList<ByteBuffer>()
+        private final String KS = KEYSPACE1;
+        private final ByteBuffer Key = ByteBufferUtil.bytes("Key01");
+        private final SortedSet<CellName> NamedCols = new TreeSet<CellName>(new SimpleDenseCellNameType(BytesType.instance))
         {{
-            add(ByteBufferUtil.bytes("AAA"));
-            add(ByteBufferUtil.bytes("BBB"));
-            add(ByteBufferUtil.bytes("CCC"));
+            add(CellNames.simpleDense(ByteBufferUtil.bytes("AAA")));
+            add(CellNames.simpleDense(ByteBufferUtil.bytes("BBB")));
+            add(CellNames.simpleDense(ByteBufferUtil.bytes("CCC")));
         }};
-        private static final ByteBuffer SC = ByteBufferUtil.bytes("SCName");
-        private static final QueryPath StandardPath = new QueryPath("Standard1");
-        private static final QueryPath SuperPath = new QueryPath("Super1", SC);
-        private static final ByteBuffer Start = ByteBufferUtil.bytes("Start");
-        private static final ByteBuffer Stop = ByteBufferUtil.bytes("Stop");
-
-        private static final ColumnFamily StandardCf = ColumnFamily.create(Statics.KS, "Standard1");
-        private static final ColumnFamily SuperCf = ColumnFamily.create(Statics.KS, "Super1");
-
-        private static final SuperColumn SuperCol = new SuperColumn(Statics.SC, Schema.instance.getComparator(Statics.KS, "Super1"))
+        private final ByteBuffer SC = ByteBufferUtil.bytes("SCName");
+        private final SortedSet<CellName> NamedSCCols = new TreeSet<CellName>(new CompoundDenseCellNameType(Arrays.<AbstractType<?>>asList(BytesType.instance, BytesType.instance)))
         {{
-            addColumn(new Column(bb("aaaa")));
-            addColumn(new Column(bb("bbbb"), bb("bbbbb-value")));
-            addColumn(new Column(bb("cccc"), bb("ccccc-value"), 1000L));
-            addColumn(new DeletedColumn(bb("dddd"), 500, 1000));
-            addColumn(new DeletedColumn(bb("eeee"), bb("eeee-value"), 1001));
-            addColumn(new ExpiringColumn(bb("ffff"), bb("ffff-value"), 2000, 1000));
-            addColumn(new ExpiringColumn(bb("gggg"), bb("gggg-value"), 2001, 1000, 2002));
+            add(CellNames.compositeDense(SC, ByteBufferUtil.bytes("AAA")));
+            add(CellNames.compositeDense(SC, ByteBufferUtil.bytes("BBB")));
+            add(CellNames.compositeDense(SC, ByteBufferUtil.bytes("CCC")));
         }};
+        private final String StandardCF = "Standard1";
+        private final String SuperCF = "Super1";
 
-        private static final Row StandardRow = new Row(Util.dk("key0"), Statics.StandardCf);
-        private static final Row SuperRow = new Row(Util.dk("key1"), Statics.SuperCf);
-        private static final Row NullRow = new Row(Util.dk("key2"), null);
+        private final long readTs = 1369935512292L;
 
-        static {
-            StandardCf.addColumn(new Column(bb("aaaa")));
-            StandardCf.addColumn(new Column(bb("bbbb"), bb("bbbbb-value")));
-            StandardCf.addColumn(new Column(bb("cccc"), bb("ccccc-value"), 1000L));
-            StandardCf.addColumn(new DeletedColumn(bb("dddd"), 500, 1000));
-            StandardCf.addColumn(new DeletedColumn(bb("eeee"), bb("eeee-value"), 1001));
-            StandardCf.addColumn(new ExpiringColumn(bb("ffff"), bb("ffff-value"), 2000, 1000));
-            StandardCf.addColumn(new ExpiringColumn(bb("gggg"), bb("gggg-value"), 2001, 1000, 2002));
+        private final ColumnFamily StandardCf = ArrayBackedSortedColumns.factory.create(KS, StandardCF);
+        private final ColumnFamily SuperCf = ArrayBackedSortedColumns.factory.create(KS, SuperCF);
 
-            SuperCf.addColumn(Statics.SuperCol);
+        private final Row StandardRow = new Row(Util.dk("key0"), StandardCf);
+        private final Row SuperRow = new Row(Util.dk("key1"), SuperCf);
+        private final Row NullRow = new Row(Util.dk("key2"), null);
+
+        private Statics()
+        {
+            StandardCf.addColumn(new BufferCell(cn("aaaa")));
+            StandardCf.addColumn(new BufferCell(cn("bbbb"), bb("bbbbb-value")));
+            StandardCf.addColumn(new BufferCell(cn("cccc"), bb("ccccc-value"), 1000L));
+            StandardCf.addColumn(new BufferDeletedCell(cn("dddd"), 500, 1000));
+            StandardCf.addColumn(new BufferDeletedCell(cn("eeee"), bb("eeee-value"), 1001));
+            StandardCf.addColumn(new BufferExpiringCell(cn("ffff"), bb("ffff-value"), 2000, 1000));
+            StandardCf.addColumn(new BufferExpiringCell(cn("gggg"), bb("gggg-value"), 2001, 1000, 2002));
+
+            SuperCf.addColumn(new BufferCell(CellNames.compositeDense(SC, bb("aaaa"))));
+            SuperCf.addColumn(new BufferCell(CellNames.compositeDense(SC, bb("bbbb")), bb("bbbbb-value")));
+            SuperCf.addColumn(new BufferCell(CellNames.compositeDense(SC, bb("cccc")), bb("ccccc-value"), 1000L));
+            SuperCf.addColumn(new BufferDeletedCell(CellNames.compositeDense(SC, bb("dddd")), 500, 1000));
+            SuperCf.addColumn(new BufferDeletedCell(CellNames.compositeDense(SC, bb("eeee")), bb("eeee-value"), 1001));
+            SuperCf.addColumn(new BufferExpiringCell(CellNames.compositeDense(SC, bb("ffff")), bb("ffff-value"), 2000, 1000));
+            SuperCf.addColumn(new BufferExpiringCell(CellNames.compositeDense(SC, bb("gggg")), bb("gggg-value"), 2001, 1000, 2002));
         }
     }
 }

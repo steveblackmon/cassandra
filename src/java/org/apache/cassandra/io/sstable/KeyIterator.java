@@ -18,7 +18,6 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
 
 import com.google.common.collect.AbstractIterator;
@@ -33,19 +32,11 @@ import org.apache.cassandra.utils.CloseableIterator;
 public class KeyIterator extends AbstractIterator<DecoratedKey> implements CloseableIterator<DecoratedKey>
 {
     private final RandomAccessReader in;
-    private final Descriptor desc;
 
     public KeyIterator(Descriptor desc)
     {
-        this.desc = desc;
-        try
-        {
-            in = RandomAccessReader.open(new File(desc.filenameFor(SSTable.COMPONENT_INDEX)), true);
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+        File path = new File(desc.filenameFor(Component.PRIMARY_INDEX));
+        in = RandomAccessReader.open(path);
     }
 
     protected DecoratedKey computeNext()
@@ -54,17 +45,17 @@ public class KeyIterator extends AbstractIterator<DecoratedKey> implements Close
         {
             if (in.isEOF())
                 return endOfData();
-            DecoratedKey key = SSTableReader.decodeKey(StorageService.getPartitioner(), desc, ByteBufferUtil.readWithShortLength(in));
-            RowIndexEntry.serializer.skip(in, desc); // skip remainder of the entry
+            DecoratedKey key = StorageService.getPartitioner().decorateKey(ByteBufferUtil.readWithShortLength(in));
+            RowIndexEntry.Serializer.skip(in); // skip remainder of the entry
             return key;
         }
         catch (IOException e)
         {
-            throw new IOError(e);
+            throw new RuntimeException(e);
         }
     }
 
-    public void close() throws IOException
+    public void close()
     {
         in.close();
     }
@@ -76,13 +67,6 @@ public class KeyIterator extends AbstractIterator<DecoratedKey> implements Close
 
     public long getTotalBytes()
     {
-        try
-        {
-            return in.length();
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+        return in.length();
     }
 }

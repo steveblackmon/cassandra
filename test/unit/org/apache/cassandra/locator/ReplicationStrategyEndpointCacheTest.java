@@ -22,28 +22,39 @@ package org.apache.cassandra.locator;
 import java.net.InetAddress;
 import java.util.*;
 
-import org.apache.cassandra.db.Table;
-
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.dht.BigIntegerToken;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
 import org.apache.cassandra.dht.Token;
 
-public class ReplicationStrategyEndpointCacheTest extends SchemaLoader
+public class ReplicationStrategyEndpointCacheTest
 {
     private TokenMetadata tmd;
     private Token searchToken;
     private AbstractReplicationStrategy strategy;
+    public static final String KEYSPACE = "ReplicationStrategyEndpointCacheTest";
+
+    @BeforeClass
+    public static void defineSchema() throws Exception
+    {
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(5));
+    }
 
     public void setup(Class stratClass, Map<String, String> strategyOptions) throws Exception
     {
         tmd = new TokenMetadata();
         searchToken = new BigIntegerToken(String.valueOf(15));
 
-        strategy = getStrategyWithNewTokenMetadata(Table.open("Keyspace3").getReplicationStrategy(), tmd);
+        strategy = getStrategyWithNewTokenMetadata(Keyspace.open(KEYSPACE).getReplicationStrategy(), tmd);
 
         tmd.updateNormalToken(new BigIntegerToken(String.valueOf(10)), InetAddress.getByName("127.0.0.1"));
         tmd.updateNormalToken(new BigIntegerToken(String.valueOf(20)), InetAddress.getByName("127.0.0.2"));
@@ -114,9 +125,9 @@ public class ReplicationStrategyEndpointCacheTest extends SchemaLoader
     {
         private boolean called = false;
 
-        public FakeSimpleStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+        public FakeSimpleStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
         {
-            super(table, tokenMetadata, snitch, configOptions);
+            super(keyspaceName, tokenMetadata, snitch, configOptions);
         }
 
         public List<InetAddress> calculateNaturalEndpoints(Token token, TokenMetadata metadata)
@@ -131,9 +142,9 @@ public class ReplicationStrategyEndpointCacheTest extends SchemaLoader
     {
         private boolean called = false;
 
-        public FakeOldNetworkTopologyStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+        public FakeOldNetworkTopologyStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
         {
-            super(table, tokenMetadata, snitch, configOptions);
+            super(keyspaceName, tokenMetadata, snitch, configOptions);
         }
 
         public List<InetAddress> calculateNaturalEndpoints(Token token, TokenMetadata metadata)
@@ -148,9 +159,9 @@ public class ReplicationStrategyEndpointCacheTest extends SchemaLoader
     {
         private boolean called = false;
 
-        public FakeNetworkTopologyStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions) throws ConfigurationException
+        public FakeNetworkTopologyStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions) throws ConfigurationException
         {
-            super(table, tokenMetadata, snitch, configOptions);
+            super(keyspaceName, tokenMetadata, snitch, configOptions);
         }
 
         public List<InetAddress> calculateNaturalEndpoints(Token token, TokenMetadata metadata)
@@ -164,8 +175,8 @@ public class ReplicationStrategyEndpointCacheTest extends SchemaLoader
     private AbstractReplicationStrategy getStrategyWithNewTokenMetadata(AbstractReplicationStrategy strategy, TokenMetadata newTmd) throws ConfigurationException
     {
         return AbstractReplicationStrategy.createReplicationStrategy(
-                strategy.table,
-                strategy.getClass().getName(),
+                strategy.keyspaceName,
+                AbstractReplicationStrategy.getClass(strategy.getClass().getName()),
                 newTmd,
                 strategy.snitch,
                 strategy.configOptions);

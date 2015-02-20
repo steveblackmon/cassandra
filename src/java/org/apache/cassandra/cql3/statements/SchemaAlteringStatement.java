@@ -17,38 +17,22 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-
-import org.apache.cassandra.cql3.CQLStatement;
-import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.db.migration.*;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.cql3.CFName;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.thrift.CqlResult;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.SchemaDisagreementException;
-
-import com.google.common.base.Predicates;
-import com.google.common.collect.Maps;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Event;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
 /**
  * Abstract class for statements that alter the schema.
  */
 public abstract class SchemaAlteringStatement extends CFStatement implements CQLStatement
 {
-    private static final long timeLimitForSchemaAgreement = 10 * 1000;
-
     private final boolean isColumnFamilyLevel;
 
     protected SchemaAlteringStatement()
@@ -63,6 +47,11 @@ public abstract class SchemaAlteringStatement extends CFStatement implements CQL
         this.isColumnFamilyLevel = true;
     }
 
+    public int getBoundTerms()
+    {
+        return 0;
+    }
+
     @Override
     public void prepareKeyspace(ClientState state) throws InvalidRequestException
     {
@@ -70,75 +59,71 @@ public abstract class SchemaAlteringStatement extends CFStatement implements CQL
             super.prepareKeyspace(state);
     }
 
-    public Prepared prepare() throws InvalidRequestException
+    @Override
+    public Prepared prepare()
     {
         return new Prepared(this);
     }
 
-    public abstract void announceMigration() throws InvalidRequestException, ConfigurationException;
+    public abstract Event.SchemaChange changeEvent();
 
-    public void checkAccess(ClientState state) throws InvalidRequestException
+    /**
+     * Schema alteration may result in a new database object (keyspace, table, role, function) being created capable of
+     * having permissions GRANTed on it. The creator of the object (the primary role assigned to the AuthenticatedUser
+     * performing the operation) is automatically granted ALL applicable permissions on the object. This is a hook for
+     * subclasses to override in order to perform that grant when the statement is executed.
+     */
+    protected void grantPermissionsToCreator(QueryState state)
     {
-        if (isColumnFamilyLevel)
-            state.hasColumnFamilySchemaAccess(Permission.WRITE);
-        else
-            state.hasKeyspaceSchemaAccess(Permission.WRITE);
+        // no-op by default
     }
 
-    @Override
-    public void validate(ClientState state) throws InvalidRequestException, SchemaDisagreementException
-    {
-        validateSchemaAgreement();
-    }
+    /**
+     * Announces the migration to other nodes in the cluster.
+     * @return true if the execution of this statement resulted in a schema change, false otherwise (when IF NOT EXISTS
+     * is used, for example)
+     * @throws RequestValidationException
+     */
+    public abstract boolean announceMigration(boolean isLocalOnly) throws RequestValidationException;
 
-    public CqlResult execute(ClientState state, List<ByteBuffer> variables) throws InvalidRequestException, SchemaDisagreementException
+    public ResultMessage execute(QueryState state, QueryOptions options) throws RequestValidationException
     {
-        try
+        // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
+        // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
+        boolean didChangeSchema = announceMigration(false);
+        if (!didChangeSchema)
+            return new ResultMessage.Void();
+
+        Event.SchemaChange ce = changeEvent();
+
+        // when a schema alteration results in a new db object being created, we grant permissions on the new
+        // object to the user performing the request if:
+        // * the user is not anonymous
+        // * the configured IAuthorizer supports granting of permissions (not all do, AllowAllAuthorizer doesn't and
+        //   custom external implementations may not)
+        AuthenticatedUser user = state.getClientState().getUser();
+        if (user != null && !user.isAnonymous() && ce != null && ce.change == Event.SchemaChange.Change.CREATED)
         {
-            announceMigration();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.toString());
-            ex.initCause(e);
-            throw ex;
-        }
-        validateSchemaIsSettled();
-        return null;
-    }
-
-    // Copypasta from CassandraServer (where it is private).
-    private static void validateSchemaAgreement() throws SchemaDisagreementException
-    {
-       if (describeSchemaVersions().size() > 1)
-            throw new SchemaDisagreementException();
-    }
-
-    private static Map<String, List<String>> describeSchemaVersions()
-    {
-        // unreachable hosts don't count towards disagreement
-        return Maps.filterKeys(StorageProxy.describeSchemaVersions(),
-                               Predicates.not(Predicates.equalTo(StorageProxy.UNREACHABLE)));
-    }
-
-    private static void validateSchemaIsSettled() throws SchemaDisagreementException
-    {
-        long limit = System.currentTimeMillis() + timeLimitForSchemaAgreement;
-
-        outer:
-        while (limit - System.currentTimeMillis() >= 0)
-        {
-            String currentVersionId = Schema.instance.getVersion().toString();
-            for (String version : describeSchemaVersions().keySet())
+            try
             {
-                if (!version.equals(currentVersionId))
-                    continue outer;
+                grantPermissionsToCreator(state);
             }
-
-            // schemas agree
-            return;
+            catch (UnsupportedOperationException e)
+            {
+                // not a problem, grant is an optional method on IAuthorizer
+            }
         }
 
-        throw new SchemaDisagreementException();
+        return ce == null ? new ResultMessage.Void() : new ResultMessage.SchemaChange(ce);
+    }
+
+    public ResultMessage executeInternal(QueryState state, QueryOptions options)
+    {
+        boolean didChangeSchema = announceMigration(true);
+        if (!didChangeSchema)
+            return new ResultMessage.Void();
+
+        Event.SchemaChange ce = changeEvent();
+        return ce == null ? new ResultMessage.Void() : new ResultMessage.SchemaChange(ce);
     }
 }

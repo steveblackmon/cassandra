@@ -18,10 +18,10 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 
@@ -51,18 +51,18 @@ public class TruncateResponse
 
     public static class TruncateResponseSerializer implements IVersionedSerializer<TruncateResponse>
     {
-        public void serialize(TruncateResponse tr, DataOutput dos, int version) throws IOException
+        public void serialize(TruncateResponse tr, DataOutputPlus out, int version) throws IOException
         {
-            dos.writeUTF(tr.keyspace);
-            dos.writeUTF(tr.columnFamily);
-            dos.writeBoolean(tr.success);
+            out.writeUTF(tr.keyspace);
+            out.writeUTF(tr.columnFamily);
+            out.writeBoolean(tr.success);
         }
 
-        public TruncateResponse deserialize(DataInput dis, int version) throws IOException
+        public TruncateResponse deserialize(DataInput in, int version) throws IOException
         {
-            String keyspace = dis.readUTF();
-            String columnFamily = dis.readUTF();
-            boolean success = dis.readBoolean();
+            String keyspace = in.readUTF();
+            String columnFamily = in.readUTF();
+            boolean success = in.readBoolean();
             return new TruncateResponse(keyspace, columnFamily, success);
         }
 

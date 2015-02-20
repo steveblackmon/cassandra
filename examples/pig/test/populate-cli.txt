@@ -8,7 +8,7 @@ column_metadata =
 [
     {column_name: name, validation_class: UTF8Type, index_type: KEYS},
     {column_name: vote_type, validation_class: UTF8Type},
-    {column_name: rating, validation_class: IntegerType},
+    {column_name: rating, validation_class: Int32Type},
     {column_name: score, validation_class: LongType},
     {column_name: percent, validation_class: FloatType},
     {column_name: atomic_weight, validation_class: DoubleType},
@@ -23,7 +23,7 @@ column_metadata =
 [
     {column_name: name, validation_class: UTF8Type, index_type: KEYS},
     {column_name: vote_type, validation_class: UTF8Type},
-    {column_name: rating, validation_class: IntegerType},
+    {column_name: rating, validation_class: Int32Type},
     {column_name: score, validation_class: LongType},
     {column_name: percent, validation_class: FloatType},
     {column_name: atomic_weight, validation_class: DoubleType},
@@ -112,3 +112,23 @@ set CompoInt['clock']['1:0'] = 'z';
 set CompoInt['clock']['1:30'] = 'zzzz';
 set CompoInt['clock']['2:30'] = 'daddy?';
 set CompoInt['clock']['6:30'] = 'coffee...';
+
+create column family CompoIntCopy
+    with key_validation_class = UTF8Type
+    and default_validation_class = UTF8Type
+    and comparator = 'CompositeType(LongType,LongType)';
+
+create column family CompoKey
+    with key_validation_class = 'CompositeType(UTF8Type,LongType)'
+    and default_validation_class = UTF8Type
+    and comparator = LongType;
+
+set CompoKey['clock:10']['1'] = 'z';
+set CompoKey['clock:20']['1'] = 'zzzz';
+set CompoKey['clock:30']['2'] = 'daddy?';
+set CompoKey['clock:40']['6'] = 'coffee...';
+
+create column family CompoKeyCopy
+    with key_validation_class = 'CompositeType(UTF8Type,LongType)'
+    and default_validation_class = UTF8Type
+    and comparator = LongType;

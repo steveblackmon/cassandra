@@ -15,16 +15,9 @@
 
 @echo off
 
-if NOT DEFINED CASSANDRA_HOME set CASSANDRA_HOME=%CD%\..\..
+if "%OS%" == "Windows_NT" setlocal
 
-set CLASSPATH=""
-for %%i in ("%CASSANDRA_HOME%\build\*.jar") do call :append "%%i"
-for %%i in ("%CASSANDRA_HOME%\lib\*.jar") do call :append "%%i"
-goto start
+pushd "%~dp0"
+call cassandra.in.bat
 
-:append
-set CLASSPATH=%CLASSPATH%;%1
-goto :eof
-
-:start
 "%JAVA_HOME%\bin\java" -cp %CLASSPATH% org.apache.cassandra.tools.SSTableMetadataViewer %*

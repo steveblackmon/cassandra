@@ -20,7 +20,6 @@ package org.apache.cassandra.net;
 import java.net.InetAddress;
 
 import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.service.StorageProxy;
 
 /**
  * Encapsulates the callback information.
@@ -30,9 +29,14 @@ import org.apache.cassandra.service.StorageProxy;
 public class CallbackInfo
 {
     protected final InetAddress target;
-    protected final IMessageCallback callback;
-    protected final MessageOut<?> sentMessage;
+    protected final IAsyncCallback callback;
     protected final IVersionedSerializer<?> serializer;
+    private final boolean failureCallback;
+
+    public CallbackInfo(InetAddress target, IAsyncCallback callback, IVersionedSerializer<?> serializer)
+    {
+        this(target, callback, serializer, false);
+    }
 
     /**
      * Create CallbackInfo without sent message
@@ -41,27 +45,31 @@ public class CallbackInfo
      * @param callback
      * @param serializer serializer to deserialize response message
      */
-    public CallbackInfo(InetAddress target, IMessageCallback callback, IVersionedSerializer<?> serializer)
-    {
-        this(target, callback, null, serializer);
-    }
-
-    public CallbackInfo(InetAddress target, IMessageCallback callback, MessageOut<?> sentMessage, IVersionedSerializer<?> serializer)
+    public CallbackInfo(InetAddress target, IAsyncCallback callback, IVersionedSerializer<?> serializer, boolean failureCallback)
     {
         this.target = target;
         this.callback = callback;
-        this.sentMessage = sentMessage;
         this.serializer = serializer;
+        this.failureCallback = failureCallback;
     }
 
-    /**
-     * @return TRUE if a hint should be written for this target and if the CL was achieved. FALSE otherwise.
-     *
-     * NOTE:
-     * Assumes it is only called after the write of "message" to "target" has timed out.
-     */
     public boolean shouldHint()
     {
-        return sentMessage != null && StorageProxy.shouldHint(target);
+        return false;
+    }
+
+    public boolean isFailureCallback()
+    {
+        return failureCallback;
+    }
+
+    public String toString()
+    {
+        return "CallbackInfo(" +
+               "target=" + target +
+               ", callback=" + callback +
+               ", serializer=" + serializer +
+               ", failureCallback=" + failureCallback +
+               ')';
     }
 }

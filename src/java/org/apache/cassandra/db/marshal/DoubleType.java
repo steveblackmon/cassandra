@@ -19,7 +19,10 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.cql.jdbc.JdbcDouble;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.DoubleSerializer;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class DoubleType extends AbstractType<Double>
@@ -28,40 +31,12 @@ public class DoubleType extends AbstractType<Double>
 
     DoubleType() {} // singleton
 
-    public Double compose(ByteBuffer bytes)
-    {
-        return JdbcDouble.instance.compose(bytes);
-    }
-
-    public ByteBuffer decompose(Double value)
-    {
-        return JdbcDouble.instance.decompose(value);
-    }
-
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        if (!o1.hasRemaining() || !o2.hasRemaining())
+            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
 
         return compose(o1).compareTo(compose(o2));
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        try
-        {
-            return JdbcDouble.instance.getString(bytes);
-        }
-        catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-        {
-            throw new MarshalException(e.getMessage());
-        }
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -73,7 +48,7 @@ public class DoubleType extends AbstractType<Double>
       Double d;
       try
       {
-          d = Double.parseDouble(source);
+          d = Double.valueOf(source);
       }
       catch (NumberFormatException e1)
       {
@@ -83,9 +58,13 @@ public class DoubleType extends AbstractType<Double>
       return decompose(d);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public CQL3Type asCQL3Type()
     {
-        if (bytes.remaining() != 8 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("Expected 8 or 0 byte value for a double (%d)", bytes.remaining()));
+        return CQL3Type.Native.DOUBLE;
+    }
+
+    public TypeSerializer<Double> getSerializer()
+    {
+        return DoubleSerializer.instance;
     }
 }

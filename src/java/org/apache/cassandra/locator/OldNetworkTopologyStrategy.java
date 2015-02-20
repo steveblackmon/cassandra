@@ -19,11 +19,13 @@ package org.apache.cassandra.locator;
 
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.Token;
 
 /**
@@ -35,9 +37,9 @@ import org.apache.cassandra.dht.Token;
  */
 public class OldNetworkTopologyStrategy extends AbstractReplicationStrategy
 {
-    public OldNetworkTopologyStrategy(String table, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
+    public OldNetworkTopologyStrategy(String keyspaceName, TokenMetadata tokenMetadata, IEndpointSnitch snitch, Map<String, String> configOptions)
     {
-        super(table, tokenMetadata, snitch, configOptions);
+        super(keyspaceName, tokenMetadata, snitch, configOptions);
     }
 
     public List<InetAddress> calculateNaturalEndpoints(Token token, TokenMetadata metadata)
@@ -111,5 +113,10 @@ public class OldNetworkTopologyStrategy extends AbstractReplicationStrategy
             throw new ConfigurationException("SimpleStrategy requires a replication_factor strategy option.");
         }
         validateReplicationFactor(configOptions.get("replication_factor"));
+    }
+
+    public Collection<String> recognizedOptions()
+    {
+        return Collections.<String>singleton("replication_factor");
     }
 }

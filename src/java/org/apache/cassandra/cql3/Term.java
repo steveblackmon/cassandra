@@ -20,201 +20,158 @@ package org.apache.cassandra.cql3;
 import java.nio.ByteBuffer;
 import java.util.List;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.db.marshal.FloatType;
-import org.apache.cassandra.db.marshal.IntegerType;
-import org.apache.cassandra.db.marshal.LexicalUUIDType;
-import org.apache.cassandra.db.marshal.MarshalException;
-import org.apache.cassandra.thrift.InvalidRequestException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 
-/** A term parsed from a CQL statement. */
-public class Term
+/**
+ * A CQL3 term, i.e. a column value with or without bind variables.
+ *
+ * A Term can be either terminal or non terminal. A term object is one that is typed and is obtained
+ * from a raw term (Term.Raw) by poviding the actual receiver to which the term is supposed to be a
+ * value of.
+ */
+public interface Term
 {
-    private final String text;
-    private final TermType type;
-    public final int bindIndex;
-    public final boolean isToken;
+    /**
+     * Collects the column specification for the bind variables in this Term.
+     * This is obviously a no-op if the term is Terminal.
+     *
+     * @param boundNames the variables specification where to collect the
+     * bind variables of this term in.
+     */
+    public void collectMarkerSpecification(VariableSpecifications boundNames);
 
-    private Term(String text, TermType type, int bindIndex, boolean isToken)
+    /**
+     * Bind the values in this term to the values contained in {@code values}.
+     * This is obviously a no-op if the term is Terminal.
+     *
+     * @param options the values to bind markers to.
+     * @return the result of binding all the variables of this NonTerminal (or
+     * 'this' if the term is terminal).
+     */
+    public Terminal bind(QueryOptions options) throws InvalidRequestException;
+
+    /**
+     * A shorter for bind(values).get().
+     * We expose it mainly because for constants it can avoids allocating a temporary
+     * object between the bind and the get (note that we still want to be able
+     * to separate bind and get for collections).
+     */
+    public ByteBuffer bindAndGet(QueryOptions options) throws InvalidRequestException;
+
+    /**
+     * Whether or not that term contains at least one bind marker.
+     *
+     * Note that this is slightly different from being or not a NonTerminal,
+     * because calls to non pure functions will be NonTerminal (see #5616)
+     * even if they don't have bind markers.
+     */
+    public abstract boolean containsBindMarker();
+
+    boolean usesFunction(String ksName, String functionName);
+
+    /**
+     * A parsed, non prepared (thus untyped) term.
+     *
+     * This can be one of:
+     *   - a constant
+     *   - a collection literal
+     *   - a function call
+     *   - a marker
+     */
+    public interface Raw extends AssignmentTestable
     {
-        this.text = text == null ? "" : text;
-        this.type = type;
-        this.bindIndex = bindIndex;
-        this.isToken = isToken;
+        /**
+         * This method validates this RawTerm is valid for provided column
+         * specification and "prepare" this RawTerm, returning the resulting
+         * prepared Term.
+         *
+         * @param receiver the "column" this RawTerm is supposed to be a value of. Note
+         * that the ColumnSpecification may not correspond to a real column in the
+         * case this RawTerm describe a list index or a map key, etc...
+         * @return the prepared term.
+         */
+        public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException;
     }
 
-    public Term(String text, TermType type)
+    public interface MultiColumnRaw extends Raw
     {
-        this(text, type, -1, false);
+        public Term prepare(String keyspace, List<? extends ColumnSpecification> receiver) throws InvalidRequestException;
     }
 
     /**
-     * Create new Term instance from a string, and an integer that corresponds
-     * with the token ID from CQLParser.
+     * A terminal term, one that can be reduced to a byte buffer directly.
      *
-     * @param text the text representation of the term.
-     * @param type the term's type as an integer token ID.
+     * This includes most terms that don't have a bind marker (an exception
+     * being delayed call for non pure function that are NonTerminal even
+     * if they don't have bind markers).
+     *
+     * This can be only one of:
+     *   - a constant value
+     *   - a collection value
+     *
+     * Note that a terminal term will always have been type checked, and thus
+     * consumer can (and should) assume so.
      */
-    public Term(String text, int type)
+    public abstract class Terminal implements Term
     {
-        this(text, TermType.forInt(type));
+        public void collectMarkerSpecification(VariableSpecifications boundNames) {}
+        public Terminal bind(QueryOptions options) { return this; }
+
+        public boolean usesFunction(String ksName, String functionName)
+        {
+            return false;
+        }
+
+        // While some NonTerminal may not have bind markers, no Term can be Terminal
+        // with a bind marker
+        public boolean containsBindMarker()
+        {
+            return false;
+        }
+
+        /**
+         * @return the serialized value of this terminal.
+         */
+        public abstract ByteBuffer get(QueryOptions options);
+
+        public ByteBuffer bindAndGet(QueryOptions options) throws InvalidRequestException
+        {
+            return get(options);
+        }
     }
 
-    public Term(long value, TermType type)
+    public abstract class MultiItemTerminal extends Terminal
     {
-        this(String.valueOf(value), type);
+        public abstract List<ByteBuffer> getElements();
     }
 
-    public Term(String text, int type, int index)
+    public interface CollectionTerminal
     {
-        this(text, TermType.forInt(type), index, false);
-    }
-
-    public static Term tokenOf(Term t)
-    {
-        return new Term(t.text, t.type, t.bindIndex, true);
+        /** Gets the value of the collection when serialized with the given protocol version format */
+        public ByteBuffer getWithProtocolVersion(int protocolVersion);
     }
 
     /**
-     * Returns the text parsed to create this term.
+     * A non terminal term, i.e. a term that can only be reduce to a byte buffer
+     * at execution time.
      *
-     * @return the string term acquired from a CQL statement.
+     * We have the following type of NonTerminal:
+     *   - marker for a constant value
+     *   - marker for a collection value (list, set, map)
+     *   - a function having bind marker
+     *   - a non pure function (even if it doesn't have bind marker - see #5616)
      */
-    public String getText()
+    public abstract class NonTerminal implements Term
     {
-        return isToken ? "token(" + text + ")" : text;
-    }
-
-    /**
-     * Returns the typed value, serialized to a ByteBuffer according to a
-     * comparator/validator.
-     *
-     * @return a ByteBuffer of the value.
-     * @throws InvalidRequestException if unable to coerce the string to its type.
-     */
-    public ByteBuffer getByteBuffer(AbstractType<?> validator, List<ByteBuffer> variables) throws InvalidRequestException
-    {
-        try
+        public boolean usesFunction(String ksName, String functionName)
         {
-            if (!isBindMarker())
-                return validator.fromString(text);
-
-            // must be a marker term so check for a CqlBindValue stored in the term
-            if (bindIndex == -1)
-                throw new AssertionError("a marker Term was encountered with no index value");
-
-            ByteBuffer value = variables.get(bindIndex);
-            validator.validate(value);
-            return value;
+            return false;
         }
-        catch (MarshalException e)
+
+        public ByteBuffer bindAndGet(QueryOptions options) throws InvalidRequestException
         {
-            throw new InvalidRequestException(e.getMessage());
+            Terminal t = bind(options);
+            return t == null ? null : t.get(options);
         }
-    }
-
-    public Token getAsToken(AbstractType<?> validator, List<ByteBuffer> variables, IPartitioner<?> p) throws InvalidRequestException
-    {
-        if (!(isToken || type == TermType.STRING))
-            throw new InvalidRequestException("Invalid value for token (use a string literal of the token value or the token() function)");
-
-        try
-        {
-            if (isToken)
-            {
-                ByteBuffer value = getByteBuffer(validator, variables);
-                return p.getToken(value);
-            }
-            else
-            {
-                p.getTokenFactory().validate(text);
-                return p.getTokenFactory().fromString(text);
-            }
-        }
-        catch (ConfigurationException e)
-        {
-            throw new InvalidRequestException(e.getMessage());
-        }
-    }
-
-    /**
-     * Obtain the term's type.
-     *
-     * @return the type
-     */
-    public TermType getType()
-    {
-        return type;
-    }
-
-    public boolean isBindMarker()
-    {
-        return type == TermType.QMARK;
-    }
-
-    @Override
-    public String toString()
-    {
-        return String.format("Term(%s, type=%s%s)", getText(), type, isToken ? ", isToken" : "");
-    }
-
-    @Override
-    public int hashCode()
-    {
-        final int prime = 31;
-        int result = 1 + (isToken ? 1 : 0);
-        result = prime * result + ((text == null) ? 0 : text.hashCode());
-        result = prime * result + ((type == null) ? 0 : type.hashCode());
-        return result;
-    }
-
-    @Override
-    public boolean equals(Object obj)
-    {
-        if (this == obj)
-            return true;
-        if (obj == null)
-            return false;
-        if (getClass() != obj.getClass())
-            return false;
-        Term other = (Term) obj;
-        if (type==TermType.QMARK) return false; // markers are never equal
-        if (text == null)
-        {
-            if (other.text != null)
-                return false;
-        } else if (!text.equals(other.text))
-            return false;
-        if (type != other.type)
-            return false;
-        if (isToken != other.isToken)
-            return false;
-        return true;
-    }
-}
-
-enum TermType
-{
-    STRING, INTEGER, UUID, FLOAT, QMARK;
-
-    static TermType forInt(int type)
-    {
-        if ((type == CqlParser.STRING_LITERAL) || (type == CqlParser.IDENT))
-            return STRING;
-        else if (type == CqlParser.INTEGER)
-            return INTEGER;
-        else if (type == CqlParser.UUID)
-          return UUID;
-        else if (type == CqlParser.FLOAT)
-            return FLOAT;
-        else if (type == CqlParser.QMARK)
-            return QMARK;
-
-        // FIXME: handled scenario that should never occur.
-        return null;
     }
 }

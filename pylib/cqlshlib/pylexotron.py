@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 import re
 from .saferscanner import SaferScanner
 
@@ -24,6 +23,9 @@ class LexingError(Exception):
         bad_char = len(rulestr) - len(unmatched)
         linenum = rulestr[:bad_char].count('\n') + 1
         charnum = len(rulestr[:bad_char].rsplit('\n', 1)[-1]) + 1
+        snippet_start = max(0, min(len(rulestr), bad_char - 10))
+        snippet_end = max(0, min(len(rulestr), bad_char + 10))
+        msg += " (Error at: '...%s...')" % (rulestr[snippet_start:snippet_end],)
         raise cls(linenum, charnum, msg)
 
     def __init__(self, linenum, charnum, msg='Lexing error'):
@@ -118,19 +120,24 @@ class matcher:
 
     @staticmethod
     def try_registered_completion(ctxt, symname, completions):
+        debugging = ctxt.get_binding('*DEBUG*', False)
         if ctxt.remainder or completions is None:
             return False
         try:
             completer = ctxt.get_completer(symname)
         except KeyError:
             return False
+        if debugging:
+            print "Trying completer %r with %r" % (completer, ctxt)
         try:
             new_compls = completer(ctxt)
         except Exception:
-            if ctxt.get_binding('*DEBUG*', False):
+            if debugging:
                 import traceback
                 traceback.print_exc()
             return False
+        if debugging:
+            print "got %r" % (new_compls,)
         completions.update(new_compls)
         return True
 
@@ -269,6 +276,31 @@ class case_match(text_match):
     def pattern(self):
         return re.escape(self.arg)
 
+class word_match(text_match):
+    def pattern(self):
+        return r'\b' + text_match.pattern(self) + r'\b'
+
+class case_word_match(case_match):
+    def pattern(self):
+        return r'\b' + case_match.pattern(self) + r'\b'
+
+class terminal_type_matcher(matcher):
+    def __init__(self, tokentype, submatcher):
+        matcher.__init__(self, tokentype)
+        self.tokentype = tokentype
+        self.submatcher = submatcher
+
+    def match(self, ctxt, completions):
+        if ctxt.remainder:
+            if ctxt.remainder[0][0] == self.tokentype:
+                return [ctxt.with_match(1)]
+        elif completions is not None:
+            self.submatcher.match(ctxt, completions)
+        return []
+
+    def __repr__(self):
+        return '%s(%r, %r)' % (self.__class__.__name__, self.tokentype, self.submatcher)
+
 class ParsingRuleSet:
     RuleSpecScanner = SaferScanner([
         (r'::=', lambda s,t: t),
@@ -309,9 +341,10 @@ class ParsingRuleSet:
                     raise ValueError('Unexpected token %r; expected "::="' % (assign,))
                 name = t[1]
                 production = cls.read_rule_tokens_until(';', tokeniter)
-                rules[name] = production
                 if isinstance(production, terminal_matcher):
                     terminals.append((name, production))
+                    production = terminal_type_matcher(name, production)
+                rules[name] = production
             else:
                 raise ValueError('Unexpected token %r; expected name' % (t,))
         return rules, terminals
@@ -345,7 +378,10 @@ class ParsingRuleSet:
                 if t[0] == 'reference':
                     t = rule_reference(t[1])
                 elif t[0] == 'litstring':
-                    t = text_match(t[1])
+                    if t[1][1].isalnum() or t[1][1] == '_':
+                        t = word_match(t[1])
+                    else:
+                        t = text_match(t[1])
                 elif t[0] == 'regex':
                     t = regex_rule(t[1])
                 elif t[0] == 'named_collector':
@@ -419,6 +455,10 @@ class ParsingRuleSet:
 
     def lex_and_parse(self, text, startsymbol='Start'):
         return self.parse(startsymbol, self.lex(text), init_bindings={'*SRC*': text})
+
+    def lex_and_whole_match(self, text, startsymbol='Start'):
+        tokens = self.lex(text)
+        return self.whole_match(startsymbol, tokens, srcstr=text)
 
     def complete(self, startsymbol, tokens, init_bindings=None):
         if init_bindings is None:

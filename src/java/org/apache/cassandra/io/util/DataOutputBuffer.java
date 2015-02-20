@@ -17,8 +17,9 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
 
 
 /**
@@ -27,7 +28,7 @@ import java.io.IOException;
  *
  * This class is completely thread unsafe.
  */
-public final class DataOutputBuffer extends DataOutputStream
+public final class DataOutputBuffer extends DataOutputStreamPlus
 {
     public DataOutputBuffer()
     {
@@ -65,16 +66,36 @@ public final class DataOutputBuffer extends DataOutputStream
         }
     }
 
+    public void write(ByteBuffer buffer) throws IOException
+    {
+        ((FastByteArrayOutputStream) out).write(buffer);
+    }
+
     /**
      * Returns the current contents of the buffer. Data is only valid to
      * {@link #getLength()}.
+     * 
+     * @return the buffer contents
      */
     public byte[] getData()
     {
         return ((FastByteArrayOutputStream) out).buf;
     }
 
-    /** Returns the length of the valid data currently in the buffer. */
+    public byte[] toByteArray()
+    {
+        FastByteArrayOutputStream out = (FastByteArrayOutputStream) this.out;
+        return Arrays.copyOfRange(out.buf, 0, out.count);
+
+    }
+
+    public ByteBuffer asByteBuffer()
+    {
+        FastByteArrayOutputStream out = (FastByteArrayOutputStream) this.out;
+        return ByteBuffer.wrap(out.buf, 0, out.count);
+    }
+
+    /** @return the length of the valid data currently in the buffer. */
     public int getLength()
     {
         return ((FastByteArrayOutputStream) out).count;

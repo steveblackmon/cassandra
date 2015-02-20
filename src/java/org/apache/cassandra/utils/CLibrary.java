@@ -17,10 +17,10 @@
  */
 package org.apache.cassandra.utils;
 
-import java.io.File;
 import java.io.FileDescriptor;
-import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
+import java.nio.channels.FileChannel;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +50,9 @@ public final class CLibrary
     private static final int POSIX_FADV_DONTNEED   = 4; /* fadvise.h */
     private static final int POSIX_FADV_NOREUSE    = 5; /* fadvise.h */
 
+    static boolean jnaAvailable = true;
+    static boolean jnaLockable = false;
+
     static
     {
         try
@@ -58,33 +61,28 @@ public final class CLibrary
         }
         catch (NoClassDefFoundError e)
         {
-            logger.info("JNA not found. Native methods will be disabled.");
+            logger.warn("JNA not found. Native methods will be disabled.");
+            jnaAvailable = false;
         }
         catch (UnsatisfiedLinkError e)
         {
-            logger.info("JNA link failure, one or more native method will be unavailable.");
-            logger.debug("JNA link failure details: " + e.getMessage());
+            logger.warn("JNA link failure, one or more native method will be unavailable.");
+            logger.debug("JNA link failure details: {}", e.getMessage());
         }
         catch (NoSuchMethodError e)
         {
             logger.warn("Obsolete version of JNA present; unable to register C library. Upgrade to JNA 3.2.7 or later");
+            jnaAvailable = false;
         }
     }
 
     private static native int mlockall(int flags) throws LastErrorException;
     private static native int munlockall() throws LastErrorException;
-
-    private static native int link(String from, String to) throws LastErrorException;
-
-    // fcntl - manipulate file descriptor, `man 2 fcntl`
-    public static native int fcntl(int fd, int command, long flags) throws LastErrorException;
-
-    // fadvice
-    public static native int posix_fadvise(int fd, long offset, int len, int flag) throws LastErrorException;
-
-    public static native int open(String path, int flags) throws LastErrorException;
-    public static native int fsync(int fd) throws LastErrorException;
-    public static native int close(int fd) throws LastErrorException;
+    private static native int fcntl(int fd, int command, long flags) throws LastErrorException;
+    private static native int posix_fadvise(int fd, long offset, int len, int flag) throws LastErrorException;
+    private static native int open(String path, int flags) throws LastErrorException;
+    private static native int fsync(int fd) throws LastErrorException;
+    private static native int close(int fd) throws LastErrorException;
 
     private static int errno(RuntimeException e)
     {
@@ -102,11 +100,22 @@ public final class CLibrary
 
     private CLibrary() {}
 
+    public static boolean jnaAvailable()
+    {
+        return jnaAvailable;
+    }
+
+    public static boolean jnaMemoryLockable()
+    {
+        return jnaLockable;
+    }
+
     public static void tryMlockall()
     {
         try
         {
             mlockall(MCL_CURRENT);
+            jnaLockable = true;
             logger.info("JNA mlockall successful");
         }
         catch (UnsatisfiedLinkError e)
@@ -117,79 +126,37 @@ public final class CLibrary
         {
             if (!(e instanceof LastErrorException))
                 throw e;
+
             if (errno(e) == ENOMEM && System.getProperty("os.name").toLowerCase().contains("linux"))
             {
                 logger.warn("Unable to lock JVM memory (ENOMEM)."
-                             + " This can result in part of the JVM being swapped out, especially with mmapped I/O enabled."
-                             + " Increase RLIMIT_MEMLOCK or run Cassandra as root.");
+                        + " This can result in part of the JVM being swapped out, especially with mmapped I/O enabled."
+                        + " Increase RLIMIT_MEMLOCK or run Cassandra as root.");
             }
             else if (!System.getProperty("os.name").toLowerCase().contains("mac"))
             {
                 // OS X allows mlockall to be called, but always returns an error
-                logger.warn("Unknown mlockall error " + errno(e));
+                logger.warn("Unknown mlockall error {}", errno(e));
             }
         }
     }
 
-    /**
-     * Create a hard link for a given file.
-     *
-     * @param sourceFile      The name of the source file.
-     * @param destinationFile The name of the destination file.
-     *
-     * @throws java.io.IOException if an error has occurred while creating the link.
-     */
-    public static void createHardLink(File sourceFile, File destinationFile) throws IOException
+    public static void trySkipCache(String path, long offset, long len)
     {
-        try
-        {
-            link(sourceFile.getAbsolutePath(), destinationFile.getAbsolutePath());
-        }
-        catch (UnsatisfiedLinkError e)
-        {
-            createHardLinkWithExec(sourceFile, destinationFile);
-        }
-        catch (RuntimeException e)
-        {
-            logger.error("Unable to create hard link", e);
-            if (!(e instanceof LastErrorException))
-                throw e;
-            // there are 17 different error codes listed on the man page.  punt until/unless we find which
-            // ones actually turn up in practice.
-            throw new IOException(String.format("Unable to create hard link from %s to %s (errno %d)",
-                                                sourceFile, destinationFile, errno(e)));
-        }
+        trySkipCache(getfd(path), offset, len);
     }
 
-    public static void createHardLinkWithExec(File sourceFile, File destinationFile) throws IOException
+    public static void trySkipCache(int fd, long offset, long len)
     {
-        String osname = System.getProperty("os.name");
-        ProcessBuilder pb;
-        if (osname.startsWith("Windows"))
+        if (len == 0)
+            trySkipCache(fd, 0, 0);
+
+        while (len > 0)
         {
-            float osversion = Float.parseFloat(System.getProperty("os.version"));
-            if (osversion >= 6.0f)
-            {
-                pb = new ProcessBuilder("cmd", "/c", "mklink", "/H", destinationFile.getAbsolutePath(), sourceFile.getAbsolutePath());
-            }
-            else
-            {
-                pb = new ProcessBuilder("fsutil", "hardlink", "create", destinationFile.getAbsolutePath(), sourceFile.getAbsolutePath());
-            }
-        }
-        else
-        {
-            pb = new ProcessBuilder("ln", sourceFile.getAbsolutePath(), destinationFile.getAbsolutePath());
-            pb.redirectErrorStream(true);
-        }
-        try
-        {
-            FBUtilities.exec(pb);
-        }
-        catch (IOException ex)
-        {
-            logger.error("Unable to create hard link", ex);
-            throw ex;
+            int sublen = (int) Math.min(Integer.MAX_VALUE, len);
+            trySkipCache(fd, offset, sublen);
+            len -= sublen;
+            offset -= sublen;
         }
     }
 
@@ -210,6 +177,13 @@ public final class CLibrary
             // if JNA is unavailable just skipping Direct I/O
             // instance of this class will act like normal RandomAccessFile
         }
+        catch (RuntimeException e)
+        {
+            if (!(e instanceof LastErrorException))
+                throw e;
+
+            logger.warn(String.format("posix_fadvise(%d, %d) failed, errno (%d).", fd, offset, errno(e)));
+        }
     }
 
     public static int tryFcntl(int fd, int command, int flags)
@@ -219,15 +193,18 @@ public final class CLibrary
 
         try
         {
-            result = CLibrary.fcntl(fd, command, flags);
+            result = fcntl(fd, command, flags);
+        }
+        catch (UnsatisfiedLinkError e)
+        {
+            // if JNA is unavailable just skipping
         }
         catch (RuntimeException e)
         {
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn(String.format("fcntl(%d, %d, %d) failed, errno (%d).",
-                                      fd, command, flags, CLibrary.errno(e)));
+            logger.warn(String.format("fcntl(%d, %d, %d) failed, errno (%d).", fd, command, flags, errno(e)));
         }
 
         return result;
@@ -250,7 +227,7 @@ public final class CLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn(String.format("open(%s, O_RDONLY) failed, errno (%d).", path, CLibrary.errno(e)));
+            logger.warn(String.format("open(%s, O_RDONLY) failed, errno (%d).", path, errno(e)));
         }
 
         return fd;
@@ -274,7 +251,7 @@ public final class CLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn(String.format("fsync(%d) failed, errno (%d).", fd, CLibrary.errno(e)));
+            logger.warn(String.format("fsync(%d) failed, errno (%d).", fd, errno(e)));
         }
     }
 
@@ -296,8 +273,26 @@ public final class CLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
-            logger.warn(String.format("close(%d) failed, errno (%d).", fd, CLibrary.errno(e)));
+            logger.warn(String.format("close(%d) failed, errno (%d).", fd, errno(e)));
         }
+    }
+
+    public static int getfd(FileChannel channel)
+    {
+        Field field = FBUtilities.getProtectedField(channel.getClass(), "fd");
+
+        if (field == null)
+            return -1;
+
+        try
+        {
+            return getfd((FileDescriptor)field.get(channel));
+        }
+        catch (IllegalArgumentException|IllegalAccessException e)
+        {
+            logger.warn("Unable to read fd field from FileChannel");
+        }
+        return -1;
     }
 
     /**
@@ -318,9 +313,38 @@ public final class CLibrary
         }
         catch (Exception e)
         {
-            logger.warn("unable to read fd field from FileDescriptor");
+            JVMStabilityInspector.inspectThrowable(e);
+            logger.warn("Unable to read fd field from FileDescriptor");
         }
 
         return -1;
+    }
+
+    public static int getfd(String path)
+    {
+        RandomAccessFile file = null;
+        try
+        {
+            file = new RandomAccessFile(path, "r");
+            return getfd(file.getFD());
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            // ignore
+            return -1;
+        }
+        finally
+        {
+            try
+            {
+                if (file != null)
+                    file.close();
+            }
+            catch (Throwable t)
+            {
+                // ignore
+            }
+        }
     }
 }

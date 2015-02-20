@@ -18,18 +18,16 @@
 package org.apache.cassandra.cql3.statements;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.concurrent.TimeoutException;
 
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.thrift.CqlResult;
-import org.apache.cassandra.thrift.InvalidRequestException;
 import org.apache.cassandra.thrift.ThriftValidation;
-import org.apache.cassandra.thrift.UnavailableException;
 
 public class TruncateStatement extends CFStatement implements CQLStatement
 {
@@ -38,14 +36,19 @@ public class TruncateStatement extends CFStatement implements CQLStatement
         super(name);
     }
 
+    public int getBoundTerms()
+    {
+        return 0;
+    }
+
     public Prepared prepare() throws InvalidRequestException
     {
         return new Prepared(this);
     }
 
-    public void checkAccess(ClientState state) throws InvalidRequestException
+    public void checkAccess(ClientState state) throws InvalidRequestException, UnauthorizedException
     {
-        state.hasColumnFamilyAccess(keyspace(), columnFamily(), Permission.WRITE);
+        state.hasColumnFamilyAccess(keyspace(), columnFamily(), Permission.MODIFY);
     }
 
     public void validate(ClientState state) throws InvalidRequestException
@@ -53,20 +56,21 @@ public class TruncateStatement extends CFStatement implements CQLStatement
         ThriftValidation.validateColumnFamily(keyspace(), columnFamily());
     }
 
-    public CqlResult execute(ClientState state, List<ByteBuffer> variables) throws InvalidRequestException, UnavailableException
+    public ResultMessage execute(QueryState state, QueryOptions options) throws InvalidRequestException, TruncateException
     {
         try
         {
             StorageProxy.truncateBlocking(keyspace(), columnFamily());
         }
-        catch (TimeoutException e)
+        catch (UnavailableException | TimeoutException | IOException e)
         {
-            throw (UnavailableException) new UnavailableException().initCause(e);
-        }
-        catch (IOException e)
-        {
-            throw (UnavailableException) new UnavailableException().initCause(e);
+            throw new TruncateException(e);
         }
         return null;
+    }
+
+    public ResultMessage executeInternal(QueryState state, QueryOptions options)
+    {
+        throw new UnsupportedOperationException();
     }
 }

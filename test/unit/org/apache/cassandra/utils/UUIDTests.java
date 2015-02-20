@@ -24,9 +24,6 @@ package org.apache.cassandra.utils;
 import org.apache.cassandra.db.marshal.TimeUUIDType;
 import org.junit.Test;
 
-import java.math.BigInteger;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.UUID;
 
@@ -34,45 +31,51 @@ import java.util.UUID;
 public class UUIDTests
 {
     @Test
-    public void verifyType1() throws UnknownHostException
+    public void verifyType1()
     {
 
-        UUID uuid = UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.1"));
+        UUID uuid = UUIDGen.getTimeUUID();
         assert uuid.version() == 1;
     }
 
     @Test
-    public void verifyOrdering1() throws UnknownHostException
+    public void verifyOrdering1()
     {
-        UUID one = UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.1"));
-        UUID two = UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.2"));
+        UUID one = UUIDGen.getTimeUUID();
+        UUID two = UUIDGen.getTimeUUID();
         assert one.timestamp() < two.timestamp();
     }
 
 
     @Test
-    public void testDecomposeAndRaw() throws UnknownHostException
+    public void testDecomposeAndRaw()
     {
-        UUID a = UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.1"));
+        UUID a = UUIDGen.getTimeUUID();
         byte[] decomposed = UUIDGen.decompose(a);
         UUID b = UUIDGen.getUUID(ByteBuffer.wrap(decomposed));
         assert a.equals(b);
     }
 
     @Test
-    public void testTimeUUIDType() throws UnknownHostException
+    public void testTimeUUIDType()
     {
         TimeUUIDType comp = TimeUUIDType.instance;
-        ByteBuffer first = ByteBuffer.wrap(UUIDGen.decompose(UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.1"))));
-        ByteBuffer second = ByteBuffer.wrap(UUIDGen.decompose(UUIDGen.makeType1UUIDFromHost(InetAddress.getByName("127.0.0.1"))));
+        ByteBuffer first = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
+        ByteBuffer second = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
         assert comp.compare(first, second) < 0;
         assert comp.compare(second, first) > 0;
         ByteBuffer sameAsFirst = ByteBuffer.wrap(UUIDGen.decompose(UUIDGen.getUUID(first)));
         assert comp.compare(first, sameAsFirst) == 0;
     }
 
-    private void assertNonZero(BigInteger i)
+    @Test
+    public void testUUIDTimestamp()
     {
-        assert i.toString(2).indexOf("1") > -1;
+        long now = System.currentTimeMillis();
+        UUID uuid = UUIDGen.getTimeUUID();
+        long tstamp = UUIDGen.getAdjustedTimestamp(uuid);
+
+        // I'll be damn is the uuid timestamp is more than 10ms after now
+        assert now <= tstamp && now >= tstamp - 10 : "now = " + now + ", timestamp = " + tstamp;
     }
 }

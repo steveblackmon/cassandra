@@ -20,17 +20,16 @@ package org.apache.cassandra.service;
 import java.net.InetAddress;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Collections;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.cassandra.thrift.UnavailableException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 
 /**
  * Handles blocking writes for ONE, ANY, TWO, THREE, QUORUM, and ALL consistency levels.
@@ -39,80 +38,40 @@ public class WriteResponseHandler extends AbstractWriteResponseHandler
 {
     protected static final Logger logger = LoggerFactory.getLogger(WriteResponseHandler.class);
 
-    protected final AtomicInteger responses;
+    protected volatile int responses;
+    private static final AtomicIntegerFieldUpdater<WriteResponseHandler> responsesUpdater
+            = AtomicIntegerFieldUpdater.newUpdater(WriteResponseHandler.class, "responses");
 
-    protected WriteResponseHandler(Collection<InetAddress> writeEndpoints, ConsistencyLevel consistencyLevel, String table)
+    public WriteResponseHandler(Collection<InetAddress> writeEndpoints,
+                                Collection<InetAddress> pendingEndpoints,
+                                ConsistencyLevel consistencyLevel,
+                                Keyspace keyspace,
+                                Runnable callback,
+                                WriteType writeType)
     {
-        super(writeEndpoints, consistencyLevel);
-        responses = new AtomicInteger(determineBlockFor(table));
+        super(keyspace, writeEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
+        responses = totalBlockFor();
     }
 
-    protected WriteResponseHandler(InetAddress endpoint)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, Runnable callback)
     {
-        super(Arrays.asList(endpoint), ConsistencyLevel.ALL);
-        responses = new AtomicInteger(1);
+        this(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ONE, null, callback, writeType);
     }
 
-    public static IWriteResponseHandler create(Collection<InetAddress> writeEndpoints, ConsistencyLevel consistencyLevel, String table)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType)
     {
-        return new WriteResponseHandler(writeEndpoints, consistencyLevel, table);
-    }
-
-    public static IWriteResponseHandler create(InetAddress endpoint)
-    {
-        return new WriteResponseHandler(endpoint);
+        this(endpoint, writeType, null);
     }
 
     public void response(MessageIn m)
     {
-        if (responses.decrementAndGet() == 0)
-            condition.signal();
+        if (responsesUpdater.decrementAndGet(this) == 0)
+            signal();
     }
 
-    protected int determineBlockFor(String table)
+    protected int ackCount()
     {
-        switch (consistencyLevel)
-        {
-            case ONE:
-                return 1;
-            case ANY:
-                return 1;
-            case TWO:
-                return 2;
-            case THREE:
-                return 3;
-            case QUORUM:
-                return (Table.open(table).getReplicationStrategy().getReplicationFactor() / 2) + 1;
-            case ALL:
-                return Table.open(table).getReplicationStrategy().getReplicationFactor();
-            default:
-                throw new UnsupportedOperationException("invalid consistency level: " + consistencyLevel.toString());
-        }
-    }
-
-    public void assureSufficientLiveNodes() throws UnavailableException
-    {
-        if (consistencyLevel == ConsistencyLevel.ANY)
-        {
-            // Ensure there are blockFor distinct living nodes (hints (local) are ok).
-            // Thus we include the local node (coordinator) as a valid replica if it is there already.
-            int effectiveEndpoints = writeEndpoints.contains(FBUtilities.getBroadcastAddress()) ? writeEndpoints.size() : writeEndpoints.size() + 1;
-            if (effectiveEndpoints < responses.get())
-                throw new UnavailableException();
-            return;
-        }
-
-        // count destinations that are part of the desired target set
-        int liveNodes = 0;
-        for (InetAddress destination : writeEndpoints)
-        {
-            if (FailureDetector.instance.isAlive(destination))
-                liveNodes++;
-        }
-        if (liveNodes < responses.get())
-        {
-            throw new UnavailableException();
-        }
+        return totalBlockFor() - responses;
     }
 
     public boolean isLatencyForSnitch()

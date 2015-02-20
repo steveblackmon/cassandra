@@ -18,13 +18,28 @@
 package org.apache.cassandra.io.compress;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.xerial.snappy.Snappy;
+import org.xerial.snappy.SnappyError;
+
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 public class SnappyCompressor implements ICompressor
 {
     public static final SnappyCompressor instance = new SnappyCompressor();
+
+    private static Logger logger = LoggerFactory.getLogger(SnappyCompressor.class);
+    static
+    {
+        if (!isAvailable())
+            logger.warn("Cannot initialize native Snappy library. Compression on new sstables will be disabled.");
+    }
 
     public static SnappyCompressor create(Map<String, String> compressionOptions)
     {
@@ -34,6 +49,37 @@ public class SnappyCompressor implements ICompressor
 
         // no specific options supported so far
         return instance;
+    }
+
+    public static boolean isAvailable()
+    {
+        try
+        {
+            create(Collections.<String, String>emptyMap());
+            return true;
+        }
+        catch (Exception e)
+        {
+            JVMStabilityInspector.inspectThrowable(e);
+            return false;
+        }
+        catch (NoClassDefFoundError e)
+        {
+            return false;
+        }
+        catch (SnappyError e)
+        {
+            return false;
+        }
+        catch (UnsatisfiedLinkError e)
+        {
+            return false;
+        }
+    }
+
+    public Set<String> supportedOptions()
+    {
+        return Collections.emptySet();
     }
 
     public int initialCompressedBufferLength(int chunkLength)
@@ -49,5 +95,16 @@ public class SnappyCompressor implements ICompressor
     public int uncompress(byte[] input, int inputOffset, int inputLength, byte[] output, int outputOffset) throws IOException
     {
         return Snappy.rawUncompress(input, inputOffset, inputLength, output, outputOffset);
+    }
+
+    public int uncompress(ByteBuffer input, ByteBuffer output) throws IOException
+    {
+        return Snappy.uncompress(input, output);
+    }
+
+    @Override
+    public boolean useDirectOutputByteBuffers()
+    {
+        return true;
     }
 }

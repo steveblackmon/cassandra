@@ -18,7 +18,6 @@
 package org.apache.cassandra.locator;
 
 import java.net.InetAddress;
-import java.net.UnknownHostException;
 
 /**
  * An endpoint snitch tells Cassandra information about network topology that it can use to route
@@ -30,7 +29,6 @@ public abstract class AbstractNetworkTopologySnitch extends AbstractEndpointSnit
      * Return the rack for which an endpoint resides in
      * @param endpoint a specified endpoint
      * @return string of rack
-     * @throws UnknownHostException
      */
     abstract public String getRack(InetAddress endpoint);
 
@@ -38,7 +36,6 @@ public abstract class AbstractNetworkTopologySnitch extends AbstractEndpointSnit
      * Return the data center for which an endpoint resides in
      * @param endpoint a specified endpoint
      * @return string of data center
-     * @throws UnknownHostException
      */
     abstract public String getDatacenter(InetAddress endpoint);
 

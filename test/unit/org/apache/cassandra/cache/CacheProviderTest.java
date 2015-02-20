@@ -24,28 +24,48 @@ package org.apache.cassandra.cache;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
+
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.db.ArrayBackedSortedColumns;
 import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.SimpleStrategy;
+
+import com.googlecode.concurrentlinkedhashmap.Weighers;
+
 import static org.apache.cassandra.Util.column;
 import static org.junit.Assert.*;
 
-public class CacheProviderTest extends SchemaLoader
+public class CacheProviderTest
 {
-    String key1 = "key1";
-    String key2 = "key2";
-    String key3 = "key3";
-    String key4 = "key4";
-    String key5 = "key5";
-    private static final int CAPACITY = 4;
-    private String tableName = "Keyspace1";
-    private String cfName = "Standard1";
+    MeasureableString key1 = new MeasureableString("key1");
+    MeasureableString key2 = new MeasureableString("key2");
+    MeasureableString key3 = new MeasureableString("key3");
+    MeasureableString key4 = new MeasureableString("key4");
+    MeasureableString key5 = new MeasureableString("key5");
+    private static final long CAPACITY = 4;
+    private static final String KEYSPACE1 = "CacheProviderTest1";
+    private static final String CF_STANDARD1 = "Standard1";
 
-    private void simpleCase(ColumnFamily cf, ICache<String, ColumnFamily> cache)
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
+    }
+
+    private void simpleCase(ColumnFamily cf, ICache<MeasureableString, IRowCacheEntry> cache)
     {
         cache.put(key1, cf);
-        assert cache.get(key1) != null;
+        assertNotNull(cache.get(key1));
 
         assertDigests(cache.get(key1), cf);
         cache.put(key2, cf);
@@ -56,14 +76,15 @@ public class CacheProviderTest extends SchemaLoader
         assertEquals(CAPACITY, cache.size());
     }
 
-    private void assertDigests(ColumnFamily one, ColumnFamily two)
+    private void assertDigests(IRowCacheEntry one, ColumnFamily two)
     {
         // CF does not implement .equals
-        assert ColumnFamily.digest(one).equals(ColumnFamily.digest(two));
+        assertTrue(one instanceof ColumnFamily);
+        assertEquals(ColumnFamily.digest((ColumnFamily)one), ColumnFamily.digest(two));
     }
 
     // TODO this isn't terribly useful
-    private void concurrentCase(final ColumnFamily cf, final ICache<String, ColumnFamily> cache) throws InterruptedException
+    private void concurrentCase(final ColumnFamily cf, final ICache<MeasureableString, IRowCacheEntry> cache) throws InterruptedException
     {
         Runnable runable = new Runnable()
         {
@@ -93,25 +114,16 @@ public class CacheProviderTest extends SchemaLoader
 
     private ColumnFamily createCF()
     {
-        ColumnFamily cf = ColumnFamily.create(tableName, cfName);
+        ColumnFamily cf = ArrayBackedSortedColumns.factory.create(KEYSPACE1, CF_STANDARD1);
         cf.addColumn(column("vijay", "great", 1));
         cf.addColumn(column("awesome", "vijay", 1));
         return cf;
     }
 
     @Test
-    public void testHeapCache() throws InterruptedException
-    {
-        ICache<String, ColumnFamily> cache = ConcurrentLinkedHashCache.create(CAPACITY);
-        ColumnFamily cf = createCF();
-        simpleCase(cf, cache);
-        concurrentCase(cf, cache);
-    }
-
-    @Test
     public void testSerializingCache() throws InterruptedException
     {
-        ICache<String, ColumnFamily> cache = new SerializingCache<String, ColumnFamily>(CAPACITY, false, ColumnFamily.serializer);
+        ICache<MeasureableString, IRowCacheEntry> cache = SerializingCache.create(CAPACITY, Weighers.<RefCountedMemory>singleton(), new SerializingCacheProvider.RowCacheSerializer());
         ColumnFamily cf = createCF();
         simpleCase(cf, cache);
         concurrentCase(cf, cache);
@@ -120,16 +132,33 @@ public class CacheProviderTest extends SchemaLoader
     @Test
     public void testKeys()
     {
+        UUID cfId = UUID.randomUUID();
+
         byte[] b1 = {1, 2, 3, 4};
-        RowCacheKey key1 = new RowCacheKey(123, ByteBuffer.wrap(b1));
+        RowCacheKey key1 = new RowCacheKey(cfId, ByteBuffer.wrap(b1));
         byte[] b2 = {1, 2, 3, 4};
-        RowCacheKey key2 = new RowCacheKey(123, ByteBuffer.wrap(b2));
+        RowCacheKey key2 = new RowCacheKey(cfId, ByteBuffer.wrap(b2));
         assertEquals(key1, key2);
         assertEquals(key1.hashCode(), key2.hashCode());
         
         byte[] b3 = {1, 2, 3, 5};
-        RowCacheKey key3 = new RowCacheKey(123, ByteBuffer.wrap(b3));
+        RowCacheKey key3 = new RowCacheKey(cfId, ByteBuffer.wrap(b3));
         assertNotSame(key1, key3);
         assertNotSame(key1.hashCode(), key3.hashCode());
+    }
+
+    private class MeasureableString implements IMeasurableMemory
+    {
+        public final String string;
+
+        public MeasureableString(String input)
+        {
+            this.string = input;
+        }
+
+        public long unsharedHeapSize()
+        {
+            return string.length();
+        }
     }
 }

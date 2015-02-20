@@ -17,6 +17,9 @@
  */
 package org.apache.cassandra.io.sstable;
 
+import java.nio.ByteBuffer;
+import java.util.List;
+
 import org.apache.cassandra.utils.StreamingHistogram;
 
 /**
@@ -28,15 +31,135 @@ public class ColumnStats
     public final int columnCount;
 
     /** the largest (client-supplied) timestamp in the row */
+    public final long minTimestamp;
     public final long maxTimestamp;
-
+    public final int maxLocalDeletionTime;
     /** histogram of tombstone drop time */
     public final StreamingHistogram tombstoneHistogram;
 
-    public ColumnStats(int columnCount, long maxTimestamp, StreamingHistogram tombstoneHistogram)
+    /** max and min column names according to comparator */
+    public final List<ByteBuffer> minColumnNames;
+    public final List<ByteBuffer> maxColumnNames;
+
+    public final boolean hasLegacyCounterShards;
+
+    public ColumnStats(int columnCount,
+                       long minTimestamp,
+                       long maxTimestamp,
+                       int maxLocalDeletionTime,
+                       StreamingHistogram tombstoneHistogram,
+                       List<ByteBuffer> minColumnNames,
+                       List<ByteBuffer> maxColumnNames,
+                       boolean hasLegacyCounterShards)
     {
+        this.minTimestamp = minTimestamp;
         this.maxTimestamp = maxTimestamp;
+        this.maxLocalDeletionTime = maxLocalDeletionTime;
         this.columnCount = columnCount;
         this.tombstoneHistogram = tombstoneHistogram;
+        this.minColumnNames = minColumnNames;
+        this.maxColumnNames = maxColumnNames;
+        this.hasLegacyCounterShards = hasLegacyCounterShards;
     }
+
+    // We use explicit classes for ints and longs instead of generics to avoid boxing and unboxing (See CASSANDRA-8109)
+    public static class MinLongTracker
+    {
+        private final long defaultValue;
+        private boolean isSet = false;
+        private long value;
+
+        public MinLongTracker(long defaultValue)
+        {
+            this.defaultValue = defaultValue;
+        }
+
+        public void update(long value)
+        {
+            if (!isSet)
+            {
+                this.value = value;
+                isSet = true;
+            }
+            else
+            {
+                if (value < this.value)
+                    this.value = value;
+            }
+        }
+
+        public long get()
+        {
+            if (isSet)
+                return value;
+            return defaultValue;
+        }
+    }
+
+    public static class MaxLongTracker
+    {
+        private final long defaultValue;
+        private boolean isSet = false;
+        private long value;
+
+        public MaxLongTracker(long defaultValue)
+        {
+            this.defaultValue = defaultValue;
+        }
+
+        public void update(long value)
+        {
+            if (!isSet)
+            {
+                this.value = value;
+                isSet = true;
+            }
+            else
+            {
+                if (value >this.value)
+                    this.value = value;
+            }
+        }
+
+        public long get()
+        {
+            if (isSet)
+                return value;
+            return defaultValue;
+        }
+    }
+
+    public static class MaxIntTracker
+    {
+        private final int defaultValue;
+        private boolean isSet = false;
+        private int value;
+
+        public MaxIntTracker(int defaultValue)
+        {
+            this.defaultValue = defaultValue;
+        }
+
+        public void update(int value)
+        {
+            if (!isSet)
+            {
+                this.value = value;
+                isSet = true;
+            }
+            else
+            {
+                if (value > this.value)
+                    this.value = value;
+            }
+        }
+
+        public int get()
+        {
+            if (isSet)
+                return value;
+            return defaultValue;
+        }
+    }
+
 }

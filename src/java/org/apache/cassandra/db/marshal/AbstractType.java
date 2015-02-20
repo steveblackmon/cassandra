@@ -18,13 +18,18 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.db.IColumn;
-import static org.apache.cassandra.io.sstable.IndexHelper.IndexInfo;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.github.jamm.Unmetered;
 
 /**
  * Specifies a Comparator for a specific type of ByteBuffer.
@@ -34,44 +39,13 @@ import static org.apache.cassandra.io.sstable.IndexHelper.IndexInfo;
  * should always handle those values even if they normally do not
  * represent a valid ByteBuffer for the type being compared.
  */
+@Unmetered
 public abstract class AbstractType<T> implements Comparator<ByteBuffer>
 {
-    public final Comparator<IndexInfo> indexComparator;
-    public final Comparator<IndexInfo> indexReverseComparator;
-    public final Comparator<IColumn> columnComparator;
-    public final Comparator<IColumn> columnReverseComparator;
     public final Comparator<ByteBuffer> reverseComparator;
 
     protected AbstractType()
     {
-        indexComparator = new Comparator<IndexInfo>()
-        {
-            public int compare(IndexInfo o1, IndexInfo o2)
-            {
-                return AbstractType.this.compare(o1.lastName, o2.lastName);
-            }
-        };
-        indexReverseComparator = new Comparator<IndexInfo>()
-        {
-            public int compare(IndexInfo o1, IndexInfo o2)
-            {
-                return AbstractType.this.compare(o1.firstName, o2.firstName);
-            }
-        };
-        columnComparator = new Comparator<IColumn>()
-        {
-            public int compare(IColumn c1, IColumn c2)
-            {
-                return AbstractType.this.compare(c1.name(), c2.name());
-            }
-        };
-        columnReverseComparator = new Comparator<IColumn>()
-        {
-            public int compare(IColumn c1, IColumn c2)
-            {
-                return AbstractType.this.compare(c2.name(), c1.name());
-            }
-        };
         reverseComparator = new Comparator<ByteBuffer>()
         {
             public int compare(ByteBuffer o1, ByteBuffer o2)
@@ -90,24 +64,62 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         };
     }
 
-    public abstract T compose(ByteBuffer bytes);
+    public static List<String> asCQLTypeStringList(List<AbstractType<?>> abstractTypes)
+    {
+        List<String> r = new ArrayList<>(abstractTypes.size());
+        for (AbstractType<?> abstractType : abstractTypes)
+            r.add(abstractType.asCQL3Type().toString());
+        return r;
+    }
 
-    public abstract ByteBuffer decompose(T value);
+    public T compose(ByteBuffer bytes)
+    {
+        return getSerializer().deserialize(bytes);
+    }
+
+    public ByteBuffer decompose(T value)
+    {
+        return getSerializer().serialize(value);
+    }
 
     /** get a string representation of the bytes suitable for log messages */
-    public abstract String getString(ByteBuffer bytes);
+    public String getString(ByteBuffer bytes)
+    {
+        TypeSerializer<T> serializer = getSerializer();
+        serializer.validate(bytes);
+
+        return serializer.toString(serializer.deserialize(bytes));
+    }
 
     /** get a byte representation of the given string. */
     public abstract ByteBuffer fromString(String source) throws MarshalException;
 
     /* validate that the byte array is a valid sequence for the type we are supposed to be comparing */
-    public abstract void validate(ByteBuffer bytes) throws MarshalException;
-
-    /** @deprecated use reverseComparator field instead */
-    public Comparator<ByteBuffer> getReverseComparator()
+    public void validate(ByteBuffer bytes) throws MarshalException
     {
-        return reverseComparator;
+        getSerializer().validate(bytes);
     }
+
+    /**
+     * Validate cell value. Unlike {@linkplain #validate(java.nio.ByteBuffer)},
+     * cell value is passed to validate its content.
+     * Usually, this is the same as validate except collection.
+     *
+     * @param cellValue ByteBuffer representing cell value
+     * @throws MarshalException
+     */
+    public void validateCellValue(ByteBuffer cellValue) throws MarshalException
+    {
+        validate(cellValue);
+    }
+
+    /* Most of our internal type should override that. */
+    public CQL3Type asCQL3Type()
+    {
+        return new CQL3Type.Custom(this);
+    }
+
+    public abstract TypeSerializer<T> getSerializer();
 
     /* convenience method */
     public String getString(Collection<ByteBuffer> names)
@@ -120,23 +132,12 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return builder.toString();
     }
 
-    /* convenience method */
-    public String getColumnsString(Collection<IColumn> columns)
-    {
-        StringBuilder builder = new StringBuilder();
-        for (IColumn column : columns)
-        {
-            builder.append(column.getString(this)).append(",");
-        }
-        return builder.toString();
-    }
-
-    public boolean isCommutative()
+    public boolean isCounter()
     {
         return false;
     }
 
-    public static AbstractType<?> parseDefaultParameters(AbstractType<?> baseType, TypeParser parser) throws ConfigurationException
+    public static AbstractType<?> parseDefaultParameters(AbstractType<?> baseType, TypeParser parser) throws SyntaxException
     {
         Map<String, String> parameters = parser.getKeyValueParameters();
         String reversed = parameters.get("reversed");
@@ -162,7 +163,105 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
      */
     public boolean isCompatibleWith(AbstractType<?> previous)
     {
-        return this == previous;
+        return this.equals(previous);
+    }
+
+    /**
+     * Returns true if values of the other AbstractType can be read and "reasonably" interpreted by the this
+     * AbstractType. Note that this is a weaker version of isCompatibleWith, as it does not require that both type
+     * compare values the same way.
+     *
+     * The restriction on the other type being "reasonably" interpreted is to prevent, for example, IntegerType from
+     * being compatible with all other types.  Even though any byte string is a valid IntegerType value, it doesn't
+     * necessarily make sense to interpret a UUID or a UTF8 string as an integer.
+     *
+     * Note that a type should be compatible with at least itself.
+     */
+    public boolean isValueCompatibleWith(AbstractType<?> otherType)
+    {
+        return isValueCompatibleWithInternal((otherType instanceof ReversedType) ? ((ReversedType) otherType).baseType : otherType);
+    }
+
+    /**
+     * Needed to handle ReversedType in value-compatibility checks.  Subclasses should implement this instead of
+     * isValueCompatibleWith().
+     */
+    protected boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return isCompatibleWith(otherType);
+    }
+
+    /**
+     * @return true IFF the byte representation of this type can be compared unsigned
+     * and always return the same result as calling this object's compare or compareCollectionMembers methods
+     */
+    public boolean isByteOrderComparable()
+    {
+        return false;
+    }
+
+    /**
+     * An alternative comparison function used by CollectionsType in conjunction with CompositeType.
+     *
+     * This comparator is only called to compare components of a CompositeType. It gets the value of the
+     * previous component as argument (or null if it's the first component of the composite).
+     *
+     * Unless you're doing something very similar to CollectionsType, you shouldn't override this.
+     */
+    public int compareCollectionMembers(ByteBuffer v1, ByteBuffer v2, ByteBuffer collectionName)
+    {
+        return compare(v1, v2);
+    }
+
+    /**
+     * An alternative validation function used by CollectionsType in conjunction with CompositeType.
+     *
+     * This is similar to the compare function above.
+     */
+    public void validateCollectionMember(ByteBuffer bytes, ByteBuffer collectionName) throws MarshalException
+    {
+        validate(bytes);
+    }
+
+    public boolean isCollection()
+    {
+        return false;
+    }
+
+    public boolean isMultiCell()
+    {
+        return false;
+    }
+
+    public AbstractType<?> freeze()
+    {
+        return this;
+    }
+
+    /**
+     * @param ignoreFreezing if true, the type string will not be wrapped with FrozenType(...), even if this type is frozen.
+     */
+    public String toString(boolean ignoreFreezing)
+    {
+        return this.toString();
+    }
+
+    /**
+     * The number of subcomponents this type has.
+     * This is always 1, i.e. the type has only itself as "subcomponents", except for CompositeType.
+     */
+    public int componentsCount()
+    {
+        return 1;
+    }
+
+    /**
+     * Return a list of the "subcomponents" this type has.
+     * This always return a singleton list with the type itself except for CompositeType.
+     */
+    public List<AbstractType<?>> getComponents()
+    {
+        return Collections.<AbstractType<?>>singletonList(this);
     }
 
     /**

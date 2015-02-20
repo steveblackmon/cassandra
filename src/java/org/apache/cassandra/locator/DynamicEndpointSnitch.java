@@ -24,34 +24,39 @@ import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
+
+import com.codahale.metrics.ExponentiallyDecayingReservoir;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.BoundedStatsDeque;
 import org.apache.cassandra.utils.FBUtilities;
+
 
 /**
  * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
  */
 public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILatencySubscriber, DynamicEndpointSnitchMBean
 {
-    private static final int UPDATES_PER_INTERVAL = 10000;
+    private static final double ALPHA = 0.75; // set to 0.75 to make EDS more biased to towards the newer values
     private static final int WINDOW_SIZE = 100;
 
     private int UPDATE_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicUpdateInterval();
     private int RESET_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicResetInterval();
     private double BADNESS_THRESHOLD = DatabaseDescriptor.getDynamicBadnessThreshold();
+
+    // the score for a merged set of endpoints must be this much worse than the score for separate endpoints to
+    // warrant not merging two ranges into a single range
+    private double RANGE_MERGING_PREFERENCE = 1.5;
+
     private String mbeanName;
     private boolean registered = false;
 
-    private final ConcurrentHashMap<InetAddress, Double> scores = new ConcurrentHashMap<InetAddress, Double>();
-    private final ConcurrentHashMap<InetAddress, Long> lastReceived = new ConcurrentHashMap<InetAddress, Long>();
-    private final ConcurrentHashMap<InetAddress, BoundedStatsDeque> windows = new ConcurrentHashMap<InetAddress, BoundedStatsDeque>();
-    private final AtomicInteger intervalupdates = new AtomicInteger(0);
+    private volatile HashMap<InetAddress, Double> scores = new HashMap<>();
+    private final ConcurrentHashMap<InetAddress, ExponentiallyDecayingReservoir> samples = new ConcurrentHashMap<>();
 
     public final IEndpointSnitch subsnitch;
 
@@ -81,8 +86,8 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
                 reset();
             }
         };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(update, UPDATE_INTERVAL_IN_MS, UPDATE_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-        StorageService.scheduledTasks.scheduleWithFixedDelay(reset, RESET_INTERVAL_IN_MS, RESET_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(update, UPDATE_INTERVAL_IN_MS, UPDATE_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(reset, RESET_INTERVAL_IN_MS, RESET_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
         registerMBean();
    }
 
@@ -158,16 +163,27 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
     {
         if (addresses.size() < 2)
             return;
+
         subsnitch.sortByProximity(address, addresses);
-        Double first = scores.get(addresses.get(0));
-        if (first == null)
-            return;
-        for (InetAddress addr : addresses)
+        ArrayList<Double> subsnitchOrderedScores = new ArrayList<>(addresses.size());
+        for (InetAddress inet : addresses)
         {
-            Double next = scores.get(addr);
-            if (next == null)
+            Double score = scores.get(inet);
+            if (score == null)
                 return;
-            if ((first - next) / first > BADNESS_THRESHOLD)
+            subsnitchOrderedScores.add(score);
+        }
+
+        // Sort the scores and then compare them (positionally) to the scores in the subsnitch order.
+        // If any of the subsnitch-ordered scores exceed the optimal/sorted score by BADNESS_THRESHOLD, use
+        // the score-sorted ordering instead of the subsnitch ordering.
+        ArrayList<Double> sortedScores = new ArrayList<>(subsnitchOrderedScores);
+        Collections.sort(sortedScores);
+
+        Iterator<Double> sortedScoreIterator = sortedScores.iterator();
+        for (Double subsnitchScore : subsnitchOrderedScores)
+        {
+            if (subsnitchScore > (sortedScoreIterator.next() * (1.0 + BADNESS_THRESHOLD)))
             {
                 sortByProximityWithScore(address, addresses);
                 return;
@@ -183,13 +199,13 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         if (scored1 == null)
         {
             scored1 = 0.0;
-            receiveTiming(a1, 0.0);
+            receiveTiming(a1, 0);
         }
 
         if (scored2 == null)
         {
             scored2 = 0.0;
-            receiveTiming(a2, 0.0);
+            receiveTiming(a2, 0);
         }
 
         if (scored1.equals(scored2))
@@ -200,21 +216,17 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
             return 1;
     }
 
-    public void receiveTiming(InetAddress host, Double latency) // this is cheap
+    public void receiveTiming(InetAddress host, long latency) // this is cheap
     {
-        lastReceived.put(host, System.currentTimeMillis());
-        if (intervalupdates.intValue() >= UPDATES_PER_INTERVAL)
-            return;
-        BoundedStatsDeque deque = windows.get(host);
-        if (deque == null)
+        ExponentiallyDecayingReservoir sample = samples.get(host);
+        if (sample == null)
         {
-            BoundedStatsDeque maybeNewDeque = new BoundedStatsDeque(WINDOW_SIZE);
-            deque = windows.putIfAbsent(host, maybeNewDeque);
-            if (deque == null)
-                deque = maybeNewDeque;
+            ExponentiallyDecayingReservoir maybeNewSample = new ExponentiallyDecayingReservoir(WINDOW_SIZE, ALPHA);
+            sample = samples.putIfAbsent(host, maybeNewSample);
+            if (sample == null)
+                sample = maybeNewSample;
         }
-        deque.add(latency);
-        intervalupdates.getAndIncrement();
+        sample.update(latency);
     }
 
     private void updateScores() // this is expensive
@@ -231,40 +243,32 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
 
         }
         double maxLatency = 1;
-        long maxPenalty = 1;
-        HashMap<InetAddress, Long> penalties = new HashMap<InetAddress, Long>();
-        for (Map.Entry<InetAddress, BoundedStatsDeque> entry : windows.entrySet())
+        // We're going to weight the latency for each host against the worst one we see, to
+        // arrive at sort of a 'badness percentage' for them. First, find the worst for each:
+        HashMap<InetAddress, Double> newScores = new HashMap<>();
+        for (Map.Entry<InetAddress, ExponentiallyDecayingReservoir> entry : samples.entrySet())
         {
-            double mean = entry.getValue().mean();
+            double mean = entry.getValue().getSnapshot().getMedian();
             if (mean > maxLatency)
                 maxLatency = mean;
-            long timePenalty = lastReceived.containsKey(entry.getKey()) ? lastReceived.get(entry.getKey()) : System.currentTimeMillis();
-            timePenalty = System.currentTimeMillis() - timePenalty;
-            timePenalty = timePenalty > UPDATE_INTERVAL_IN_MS ? UPDATE_INTERVAL_IN_MS : timePenalty;
-            penalties.put(entry.getKey(), timePenalty);
-            if (timePenalty > maxPenalty)
-                maxPenalty = timePenalty;
         }
-        for (Map.Entry<InetAddress, BoundedStatsDeque> entry: windows.entrySet())
+        // now make another pass to do the weighting based on the maximums we found before
+        for (Map.Entry<InetAddress, ExponentiallyDecayingReservoir> entry: samples.entrySet())
         {
-            double score = entry.getValue().mean() / maxLatency;
-            if (penalties.containsKey(entry.getKey()))
-                score += penalties.get(entry.getKey()) / ((double) maxPenalty);
-            else
-                score += 1; // maxPenalty / maxPenalty
+            double score = entry.getValue().getSnapshot().getMedian() / maxLatency;
+            // finally, add the severity without any weighting, since hosts scale this relative to their own load and the size of the task causing the severity.
+            // "Severity" is basically a measure of compaction activity (CASSANDRA-3722).
             score += StorageService.instance.getSeverity(entry.getKey());
-            scores.put(entry.getKey(), score);            
+            // lowest score (least amount of badness) wins.
+            newScores.put(entry.getKey(), score);
         }
-        intervalupdates.set(0);
+        scores = newScores;
     }
 
 
     private void reset()
     {
-        for (BoundedStatsDeque deque : windows.values())
-        {
-            deque.clear();
-        }
+       samples.clear();
     }
 
     public Map<InetAddress, Double> getScores()
@@ -293,20 +297,18 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
     {
         InetAddress host = InetAddress.getByName(hostname);
         ArrayList<Double> timings = new ArrayList<Double>();
-        BoundedStatsDeque window = windows.get(host);
-        if (window != null)
+        ExponentiallyDecayingReservoir sample = samples.get(host);
+        if (sample != null)
         {
-            for (double time: window)
-            {
+            for (double time: sample.getSnapshot().getValues())
                 timings.add(time);
-            }
         }
         return timings;
     }
 
     public void setSeverity(double severity)
     {
-        StorageService.instance.reportSeverity(severity);
+        StorageService.instance.reportManualSeverity(severity);
     }
 
     public double getSeverity()
@@ -314,4 +316,38 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         return StorageService.instance.getSeverity(FBUtilities.getBroadcastAddress());
     }
 
+    public boolean isWorthMergingForRangeQuery(List<InetAddress> merged, List<InetAddress> l1, List<InetAddress> l2)
+    {
+        if (!subsnitch.isWorthMergingForRangeQuery(merged, l1, l2))
+            return false;
+
+        // skip checking scores in the single-node case
+        if (l1.size() == 1 && l2.size() == 1 && l1.get(0).equals(l2.get(0)))
+            return true;
+
+        // Make sure we return the subsnitch decision (i.e true if we're here) if we lack too much scores
+        double maxMerged = maxScore(merged);
+        double maxL1 = maxScore(l1);
+        double maxL2 = maxScore(l2);
+        if (maxMerged < 0 || maxL1 < 0 || maxL2 < 0)
+            return true;
+
+        return maxMerged <= (maxL1 + maxL2) * RANGE_MERGING_PREFERENCE;
+    }
+
+    // Return the max score for the endpoint in the provided list, or -1.0 if no node have a score.
+    private double maxScore(List<InetAddress> endpoints)
+    {
+        double maxScore = -1.0;
+        for (InetAddress endpoint : endpoints)
+        {
+            Double score = scores.get(endpoint);
+            if (score == null)
+                continue;
+
+            if (score > maxScore)
+                maxScore = score;
+        }
+        return maxScore;
+    }
 }

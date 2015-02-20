@@ -17,9 +17,8 @@
  */
 package org.apache.cassandra.service;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.ReadResponse;
@@ -28,15 +27,15 @@ import org.apache.cassandra.net.MessageIn;
 
 public class RowDigestResolver extends AbstractRowResolver
 {
-    public RowDigestResolver(String table, ByteBuffer key)
+    public RowDigestResolver(String keyspaceName, ByteBuffer key, int maxResponseCount)
     {
-        super(key, table);
+        super(key, keyspaceName, maxResponseCount);
     }
 
     /**
      * Special case of resolve() so that CL.ONE reads never throw DigestMismatchException in the foreground
      */
-    public Row getData() throws IOException
+    public Row getData()
     {
         for (MessageIn<ReadResponse> message : replies)
         {
@@ -44,8 +43,7 @@ public class RowDigestResolver extends AbstractRowResolver
             if (!result.isDigestQuery())
                 return result.row();
         }
-
-        throw new AssertionError("getData should not be invoked when no data is present");
+        return null;
     }
 
     /*
@@ -58,12 +56,12 @@ public class RowDigestResolver extends AbstractRowResolver
      * b) we're checking additional digests that arrived after the minimum to handle
      *    the requested ConsistencyLevel, i.e. asynchronous read repair check
      */
-    public Row resolve() throws DigestMismatchException, IOException
+    public Row resolve() throws DigestMismatchException
     {
         if (logger.isDebugEnabled())
-            logger.debug("resolving " + replies.size() + " responses");
+            logger.debug("resolving {} responses", replies.size());
 
-        long startTime = System.currentTimeMillis();
+        long start = System.nanoTime();
 
         // validate digests against each other; throw immediately on mismatch.
         // also extract the data reply, if any.
@@ -73,41 +71,27 @@ public class RowDigestResolver extends AbstractRowResolver
         for (MessageIn<ReadResponse> message : replies)
         {
             ReadResponse response = message.payload;
+
+            ByteBuffer newDigest;
             if (response.isDigestQuery())
             {
-                if (digest == null)
-                {
-                    digest = response.digest();
-                }
-                else
-                {
-                    ByteBuffer digest2 = response.digest();
-                    if (!digest.equals(digest2))
-                        throw new DigestMismatchException(key, digest, digest2);
-                }
+                newDigest = response.digest();
             }
             else
             {
+                // note that this allows for multiple data replies, post-CASSANDRA-5932
                 data = response.row().cf;
+                newDigest = ColumnFamily.digest(data);
             }
-        }
 
-        // Compare digest (only one, since we threw earlier if there were different replies)
-        // with the data response. If there is a mismatch then throw an exception so that read repair can happen.
-        //
-        // It's important to note that we do not consider the possibility of multiple data responses --
-        // that can only happen when we're doing the repair post-mismatch, and will be handled by RowRepairResolver.
-        if (digest != null)
-        {
-            ByteBuffer digest2 = ColumnFamily.digest(data);
-            if (!digest.equals(digest2))
-                throw new DigestMismatchException(key, digest, digest2);
-            if (logger.isDebugEnabled())
-                logger.debug("digests verified");
+            if (digest == null)
+                digest = newDigest;
+            else if (!digest.equals(newDigest))
+                throw new DigestMismatchException(key, digest, newDigest);
         }
 
         if (logger.isDebugEnabled())
-            logger.debug("resolve: " + (System.currentTimeMillis() - startTime) + " ms.");
+            logger.debug("resolve: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
         return new Row(key, data);
     }
 

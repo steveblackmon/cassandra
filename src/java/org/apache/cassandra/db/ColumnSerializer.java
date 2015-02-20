@@ -18,44 +18,67 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.io.IColumnSerializer;
+import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.CellNameType;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class ColumnSerializer implements IColumnSerializer
+public class ColumnSerializer implements ISerializer<Cell>
 {
-    private static final Logger logger = LoggerFactory.getLogger(ColumnSerializer.class);
+    public final static int DELETION_MASK        = 0x01;
+    public final static int EXPIRATION_MASK      = 0x02;
+    public final static int COUNTER_MASK         = 0x04;
+    public final static int COUNTER_UPDATE_MASK  = 0x08;
+    public final static int RANGE_TOMBSTONE_MASK = 0x10;
 
-    public final static int DELETION_MASK       = 0x01;
-    public final static int EXPIRATION_MASK     = 0x02;
-    public final static int COUNTER_MASK        = 0x04;
-    public final static int COUNTER_UPDATE_MASK = 0x08;
-
-    public void serialize(IColumn column, DataOutput dos)
+    /**
+     * Flag affecting deserialization behavior.
+     *  - LOCAL: for deserialization of local data (Expired columns are
+     *      converted to tombstones (to gain disk space)).
+     *  - FROM_REMOTE: for deserialization of data received from remote hosts
+     *      (Expired columns are converted to tombstone and counters have
+     *      their delta cleared)
+     *  - PRESERVE_SIZE: used when no transformation must be performed, i.e,
+     *      when we must ensure that deserializing and reserializing the
+     *      result yield the exact same bytes. Streaming uses this.
+     */
+    public static enum Flag
     {
-        assert column.name().remaining() > 0;
-        ByteBufferUtil.writeWithShortLength(column.name(), dos);
+        LOCAL, FROM_REMOTE, PRESERVE_SIZE;
+    }
+
+    private final CellNameType type;
+
+    public ColumnSerializer(CellNameType type)
+    {
+        this.type = type;
+    }
+
+    public void serialize(Cell cell, DataOutputPlus out) throws IOException
+    {
+        assert !cell.name().isEmpty();
+        type.cellSerializer().serialize(cell.name(), out);
         try
         {
-            dos.writeByte(column.serializationFlags());
-            if (column instanceof CounterColumn)
+            out.writeByte(cell.serializationFlags());
+            if (cell instanceof CounterCell)
             {
-                dos.writeLong(((CounterColumn)column).timestampOfLastDelete());
+                out.writeLong(((CounterCell) cell).timestampOfLastDelete());
             }
-            else if (column instanceof ExpiringColumn)
+            else if (cell instanceof ExpiringCell)
             {
-                dos.writeInt(((ExpiringColumn) column).getTimeToLive());
-                dos.writeInt(column.getLocalDeletionTime());
+                out.writeInt(((ExpiringCell) cell).getTimeToLive());
+                out.writeInt(cell.getLocalDeletionTime());
             }
-            dos.writeLong(column.timestamp());
-            ByteBufferUtil.writeWithLength(column.value(), dos);
+            out.writeLong(cell.timestamp());
+            ByteBufferUtil.writeWithLength(cell.value(), out);
         }
         catch (IOException e)
         {
@@ -63,9 +86,9 @@ public class ColumnSerializer implements IColumnSerializer
         }
     }
 
-    public Column deserialize(DataInput dis) throws IOException
+    public Cell deserialize(DataInput in) throws IOException
     {
-        return deserialize(dis, Flag.LOCAL);
+        return deserialize(in, Flag.LOCAL);
     }
 
     /*
@@ -73,64 +96,93 @@ public class ColumnSerializer implements IColumnSerializer
      * deserialize comes from a remote host. If it does, then we must clear
      * the delta.
      */
-    public Column deserialize(DataInput dis, IColumnSerializer.Flag flag) throws IOException
+    public Cell deserialize(DataInput in, ColumnSerializer.Flag flag) throws IOException
     {
-        return deserialize(dis, flag, (int) (System.currentTimeMillis() / 1000));
+        return deserialize(in, flag, Integer.MIN_VALUE);
     }
 
-    public Column deserialize(DataInput dis, IColumnSerializer.Flag flag, int expireBefore) throws IOException
+    public Cell deserialize(DataInput in, ColumnSerializer.Flag flag, int expireBefore) throws IOException
     {
-        ByteBuffer name = ByteBufferUtil.readWithShortLength(dis);
-        if (name.remaining() <= 0)
-        {
-            String format = "invalid column name length %d%s";
-            String details = "";
-            if (dis instanceof FileDataInput)
-            {
-                FileDataInput fdis = (FileDataInput)dis;
-                details = String.format(" (%s, %d bytes remaining)", fdis.getPath(), fdis.bytesRemaining());
-            }
-            throw new CorruptColumnException(String.format(format, name.remaining(), details));
-        }
+        CellName name = type.cellSerializer().deserialize(in);
 
-        int b = dis.readUnsignedByte();
-        if ((b & COUNTER_MASK) != 0)
+        int b = in.readUnsignedByte();
+        return deserializeColumnBody(in, name, b, flag, expireBefore);
+    }
+
+    Cell deserializeColumnBody(DataInput in, CellName name, int mask, ColumnSerializer.Flag flag, int expireBefore) throws IOException
+    {
+        if ((mask & COUNTER_MASK) != 0)
         {
-            long timestampOfLastDelete = dis.readLong();
-            long ts = dis.readLong();
-            ByteBuffer value = ByteBufferUtil.readWithLength(dis);
-            return CounterColumn.create(name, value, ts, timestampOfLastDelete, flag);
+            long timestampOfLastDelete = in.readLong();
+            long ts = in.readLong();
+            ByteBuffer value = ByteBufferUtil.readWithLength(in);
+            return BufferCounterCell.create(name, value, ts, timestampOfLastDelete, flag);
         }
-        else if ((b & EXPIRATION_MASK) != 0)
+        else if ((mask & EXPIRATION_MASK) != 0)
         {
-            int ttl = dis.readInt();
-            int expiration = dis.readInt();
-            long ts = dis.readLong();
-            ByteBuffer value = ByteBufferUtil.readWithLength(dis);
-            return ExpiringColumn.create(name, value, ts, ttl, expiration, expireBefore, flag);
+            int ttl = in.readInt();
+            int expiration = in.readInt();
+            long ts = in.readLong();
+            ByteBuffer value = ByteBufferUtil.readWithLength(in);
+            return BufferExpiringCell.create(name, value, ts, ttl, expiration, expireBefore, flag);
         }
         else
         {
-            long ts = dis.readLong();
-            ByteBuffer value = ByteBufferUtil.readWithLength(dis);
-            return (b & COUNTER_UPDATE_MASK) != 0
-                   ? new CounterUpdateColumn(name, value, ts)
-                   : ((b & DELETION_MASK) == 0
-                      ? new Column(name, value, ts)
-                      : new DeletedColumn(name, value, ts));
+            long ts = in.readLong();
+            ByteBuffer value = ByteBufferUtil.readWithLength(in);
+            return (mask & COUNTER_UPDATE_MASK) != 0
+                   ? new BufferCounterUpdateCell(name, value, ts)
+                   : ((mask & DELETION_MASK) == 0
+                      ? new BufferCell(name, value, ts)
+                      : new BufferDeletedCell(name, value, ts));
         }
     }
 
-    public long serializedSize(IColumn object, TypeSizes type)
+    void skipColumnBody(DataInput in, int mask) throws IOException
     {
-        return object.serializedSize(type);
+        if ((mask & COUNTER_MASK) != 0)
+            FileUtils.skipBytesFully(in, 16);
+        else if ((mask & EXPIRATION_MASK) != 0)
+            FileUtils.skipBytesFully(in, 16);
+        else
+            FileUtils.skipBytesFully(in, 8);
+
+        int length = in.readInt();
+        FileUtils.skipBytesFully(in, length);
     }
 
-    private static class CorruptColumnException extends IOException
+    public long serializedSize(Cell cell, TypeSizes typeSizes)
+    {
+        return cell.serializedSize(type, typeSizes);
+    }
+
+    public static class CorruptColumnException extends IOException
     {
         public CorruptColumnException(String s)
         {
             super(s);
+        }
+
+        public static CorruptColumnException create(DataInput in, ByteBuffer name)
+        {
+            assert name.remaining() <= 0;
+            String format = "invalid column name length %d%s";
+            String details = "";
+            if (in instanceof FileDataInput)
+            {
+                FileDataInput fdis = (FileDataInput)in;
+                long remaining;
+                try
+                {
+                    remaining = fdis.bytesRemaining();
+                }
+                catch (IOException e)
+                {
+                    throw new FSReadError(e, fdis.getPath());
+                }
+                details = String.format(" (%s, %d bytes remaining)", fdis.getPath(), remaining);
+            }
+            return new CorruptColumnException(String.format(format, name.remaining(), details));
         }
     }
 }

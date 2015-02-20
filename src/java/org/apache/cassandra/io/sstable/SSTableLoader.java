@@ -22,56 +22,68 @@ import java.io.FilenameFilter;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.util.*;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.ConfigurationException;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.streaming.*;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Pair;
+
+import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
  * Cassandra SSTable bulk loader.
  * Load an externally created sstable into a cluster.
  */
-public class SSTableLoader
+public class SSTableLoader implements StreamEventHandler
 {
     private final File directory;
     private final String keyspace;
     private final Client client;
+    private final int connectionsPerHost;
     private final OutputHandler outputHandler;
+    private final Set<InetAddress> failedHosts = new HashSet<>();
 
-    static
-    {
-        Config.setLoadYaml(false);
-    }
+    private final List<SSTableReader> sstables = new ArrayList<>();
+    private final Multimap<InetAddress, StreamSession.SSTableStreamingSections> streamingDetails = HashMultimap.create();
 
     public SSTableLoader(File directory, Client client, OutputHandler outputHandler)
+    {
+        this(directory, client, outputHandler, 1);
+    }
+
+    public SSTableLoader(File directory, Client client, OutputHandler outputHandler, int connectionsPerHost)
     {
         this.directory = directory;
         this.keyspace = directory.getParentFile().getName();
         this.client = client;
         this.outputHandler = outputHandler;
+        this.connectionsPerHost = connectionsPerHost;
     }
 
-    protected Collection<SSTableReader> openSSTables()
+    protected Collection<SSTableReader> openSSTables(final Map<InetAddress, Collection<Range<Token>>> ranges)
     {
-        final List<SSTableReader> sstables = new LinkedList<SSTableReader>();
+        outputHandler.output("Opening sstables and calculating sections to stream");
 
         directory.list(new FilenameFilter()
         {
             public boolean accept(File dir, String name)
             {
+                if (new File(dir, name).isDirectory())
+                    return false;
                 Pair<Descriptor, Component> p = SSTable.tryComponentFromFilename(dir, name);
                 Descriptor desc = p == null ? null : p.left;
-                if (p == null || !p.right.equals(Component.DATA) || desc.temporary)
+                if (p == null || !p.right.equals(Component.DATA) || desc.type.isTemporary)
                     return false;
 
                 if (!new File(desc.filenameFor(Component.PRIMARY_INDEX)).exists())
@@ -80,21 +92,49 @@ public class SSTableLoader
                     return false;
                 }
 
-                if (!client.validateColumnFamily(keyspace, desc.cfname))
+                CFMetaData metadata = client.getCFMetaData(keyspace, desc.cfname);
+                if (metadata == null)
                 {
-                    outputHandler.output(String.format("Skipping file %s: column family %s.%s doesn't exist", name, keyspace, desc.cfname));
+                    outputHandler.output(String.format("Skipping file %s: table %s.%s doesn't exist", name, keyspace, desc.cfname));
                     return false;
                 }
 
-                Set<Component> components = new HashSet<Component>();
+                Set<Component> components = new HashSet<>();
                 components.add(Component.DATA);
                 components.add(Component.PRIMARY_INDEX);
+                if (new File(desc.filenameFor(Component.SUMMARY)).exists())
+                    components.add(Component.SUMMARY);
                 if (new File(desc.filenameFor(Component.COMPRESSION_INFO)).exists())
                     components.add(Component.COMPRESSION_INFO);
+                if (new File(desc.filenameFor(Component.STATS)).exists())
+                    components.add(Component.STATS);
 
                 try
                 {
-                    sstables.add(SSTableReader.open(desc, components, null, client.getPartitioner()));
+                    // To conserve memory, open SSTableReaders without bloom filters and discard
+                    // the index summary after calculating the file sections to stream and the estimated
+                    // number of keys for each endpoint. See CASSANDRA-5555 for details.
+                    SSTableReader sstable = SSTableReader.openForBatch(desc, components, metadata, client.getPartitioner());
+                    sstables.add(sstable);
+
+                    // calculate the sstable sections to stream as well as the estimated number of
+                    // keys per host
+                    for (Map.Entry<InetAddress, Collection<Range<Token>>> entry : ranges.entrySet())
+                    {
+                        InetAddress endpoint = entry.getKey();
+                        Collection<Range<Token>> tokenRanges = entry.getValue();
+
+                        List<Pair<Long, Long>> sstableSections = sstable.getPositionsForRanges(tokenRanges);
+                        long estimatedKeys = sstable.estimatedKeysForRanges(tokenRanges);
+                        Ref ref = sstable.tryRef();
+                        if (ref == null)
+                            throw new IllegalStateException("Could not acquire ref for "+sstable);
+                        StreamSession.SSTableStreamingSections details = new StreamSession.SSTableStreamingSections(sstable, ref, sstableSections, estimatedKeys, ActiveRepairService.UNREPAIRED_SSTABLE);
+                        streamingDetails.put(endpoint, details);
+                    }
+
+                    // to conserve heap space when bulk loading
+                    sstable.releaseSummary();
                 }
                 catch (IOException e)
                 {
@@ -106,110 +146,76 @@ public class SSTableLoader
         return sstables;
     }
 
-    public LoaderFuture stream() throws IOException
+    public StreamResultFuture stream()
     {
         return stream(Collections.<InetAddress>emptySet());
     }
 
-    public LoaderFuture stream(Set<InetAddress> toIgnore) throws IOException
+    public StreamResultFuture stream(Set<InetAddress> toIgnore, StreamEventHandler... listeners)
     {
         client.init(keyspace);
+        outputHandler.output("Established connection to initial hosts");
 
-        Collection<SSTableReader> sstables = openSSTables();
-        if (sstables.isEmpty())
-        {
-            outputHandler.output("No sstables to stream");
-            return new LoaderFuture(0);
-        }
+        StreamPlan plan = new StreamPlan("Bulk Load", 0, connectionsPerHost, false).connectionFactory(client.getConnectionFactory());
 
         Map<InetAddress, Collection<Range<Token>>> endpointToRanges = client.getEndpointToRangesMap();
-        outputHandler.output(String.format("Streaming revelant part of %sto %s", names(sstables), endpointToRanges.keySet()));
+        openSSTables(endpointToRanges);
+        if (sstables.isEmpty())
+        {
+            // return empty result
+            return plan.execute();
+        }
 
-        // There will be one streaming session by endpoint
-        LoaderFuture future = new LoaderFuture(endpointToRanges.size());
+        outputHandler.output(String.format("Streaming relevant part of %sto %s", names(sstables), endpointToRanges.keySet()));
+
         for (Map.Entry<InetAddress, Collection<Range<Token>>> entry : endpointToRanges.entrySet())
         {
             InetAddress remote = entry.getKey();
             if (toIgnore.contains(remote))
-            {
-                future.latch.countDown();
                 continue;
+
+            List<StreamSession.SSTableStreamingSections> endpointDetails = new LinkedList<>();
+
+            // references are acquired when constructing the SSTableStreamingSections above
+            for (StreamSession.SSTableStreamingSections details : streamingDetails.get(remote))
+            {
+                endpointDetails.add(details);
             }
-            Collection<Range<Token>> ranges = entry.getValue();
-            StreamOutSession session = StreamOutSession.create(keyspace, remote, new CountDownCallback(future, remote));
-            // transferSSTables assumes references have been acquired
-            SSTableReader.acquireReferences(sstables);
-            StreamOut.transferSSTables(session, sstables, ranges, OperationType.BULK_LOAD);
-            future.setPendings(remote, session.getFiles());
+
+            plan.transferFiles(remote, endpointDetails);
         }
-        return future;
+        plan.listeners(this, listeners);
+        return plan.execute();
     }
 
-    public static class LoaderFuture implements Future<Void>
+    public void onSuccess(StreamState finalState)
     {
-        final CountDownLatch latch;
-        final Map<InetAddress, Collection<PendingFile>> pendingFiles;
-        private List<InetAddress> failedHosts = new ArrayList<InetAddress>();
+        releaseReferences();
+    }
+    public void onFailure(Throwable t)
+    {
+        releaseReferences();
+    }
 
-        private LoaderFuture(int request)
+    /**
+     * releases the shared reference for all sstables, we acquire this when opening the sstable
+     */
+    private void releaseReferences()
+    {
+        for (SSTableReader sstable : sstables)
         {
-            latch = new CountDownLatch(request);
-            pendingFiles = new HashMap<InetAddress, Collection<PendingFile>>();
+            sstable.selfRef().release();
+            assert sstable.selfRef().globalCount() == 0;
         }
+    }
 
-        private void setPendings(InetAddress remote, Collection<PendingFile> files)
+    public void handleStreamEvent(StreamEvent event)
+    {
+        if (event.eventType == StreamEvent.Type.STREAM_COMPLETE)
         {
-            pendingFiles.put(remote, new ArrayList(files));
-        }
-
-        private void setFailed(InetAddress addr)
-        {
-            failedHosts.add(addr);
-        }
-
-        public List<InetAddress> getFailedHosts()
-        {
-            return failedHosts;
-        }
-
-        public boolean cancel(boolean mayInterruptIfRunning)
-        {
-            throw new UnsupportedOperationException("Cancellation is not yet supported");
-        }
-
-        public Void get() throws InterruptedException
-        {
-            latch.await();
-            return null;
-        }
-
-        public Void get(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
-        {
-            if (latch.await(timeout, unit))
-                return null;
-            else
-                throw new TimeoutException();
-        }
-
-        public boolean isCancelled()
-        {
-            // For now, cancellation is not supported, maybe one day...
-            return false;
-        }
-
-        public boolean isDone()
-        {
-            return latch.getCount() == 0;
-        }
-
-        public boolean hadFailures()
-        {
-            return failedHosts.size() > 0;
-        }
-
-        public Map<InetAddress, Collection<PendingFile>> getPendingFiles()
-        {
-            return pendingFiles;
+            StreamEvent.SessionCompleteEvent se = (StreamEvent.SessionCompleteEvent) event;
+            if (!se.success)
+                failedHosts.add(se.peer);
         }
     }
 
@@ -221,48 +227,14 @@ public class SSTableLoader
         return builder.toString();
     }
 
-    private class CountDownCallback implements IStreamCallback
+    public Set<InetAddress> getFailedHosts()
     {
-        private final InetAddress endpoint;
-        private final LoaderFuture future;
-
-        CountDownCallback(LoaderFuture future, InetAddress endpoint)
-        {
-            this.future = future;
-            this.endpoint = endpoint;
-        }
-
-        public void onSuccess()
-        {
-            future.latch.countDown();
-            outputHandler.debug(String.format("Streaming session to %s completed (waiting on %d outstanding sessions)", endpoint, future.latch.getCount()));
-
-            // There could be race with stop being called twice but it should be ok
-            if (future.latch.getCount() == 0)
-                client.stop();
-        }
-
-        public void onFailure()
-        {
-            outputHandler.output(String.format("Streaming session to %s failed", endpoint));
-            future.setFailed(endpoint);
-            future.latch.countDown();
-            client.stop();
-        }
-    }
-
-    public interface OutputHandler
-    {
-        // called when an important info need to be displayed
-        public void output(String msg);
-
-        // called when a less important info need to be displayed
-        public void debug(String msg);
+        return failedHosts;
     }
 
     public static abstract class Client
     {
-        private final Map<InetAddress, Collection<Range<Token>>> endpointToRanges = new HashMap<InetAddress, Collection<Range<Token>>>();
+        private final Map<InetAddress, Collection<Range<Token>>> endpointToRanges = new HashMap<>();
         private IPartitioner partitioner;
 
         /**
@@ -282,10 +254,21 @@ public class SSTableLoader
         public void stop() {}
 
         /**
+         * Provides connection factory.
+         * By default, it uses DefaultConnectionFactory.
+         *
+         * @return StreamConnectionFactory to use
+         */
+        public StreamConnectionFactory getConnectionFactory()
+        {
+            return new DefaultConnectionFactory();
+        }
+
+        /**
          * Validate that {@code keyspace} is an existing keyspace and {@code
          * cfName} one of its existing column family.
          */
-        public abstract boolean validateColumnFamily(String keyspace, String cfName);
+        public abstract CFMetaData getCFMetaData(String keyspace, String cfName);
 
         public Map<InetAddress, Collection<Range<Token>>> getEndpointToRangesMap()
         {
@@ -294,7 +277,13 @@ public class SSTableLoader
 
         protected void setPartitioner(String partclass) throws ConfigurationException
         {
-            this.partitioner = FBUtilities.newPartitioner(partclass);
+            setPartitioner(FBUtilities.newPartitioner(partclass));
+        }
+
+        protected void setPartitioner(IPartitioner partitioner)
+        {
+            this.partitioner = partitioner;
+            // the following is still necessary since Range/Token reference partitioner through StorageService.getPartitioner
             DatabaseDescriptor.setPartitioner(partitioner);
         }
 
@@ -308,7 +297,7 @@ public class SSTableLoader
             Collection<Range<Token>> ranges = endpointToRanges.get(endpoint);
             if (ranges == null)
             {
-                ranges = new HashSet<Range<Token>>();
+                ranges = new HashSet<>();
                 endpointToRanges.put(endpoint, ranges);
             }
             ranges.add(range);

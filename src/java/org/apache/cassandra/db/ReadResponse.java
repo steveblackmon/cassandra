@@ -20,14 +20,14 @@ package org.apache.cassandra.db;
 import java.io.*;
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /*
  * The read response message is sent by the server when reading data
- * this encapsulates the tablename and the row that has been read.
- * The table name is needed so that we can use it to create repairs.
+ * this encapsulates the keyspacename and the row that has been read.
+ * The keyspace name is needed so that we can use it to create repairs.
  */
 public class ReadResponse
 {
@@ -68,33 +68,33 @@ public class ReadResponse
 
 class ReadResponseSerializer implements IVersionedSerializer<ReadResponse>
 {
-    public void serialize(ReadResponse response, DataOutput dos, int version) throws IOException
+    public void serialize(ReadResponse response, DataOutputPlus out, int version) throws IOException
     {
-        dos.writeInt(response.isDigestQuery() ? response.digest().remaining() : 0);
+        out.writeInt(response.isDigestQuery() ? response.digest().remaining() : 0);
         ByteBuffer buffer = response.isDigestQuery() ? response.digest() : ByteBufferUtil.EMPTY_BYTE_BUFFER;
-        ByteBufferUtil.write(buffer, dos);
-        dos.writeBoolean(response.isDigestQuery());
+        out.write(buffer);
+        out.writeBoolean(response.isDigestQuery());
         if (!response.isDigestQuery())
-            Row.serializer.serialize(response.row(), dos, version);
+            Row.serializer.serialize(response.row(), out, version);
     }
 
-    public ReadResponse deserialize(DataInput dis, int version) throws IOException
+    public ReadResponse deserialize(DataInput in, int version) throws IOException
     {
         byte[] digest = null;
-        int digestSize = dis.readInt();
+        int digestSize = in.readInt();
         if (digestSize > 0)
         {
             digest = new byte[digestSize];
-            dis.readFully(digest, 0, digestSize);
+            in.readFully(digest, 0, digestSize);
         }
-        boolean isDigest = dis.readBoolean();
+        boolean isDigest = in.readBoolean();
         assert isDigest == digestSize > 0;
 
         Row row = null;
         if (!isDigest)
         {
             // This is coming from a remote host
-            row = Row.serializer.deserialize(dis, version, IColumnSerializer.Flag.FROM_REMOTE, ArrayBackedSortedColumns.factory());
+            row = Row.serializer.deserialize(in, version, ColumnSerializer.Flag.FROM_REMOTE);
         }
 
         return isDigest ? new ReadResponse(ByteBuffer.wrap(digest)) : new ReadResponse(row);
@@ -105,6 +105,7 @@ class ReadResponseSerializer implements IVersionedSerializer<ReadResponse>
         TypeSizes typeSizes = TypeSizes.NATIVE;
         ByteBuffer buffer = response.isDigestQuery() ? response.digest() : ByteBufferUtil.EMPTY_BYTE_BUFFER;
         int size = typeSizes.sizeof(buffer.remaining());
+        size += buffer.remaining();
         size += typeSizes.sizeof(response.isDigestQuery());
         if (!response.isDigestQuery())
             size += Row.serializer.serializedSize(response.row(), version);

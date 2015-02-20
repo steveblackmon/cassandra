@@ -22,17 +22,19 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.List;
 
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.TypeSerializer;
 
 public class ReversedType<T> extends AbstractType<T>
 {
     // interning instances
     private static final Map<AbstractType<?>, ReversedType> instances = new HashMap<AbstractType<?>, ReversedType>();
 
-    // package protected for unit tests sake
-    final AbstractType<T> baseType;
+    public final AbstractType<T> baseType;
 
-    public static <T> ReversedType<T> getInstance(TypeParser parser) throws ConfigurationException
+    public static <T> ReversedType<T> getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
     {
         List<AbstractType<?>> types = parser.getTypeParameters();
         if (types.size() != 1)
@@ -48,7 +50,7 @@ public class ReversedType<T> extends AbstractType<T>
             type = new ReversedType<T>(baseType);
             instances.put(baseType, type);
         }
-        return (ReversedType<T>) type;
+        return type;
     }
 
     private ReversedType(AbstractType<T> baseType)
@@ -81,19 +83,30 @@ public class ReversedType<T> extends AbstractType<T>
         return baseType.fromString(source);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> otherType)
     {
-        baseType.validate(bytes);
+        if (!(otherType instanceof ReversedType))
+            return false;
+
+        return this.baseType.isCompatibleWith(((ReversedType) otherType).baseType);
     }
 
-    public T compose(ByteBuffer bytes)
+    @Override
+    public boolean isValueCompatibleWith(AbstractType<?> otherType)
     {
-        return baseType.compose(bytes);
+        return this.baseType.isValueCompatibleWith(otherType);
     }
 
-    public ByteBuffer decompose(T value)
+    @Override
+    public CQL3Type asCQL3Type()
     {
-        return baseType.decompose(value);
+        return baseType.asCQL3Type();
+    }
+
+    public TypeSerializer<T> getSerializer()
+    {
+        return baseType.getSerializer();
     }
 
     @Override

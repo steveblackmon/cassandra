@@ -31,7 +31,7 @@ import org.apache.cassandra.utils.WrappedRunnable;
 public class DebuggableThreadPoolExecutorTest
 {
     @Test
-    public void testSerialization() throws InterruptedException
+    public void testSerialization()
     {
         LinkedBlockingQueue<Runnable> q = new LinkedBlockingQueue<Runnable>(1);
         DebuggableThreadPoolExecutor executor = new DebuggableThreadPoolExecutor(1,
@@ -46,7 +46,7 @@ public class DebuggableThreadPoolExecutorTest
                 Thread.sleep(50);
             }
         };
-        long start = System.currentTimeMillis();
+        long start = System.nanoTime();
         for (int i = 0; i < 10; i++)
         {
             executor.execute(runnable);
@@ -54,7 +54,7 @@ public class DebuggableThreadPoolExecutorTest
         assert q.size() > 0 : q.size();
         while (executor.getCompletedTaskCount() < 10)
             continue;
-        long delta = System.currentTimeMillis() - start;
+        long delta = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
         assert delta >= 9 * 50 : delta;
     }
 }

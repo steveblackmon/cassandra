@@ -17,200 +17,244 @@
  */
 package org.apache.cassandra.db.filter;
 
-import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.SortedSet;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.columniterator.IColumnIterator;
+import org.apache.cassandra.db.Cell;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.OnDiskAtom;
+import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.io.util.FileDataInput;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.cassandra.thrift.SliceRange;
-import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
+import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.Composite;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.MergeIterator;
 
 public class QueryFilter
 {
-    private static final Logger logger = LoggerFactory.getLogger(QueryFilter.class);
-
     public final DecoratedKey key;
-    public final QueryPath path;
-    public final IFilter filter;
-    private final IFilter superFilter;
+    public final String cfName;
+    public final IDiskAtomFilter filter;
+    public final long timestamp;
 
-    public QueryFilter(DecoratedKey key, QueryPath path, IFilter filter)
+    public QueryFilter(DecoratedKey key, String cfName, IDiskAtomFilter filter, long timestamp)
     {
         this.key = key;
-        this.path = path;
+        this.cfName = cfName;
         this.filter = filter;
-        superFilter = path.superColumnName == null ? null : new NamesQueryFilter(path.superColumnName);
+        this.timestamp = timestamp;
     }
 
-    public IColumnIterator getMemtableColumnIterator(Memtable memtable)
-    {
-        ColumnFamily cf = memtable.getColumnFamily(key);
-        if (cf == null)
-            return null;
-        return getMemtableColumnIterator(cf, key);
-    }
-
-    public IColumnIterator getMemtableColumnIterator(ColumnFamily cf, DecoratedKey key)
+    public Iterator<Cell> getIterator(ColumnFamily cf)
     {
         assert cf != null;
-        if (path.superColumnName == null)
-            return filter.getMemtableColumnIterator(cf, key);
-        return superFilter.getMemtableColumnIterator(cf, key);
+        return filter.getColumnIterator(cf);
     }
 
-    // TODO move gcBefore into a field
-    public IColumnIterator getSSTableColumnIterator(SSTableReader sstable)
+    public OnDiskAtomIterator getSSTableColumnIterator(SSTableReader sstable)
     {
-        if (path.superColumnName == null)
-            return filter.getSSTableColumnIterator(sstable, key);
-        return superFilter.getSSTableColumnIterator(sstable, key);
+        return filter.getSSTableColumnIterator(sstable, key);
     }
 
-    public IColumnIterator getSSTableColumnIterator(SSTableReader sstable, FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry)
+    public void collateOnDiskAtom(ColumnFamily returnCF,
+                                  List<? extends Iterator<? extends OnDiskAtom>> toCollate,
+                                  int gcBefore)
     {
-        if (path.superColumnName == null)
-            return filter.getSSTableColumnIterator(sstable, file, key, indexEntry);
-        return superFilter.getSSTableColumnIterator(sstable, file, key, indexEntry);
+        collateOnDiskAtom(returnCF, toCollate, filter, gcBefore, timestamp);
     }
 
-    // TODO move gcBefore into a field
-    public void collateColumns(final ColumnFamily returnCF, List<? extends CloseableIterator<IColumn>> toCollate, final int gcBefore)
+    public static void collateOnDiskAtom(ColumnFamily returnCF,
+                                         List<? extends Iterator<? extends OnDiskAtom>> toCollate,
+                                         IDiskAtomFilter filter,
+                                         int gcBefore,
+                                         long timestamp)
     {
-        IFilter topLevelFilter = (superFilter == null ? filter : superFilter);
-        Comparator<IColumn> fcomp = topLevelFilter.getColumnComparator(returnCF.getComparator());
+        List<Iterator<Cell>> filteredIterators = new ArrayList<>(toCollate.size());
+        for (Iterator<? extends OnDiskAtom> iter : toCollate)
+            filteredIterators.add(gatherTombstones(returnCF, iter));
+        collateColumns(returnCF, filteredIterators, filter, gcBefore, timestamp);
+    }
+
+    // When there is only a single source of atoms, we can skip the collate step
+    public void collateOnDiskAtom(ColumnFamily returnCF, Iterator<? extends OnDiskAtom> toCollate, int gcBefore)
+    {
+        filter.collectReducedColumns(returnCF, gatherTombstones(returnCF, toCollate), gcBefore, timestamp);
+    }
+
+    public void collateColumns(ColumnFamily returnCF, List<? extends Iterator<Cell>> toCollate, int gcBefore)
+    {
+        collateColumns(returnCF, toCollate, filter, gcBefore, timestamp);
+    }
+
+    public static void collateColumns(ColumnFamily returnCF,
+                                      List<? extends Iterator<Cell>> toCollate,
+                                      IDiskAtomFilter filter,
+                                      int gcBefore,
+                                      long timestamp)
+    {
+        Comparator<Cell> comparator = filter.getColumnComparator(returnCF.getComparator());
+
+        Iterator<Cell> reduced = toCollate.size() == 1
+                               ? toCollate.get(0)
+                               : MergeIterator.get(toCollate, comparator, getReducer(comparator));
+
+        filter.collectReducedColumns(returnCF, reduced, gcBefore, timestamp);
+    }
+
+    private static MergeIterator.Reducer<Cell, Cell> getReducer(final Comparator<Cell> comparator)
+    {
         // define a 'reduced' iterator that merges columns w/ the same name, which
         // greatly simplifies computing liveColumns in the presence of tombstones.
-        MergeIterator.Reducer<IColumn, IColumn> reducer = new MergeIterator.Reducer<IColumn, IColumn>()
+        return new MergeIterator.Reducer<Cell, Cell>()
         {
-            ColumnFamily curCF = returnCF.cloneMeShallow();
+            Cell current;
 
-            public void reduce(IColumn current)
+            public void reduce(Cell next)
             {
-                if (curCF.isSuper() && curCF.isEmpty())
-                {
-                    // If it is the first super column we add, we must clone it since other super column may modify
-                    // it otherwise and it could be aliased in a memtable somewhere. We'll also don't have to care about what
-                    // consumers make of the result (for instance CFS.getColumnFamily() call removeDeleted() on the
-                    // result which removes column; which shouldn't be done on the original super column).
-                    assert current instanceof SuperColumn;
-                    curCF.addColumn(((SuperColumn) current).cloneMe());
-                }
-                else
-                {
-                    curCF.addColumn(current);
-                }
+                assert current == null || comparator.compare(current, next) == 0;
+                current = current == null ? next : current.reconcile(next);
             }
 
-            protected IColumn getReduced()
+            protected Cell getReduced()
             {
-                IColumn c = curCF.iterator().next();
-                if (superFilter != null)
-                {
-                    // filterSuperColumn only looks at immediate parent (the supercolumn) when determining if a subcolumn
-                    // is still live, i.e., not shadowed by the parent's tombstone.  so, bump it up temporarily to the tombstone
-                    // time of the cf, if that is greater.
-                    long deletedAt = c.getMarkedForDeleteAt();
-                    if (returnCF.getMarkedForDeleteAt() > deletedAt)
-                        ((SuperColumn) c).delete(c.getLocalDeletionTime(), returnCF.getMarkedForDeleteAt());
+                assert current != null;
+                Cell toReturn = current;
+                current = null;
+                return toReturn;
+            }
 
-                    c = filter.filterSuperColumn((SuperColumn) c, gcBefore);
-                    ((SuperColumn) c).delete(c.getLocalDeletionTime(), deletedAt); // reset sc tombstone time to what it should be
-                }
-                curCF.clear();
-
-                return c;
+            @Override
+            public boolean trivialReduceIsTrivial()
+            {
+                return true;
             }
         };
-        Iterator<IColumn> reduced = MergeIterator.get(toCollate, fcomp, reducer);
+    }
 
-        topLevelFilter.collectReducedColumns(returnCF, reduced, gcBefore);
+    /**
+     * Given an iterator of on disk atom, returns an iterator that filters the tombstone range
+     * markers adding them to {@code returnCF} and returns the normal column.
+     */
+    public static Iterator<Cell> gatherTombstones(final ColumnFamily returnCF, final Iterator<? extends OnDiskAtom> iter)
+    {
+        return new Iterator<Cell>()
+        {
+            private Cell next;
+
+            public boolean hasNext()
+            {
+                if (next != null)
+                    return true;
+
+                getNext();
+                return next != null;
+            }
+
+            public Cell next()
+            {
+                if (next == null)
+                    getNext();
+
+                assert next != null;
+                Cell toReturn = next;
+                next = null;
+                return toReturn;
+            }
+
+            private void getNext()
+            {
+                while (iter.hasNext())
+                {
+                    OnDiskAtom atom = iter.next();
+
+                    if (atom instanceof Cell)
+                    {
+                        next = (Cell)atom;
+                        break;
+                    }
+                    else
+                    {
+                        returnCF.addAtom(atom);
+                    }
+                }
+            }
+
+            public void remove()
+            {
+                throw new UnsupportedOperationException();
+            }
+        };
     }
 
     public String getColumnFamilyName()
     {
-        return path.columnFamilyName;
-    }
-
-    public static boolean isRelevant(IColumn column, IColumnContainer container, int gcBefore)
-    {
-        // the column itself must be not gc-able (it is live, or a still relevant tombstone, or has live subcolumns), (1)
-        // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
-        // (since otherwise, the only thing repair cares about is the container tombstone)
-        long maxChange = column.mostRecentNonGCableChangeAt(gcBefore);
-        return (column.getLocalDeletionTime() >= gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
-               && (!container.isMarkedForDelete() || maxChange > container.getMarkedForDeleteAt()); // (2)
+        return cfName;
     }
 
     /**
      * @return a QueryFilter object to satisfy the given slice criteria:
      * @param key the row to slice
-     * @param path path to the level to slice at (CF or SuperColumn)
+     * @param cfName column family to query
      * @param start column to start slice at, inclusive; empty for "the first column"
      * @param finish column to stop slice at, inclusive; empty for "the last column"
      * @param reversed true to start with the largest column (as determined by configured sort order) instead of smallest
      * @param limit maximum number of non-deleted columns to return
+     * @param timestamp time to use for determining expiring columns' state
      */
-    public static QueryFilter getSliceFilter(DecoratedKey key, QueryPath path, ByteBuffer start, ByteBuffer finish, boolean reversed, int limit)
+    public static QueryFilter getSliceFilter(DecoratedKey key,
+                                             String cfName,
+                                             Composite start,
+                                             Composite finish,
+                                             boolean reversed,
+                                             int limit,
+                                             long timestamp)
     {
-        return new QueryFilter(key, path, new SliceQueryFilter(start, finish, reversed, limit));
+        return new QueryFilter(key, cfName, new SliceQueryFilter(start, finish, reversed, limit), timestamp);
     }
 
     /**
      * return a QueryFilter object that includes every column in the row.
      * This is dangerous on large rows; avoid except for test code.
      */
-    public static QueryFilter getIdentityFilter(DecoratedKey key, QueryPath path)
+    public static QueryFilter getIdentityFilter(DecoratedKey key, String cfName, long timestamp)
     {
-        return new QueryFilter(key, path, new IdentityQueryFilter());
+        return new QueryFilter(key, cfName, new IdentityQueryFilter(), timestamp);
     }
 
     /**
      * @return a QueryFilter object that will return columns matching the given names
      * @param key the row to slice
-     * @param path path to the level to slice at (CF or SuperColumn)
+     * @param cfName column family to query
      * @param columns the column names to restrict the results to, sorted in comparator order
      */
-    public static QueryFilter getNamesFilter(DecoratedKey key, QueryPath path, SortedSet<ByteBuffer> columns)
+    public static QueryFilter getNamesFilter(DecoratedKey key, String cfName, SortedSet<CellName> columns, long timestamp)
     {
-        return new QueryFilter(key, path, new NamesQueryFilter(columns));
-    }
-
-    public static IFilter getFilter(SlicePredicate predicate, AbstractType<?> comparator)
-    {
-        if (predicate.column_names != null)
-        {
-            final SortedSet<ByteBuffer> columnNameSet = new TreeSet<ByteBuffer>(comparator);
-            columnNameSet.addAll(predicate.column_names);
-            return new NamesQueryFilter(columnNameSet);
-        }
-
-        SliceRange range = predicate.slice_range;
-        return new SliceQueryFilter(range.start, range.finish, range.reversed, range.count);
-    }
-
-    /**
-     * convenience method for creating a name filter matching a single column
-     */
-    public static QueryFilter getNamesFilter(DecoratedKey key, QueryPath path, ByteBuffer column)
-    {
-        return new QueryFilter(key, path, new NamesQueryFilter(column));
+        return new QueryFilter(key, cfName, new NamesQueryFilter(columns), timestamp);
     }
 
     @Override
-    public String toString() {
-        return getClass().getSimpleName() + "(key=" + key +
-               ", path=" + path +
-               (filter == null ? "" : ", filter=" + filter) +
-               (superFilter == null ? "" : ", superFilter=" + superFilter) +
-               ")";
+    public String toString()
+    {
+        return getClass().getSimpleName() + "(key=" + key + ", cfName=" + cfName + (filter == null ? "" : ", filter=" + filter) + ")";
+    }
+
+    public boolean shouldInclude(SSTableReader sstable)
+    {
+        return filter.shouldInclude(sstable);
+    }
+
+    public void delete(DeletionInfo target, ColumnFamily source)
+    {
+        target.add(source.deletionInfo().getTopLevelDeletion());
+        // source is the CF currently in the memtable, and it can be large compared to what the filter selects,
+        // so only consider those range tombstones that the filter do select.
+        for (Iterator<RangeTombstone> iter = filter.getRangeTombstoneIterator(source); iter.hasNext(); )
+            target.add(iter.next(), source.getComparator());
     }
 }

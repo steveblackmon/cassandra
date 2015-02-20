@@ -18,16 +18,24 @@
 package org.apache.cassandra.gms;
 
 import java.io.*;
+
 import java.net.InetAddress;
+import java.util.Collection;
 import java.util.UUID;
+
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
+
+import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.commons.lang.StringUtils;
+
+import org.apache.commons.lang3.StringUtils;
 
 
 /**
@@ -35,20 +43,25 @@ import org.apache.commons.lang.StringUtils;
  * application wants to make available to the rest of the nodes in the cluster.
  * Whenever a piece of state needs to be disseminated to the rest of cluster wrap
  * the state in an instance of <i>ApplicationState</i> and add it to the Gossiper.
- *
+ * <p>
  * e.g. if we want to disseminate load information for node A do the following:
- *
- *      ApplicationState loadState = new ApplicationState(<string representation of load>);
- *      Gossiper.instance.addApplicationState("LOAD STATE", loadState);
+ * </p>
+ * <pre>
+ * {@code
+ * ApplicationState loadState = new ApplicationState(<string representation of load>);
+ * Gossiper.instance.addApplicationState("LOAD STATE", loadState);
+ * }
+ * </pre>
  */
 
 public class VersionedValue implements Comparable<VersionedValue>
 {
+
     public static final IVersionedSerializer<VersionedValue> serializer = new VersionedValueSerializer();
 
     // this must be a char that cannot be present in any token
     public final static char DELIMITER = ',';
-    public final static String DELIMITER_STR = new String(new char[] { DELIMITER });
+    public final static String DELIMITER_STR = new String(new char[]{ DELIMITER });
 
     // values for ApplicationState.STATUS
     public final static String STATUS_BOOTSTRAPPING = "BOOT";
@@ -71,7 +84,11 @@ public class VersionedValue implements Comparable<VersionedValue>
     private VersionedValue(String value, int version)
     {
         assert value != null;
-        this.value = value;
+        // blindly interning everything is somewhat suboptimal -- lots of VersionedValues are unique --
+        // but harmless, and interning the non-unique ones saves significant memory.  (Unfortunately,
+        // we don't really have enough information here in VersionedValue to tell the probably-unique
+        // values apart.)  See CASSANDRA-6410.
+        this.value = value.intern();
         this.version = version;
     }
 
@@ -91,7 +108,7 @@ public class VersionedValue implements Comparable<VersionedValue>
         return "Value(" + value + "," + version + ")";
     }
 
-    private static String versionString(String...args)
+    private static String versionString(String... args)
     {
         return StringUtils.join(args, VersionedValue.DELIMITER);
     }
@@ -104,19 +121,27 @@ public class VersionedValue implements Comparable<VersionedValue>
         {
             this.partitioner = partitioner;
         }
-
-        public VersionedValue bootstrapping(Token token, UUID hostId)
+        
+        public VersionedValue cloneWithHigherVersion(VersionedValue value)
         {
-            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING,
-                                                    hostId.toString(),
-                                                    partitioner.getTokenFactory().toString(token)));
+            return new VersionedValue(value.value);
         }
 
-        public VersionedValue normal(Token token, UUID hostId)
+        public VersionedValue bootstrapping(Collection<Token> tokens)
+        {
+            return new VersionedValue(versionString(VersionedValue.STATUS_BOOTSTRAPPING,
+                                                    makeTokenString(tokens)));
+        }
+
+        public VersionedValue normal(Collection<Token> tokens)
         {
             return new VersionedValue(versionString(VersionedValue.STATUS_NORMAL,
-                                                    hostId.toString(),
-                                                    partitioner.getTokenFactory().toString(token)));
+                                                    makeTokenString(tokens)));
+        }
+
+        private String makeTokenString(Collection<Token> tokens)
+        {
+            return partitioner.getTokenFactory().toString(Iterables.get(tokens, 0));
         }
 
         public VersionedValue load(double load)
@@ -124,25 +149,47 @@ public class VersionedValue implements Comparable<VersionedValue>
             return new VersionedValue(String.valueOf(load));
         }
 
-        public VersionedValue migration(UUID newVersion)
+        public VersionedValue schema(UUID newVersion)
         {
             return new VersionedValue(newVersion.toString());
         }
 
-        public VersionedValue leaving(Token token)
+        public VersionedValue leaving(Collection<Token> tokens)
         {
-            return new VersionedValue(VersionedValue.STATUS_LEAVING + VersionedValue.DELIMITER + partitioner.getTokenFactory().toString(token));
+            return new VersionedValue(versionString(VersionedValue.STATUS_LEAVING,
+                                                    makeTokenString(tokens)));
         }
 
-        public VersionedValue left(Token token, long expireTime)
+        public VersionedValue left(Collection<Token> tokens, long expireTime)
         {
-            return new VersionedValue(VersionedValue.STATUS_LEFT + VersionedValue.DELIMITER
-                    + partitioner.getTokenFactory().toString(token) + VersionedValue.DELIMITER + expireTime);
+            return new VersionedValue(versionString(VersionedValue.STATUS_LEFT,
+                                                    makeTokenString(tokens),
+                                                    Long.toString(expireTime)));
         }
 
         public VersionedValue moving(Token token)
         {
             return new VersionedValue(VersionedValue.STATUS_MOVING + VersionedValue.DELIMITER + partitioner.getTokenFactory().toString(token));
+        }
+
+        public VersionedValue hostId(UUID hostId)
+        {
+            return new VersionedValue(hostId.toString());
+        }
+
+        public VersionedValue tokens(Collection<Token> tokens)
+        {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(bos);
+            try
+            {
+                TokenSerializer.serialize(partitioner, tokens, out);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+            return new VersionedValue(new String(bos.toByteArray(), ISO_8859_1));
         }
 
         public VersionedValue removingNonlocal(UUID hostId)
@@ -185,11 +232,16 @@ public class VersionedValue implements Comparable<VersionedValue>
             return new VersionedValue(FBUtilities.getReleaseVersionString());
         }
 
+        public VersionedValue networkVersion()
+        {
+            return new VersionedValue(String.valueOf(MessagingService.current_version));
+        }
+
         public VersionedValue internalIP(String private_ip)
         {
             return new VersionedValue(private_ip);
         }
-        
+
         public VersionedValue severity(double value)
         {
             return new VersionedValue(String.valueOf(value));
@@ -198,38 +250,21 @@ public class VersionedValue implements Comparable<VersionedValue>
 
     private static class VersionedValueSerializer implements IVersionedSerializer<VersionedValue>
     {
-        public void serialize(VersionedValue value, DataOutput dos, int version) throws IOException
+        public void serialize(VersionedValue value, DataOutputPlus out, int version) throws IOException
         {
-            dos.writeUTF(outValue(value, version));
-            dos.writeInt(value.version);
+            out.writeUTF(outValue(value, version));
+            out.writeInt(value.version);
         }
 
         private String outValue(VersionedValue value, int version)
         {
-            String outValue = value.value;
-
-            if (version < MessagingService.VERSION_12)
-            {
-                String[] pieces = value.value.split(DELIMITER_STR, -1);
-                String type = pieces[0];
-
-                if ((type.equals(STATUS_NORMAL)) || type.equals(STATUS_BOOTSTRAPPING))
-                {
-                    assert pieces.length >= 3;
-                    outValue = versionString(pieces[0], pieces[2]);
-                }
-
-                if ((type.equals(REMOVAL_COORDINATOR)) || (type.equals(REMOVING_TOKEN)) || (type.equals(REMOVED_TOKEN)))
-                    throw new RuntimeException(String.format("Unable to serialize %s(%s...) for nodes older than 1.2",
-                                                             VersionedValue.class.getName(), type));
-            }
-            return outValue;
+            return value.value;
         }
 
-        public VersionedValue deserialize(DataInput dis, int version) throws IOException
+        public VersionedValue deserialize(DataInput in, int version) throws IOException
         {
-            String value = dis.readUTF();
-            int valVersion = dis.readInt();
+            String value = in.readUTF();
+            int valVersion = in.readInt();
             return new VersionedValue(value, valVersion);
         }
 

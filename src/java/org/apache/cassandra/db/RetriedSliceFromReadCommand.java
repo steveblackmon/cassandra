@@ -19,37 +19,26 @@ package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.thrift.ColumnParent;
-import org.apache.cassandra.utils.ByteBufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.filter.SliceQueryFilter;
 
 public class RetriedSliceFromReadCommand extends SliceFromReadCommand
 {
     static final Logger logger = LoggerFactory.getLogger(RetriedSliceFromReadCommand.class);
     public final int originalCount;
 
-    public RetriedSliceFromReadCommand(String table, ByteBuffer key, ColumnParent column_parent, ByteBuffer start,
-            ByteBuffer finish, boolean reversed, int originalCount, int count)
+    public RetriedSliceFromReadCommand(String keyspaceName, ByteBuffer key, String cfName, long timestamp, SliceQueryFilter filter, int originalCount)
     {
-        super(table, key, column_parent, start, finish, reversed, count);
-        this.originalCount = originalCount;
-    }
-
-    public RetriedSliceFromReadCommand(String table, ByteBuffer key, QueryPath path, ByteBuffer start,
-            ByteBuffer finish, boolean reversed, int originalCount, int count)
-    {
-        super(table, key, path, start, finish, reversed, count);
+        super(keyspaceName, key, cfName, timestamp, filter);
         this.originalCount = originalCount;
     }
 
     @Override
     public ReadCommand copy()
     {
-        ReadCommand readCommand = new RetriedSliceFromReadCommand(table, key, queryPath, start, finish, reversed, originalCount, count);
-        readCommand.setDigestQuery(isDigestQuery());
-        return readCommand;
+        return new RetriedSliceFromReadCommand(ksName, key, cfName, timestamp, filter, originalCount).setIsDigestQuery(isDigestQuery());
     }
 
     @Override
@@ -61,16 +50,7 @@ public class RetriedSliceFromReadCommand extends SliceFromReadCommand
     @Override
     public String toString()
     {
-        return "RetriedSliceFromReadCommand(" +
-               "table='" + table + '\'' +
-               ", key='" + ByteBufferUtil.bytesToHex(key) + '\'' +
-               ", column_parent='" + queryPath + '\'' +
-               ", start='" + getComparator().getString(start) + '\'' +
-               ", finish='" + getComparator().getString(finish) + '\'' +
-               ", reversed=" + reversed +
-               ", originalCount=" + originalCount +
-               ", count=" + count +
-               ')';
+        return "RetriedSliceFromReadCommand(" + "cmd=" + super.toString() + ", originalCount=" + originalCount + ")";
     }
 
 }

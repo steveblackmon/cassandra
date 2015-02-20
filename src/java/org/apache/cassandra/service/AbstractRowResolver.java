@@ -18,10 +18,7 @@
 package org.apache.cassandra.service;
 
 import java.nio.ByteBuffer;
-import java.util.Collections;
-import java.util.Set;
 
-import org.cliffc.high_scale_lib.NonBlockingHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,21 +26,22 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadResponse;
 import org.apache.cassandra.db.Row;
 import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.Accumulator;
 
 public abstract class AbstractRowResolver implements IResponseResolver<ReadResponse, Row>
 {
     protected static final Logger logger = LoggerFactory.getLogger(AbstractRowResolver.class);
 
-    protected final String table;
-    protected final Set<MessageIn<ReadResponse>> replies = new NonBlockingHashSet<MessageIn<ReadResponse>>();
+    protected final String keyspaceName;
+    // Accumulator gives us non-blocking thread-safety with optimal algorithmic constraints
+    protected final Accumulator<MessageIn<ReadResponse>> replies;
     protected final DecoratedKey key;
 
-    public AbstractRowResolver(ByteBuffer key, String table)
+    public AbstractRowResolver(ByteBuffer key, String keyspaceName, int maxResponseCount)
     {
         this.key = StorageService.getPartitioner().decorateKey(key);
-        this.table = table;
+        this.keyspaceName = keyspaceName;
+        this.replies = new Accumulator<>(maxResponseCount);
     }
 
     public void preprocess(MessageIn<ReadResponse> message)
@@ -51,24 +49,8 @@ public abstract class AbstractRowResolver implements IResponseResolver<ReadRespo
         replies.add(message);
     }
 
-    /** hack so local reads don't force de/serialization of an extra real Message */
-    public void injectPreProcessed(ReadResponse result)
-    {
-        MessageIn<ReadResponse> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
-                                                           result,
-                                                           Collections.<String, byte[]>emptyMap(),
-                                                           MessagingService.Verb.INTERNAL_RESPONSE,
-                                                           MessagingService.current_version);
-        replies.add(message);
-    }
-
     public Iterable<MessageIn<ReadResponse>> getMessages()
     {
         return replies;
-    }
-
-    public int getMaxLiveColumns()
-    {
-        throw new UnsupportedOperationException();
     }
 }

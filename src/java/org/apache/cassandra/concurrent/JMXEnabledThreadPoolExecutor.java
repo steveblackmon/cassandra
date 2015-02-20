@@ -19,12 +19,13 @@ package org.apache.cassandra.concurrent;
 
 import java.lang.management.ManagementFactory;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
+
+import org.apache.cassandra.metrics.ThreadPoolMetrics;
 
 /**
  * This is a wrapper class for the <i>ScheduledThreadPoolExecutor</i>. It provides an implementation
@@ -35,9 +36,7 @@ import javax.management.ObjectName;
 public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor implements JMXEnabledThreadPoolExecutorMBean
 {
     private final String mbeanName;
-
-    private final AtomicInteger totalBlocked = new AtomicInteger(0);
-    private final AtomicInteger currentBlocked = new AtomicInteger(0);
+    public final ThreadPoolMetrics metrics;
 
     public JMXEnabledThreadPoolExecutor(String threadPoolName)
     {
@@ -74,9 +73,11 @@ public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor i
     {
         super(corePoolSize, maxPoolSize, keepAliveTime, unit, workQueue, threadFactory);
         super.prestartAllCoreThreads();
+        metrics = new ThreadPoolMetrics(this, jmxPath, threadFactory.id);
 
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         mbeanName = "org.apache.cassandra." + jmxPath + ":type=" + threadFactory.id;
+
         try
         {
             mbs.registerMBean(this, new ObjectName(mbeanName));
@@ -102,6 +103,9 @@ public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor i
         {
             throw new RuntimeException(e);
         }
+
+        // release metrics
+        metrics.release();
     }
 
     @Override
@@ -128,49 +132,55 @@ public class JMXEnabledThreadPoolExecutor extends DebuggableThreadPoolExecutor i
         return super.shutdownNow();
     }
 
-    /**
-     * Get the number of completed tasks
-     */
-    public long getCompletedTasks()
-    {
-        return getCompletedTaskCount();
-    }
 
-    /**
-     * Get the number of tasks waiting to be executed
-     */
-    public long getPendingTasks()
-    {
-        return getTaskCount() - getCompletedTaskCount();
-    }
+
 
     public int getTotalBlockedTasks()
     {
-        return totalBlocked.get();
+        return (int) metrics.totalBlocked.getCount();
     }
 
     public int getCurrentlyBlockedTasks()
     {
-        return currentBlocked.get();
+        return (int) metrics.currentBlocked.getCount();
+    }
+
+    public int getCoreThreads()
+    {
+        return getCorePoolSize();
+    }
+
+    public void setCoreThreads(int number)
+    {
+        setCorePoolSize(number);
+    }
+
+    public int getMaximumThreads()
+    {
+        return getMaximumPoolSize();
+    }
+
+    public void setMaximumThreads(int number)
+    {
+        setMaximumPoolSize(number);
     }
 
     @Override
     protected void onInitialRejection(Runnable task)
     {
-        totalBlocked.incrementAndGet();
-        currentBlocked.incrementAndGet();
+        metrics.totalBlocked.inc();
+        metrics.currentBlocked.inc();
     }
 
     @Override
     protected void onFinalAccept(Runnable task)
     {
-        currentBlocked.decrementAndGet();
+        metrics.currentBlocked.dec();
     }
 
     @Override
     protected void onFinalRejection(Runnable task)
     {
-        currentBlocked.decrementAndGet();
+        metrics.currentBlocked.dec();
     }
-
 }

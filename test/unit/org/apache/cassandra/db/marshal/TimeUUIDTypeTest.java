@@ -18,13 +18,12 @@
 */
 package org.apache.cassandra.db.marshal;
 
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Random;
 import java.util.UUID;
 
+import org.apache.cassandra.serializers.MarshalException;
 import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 
@@ -35,9 +34,9 @@ public class TimeUUIDTypeTest
     TimeUUIDType timeUUIDType = new TimeUUIDType();
 
     @Test
-    public void testEquality() throws UnknownHostException
+    public void testEquality()
     {
-        UUID a = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
+        UUID a = UUIDGen.getTimeUUID();
         UUID b = new UUID(a.getMostSignificantBits(), a.getLeastSignificantBits());
 
         timeUUIDType.validate(ByteBuffer.wrap(UUIDGen.decompose(a)));
@@ -46,11 +45,11 @@ public class TimeUUIDTypeTest
     }
 
     @Test
-    public void testSmaller() throws UnknownHostException
+    public void testSmaller()
     {
-        UUID a = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
-        UUID b = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
-        UUID c = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
+        UUID a = UUIDGen.getTimeUUID();
+        UUID b = UUIDGen.getTimeUUID();
+        UUID c = UUIDGen.getTimeUUID();
 
         timeUUIDType.validate(ByteBuffer.wrap(UUIDGen.decompose(a)));
         timeUUIDType.validate(ByteBuffer.wrap(UUIDGen.decompose(b)));
@@ -62,11 +61,11 @@ public class TimeUUIDTypeTest
     }
 
     @Test
-    public void testBigger() throws UnknownHostException
+    public void testBigger()
     {
-        UUID a = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
-        UUID b = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
-        UUID c = UUIDGen.makeType1UUIDFromHost(InetAddress.getLocalHost());
+        UUID a = UUIDGen.getTimeUUID();
+        UUID b = UUIDGen.getTimeUUID();
+        UUID c = UUIDGen.getTimeUUID();
 
         timeUUIDType.validate(ByteBuffer.wrap(UUIDGen.decompose(a)));
         timeUUIDType.validate(ByteBuffer.wrap(UUIDGen.decompose(b)));

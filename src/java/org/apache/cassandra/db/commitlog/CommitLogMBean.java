@@ -24,21 +24,6 @@ import java.util.List;
 public interface CommitLogMBean
 {
     /**
-     * Get the number of completed tasks
-     */
-    public long getCompletedTasks();
-
-    /**
-     * Get the number of tasks waiting to be executed
-     */
-    public long getPendingTasks();
-
-    /**
-     * Get the current size used by all the commitlog segments.
-     */
-    public long getTotalCommitlogSize();
-
-    /**
      * Recover a single file.
      */
     public void recover(String path) throws IOException;

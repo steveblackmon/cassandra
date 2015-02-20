@@ -19,76 +19,43 @@
 package org.apache.cassandra.utils;
 
 import org.apache.cassandra.AbstractSerializationsTester;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.util.DataOutputStreamAndChannel;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FilterFactory.Type;
+import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 
 public class SerializationsTest extends AbstractSerializationsTester
 {
 
-    private void testBloomFilterWrite(Type murmur) throws IOException
+    private void testBloomFilterWrite(boolean offheap) throws IOException
     {
-        Filter bf = FilterFactory.getFilter(1000000, 0.0001, murmur);
-        for (int i = 0; i < 100; i++)
-            bf.add(StorageService.getPartitioner().getTokenFactory().toByteArray(StorageService.getPartitioner().getRandomToken()));
-        DataOutputStream out = getOutput("utils.BloomFilter.bin");
-        FilterFactory.serialize(bf, out, murmur);
-        out.close();
-    }
-
-    @Test
-    public void testBloomFilterReadMURMUR2() throws IOException
-    {
-        if (EXECUTE_WRITES)
-            testBloomFilterWrite(FilterFactory.Type.MURMUR2);
-
-        DataInputStream in = getInput("utils.BloomFilter.bin");
-        assert FilterFactory.deserialize(in, FilterFactory.Type.MURMUR2) != null;
-        in.close();
+        IPartitioner partitioner = StorageService.getPartitioner();
+        try (IFilter bf = FilterFactory.getFilter(1000000, 0.0001, offheap))
+        {
+            for (int i = 0; i < 100; i++)
+                bf.add(partitioner.decorateKey(partitioner.getTokenFactory().toByteArray(partitioner.getRandomToken())));
+            try (DataOutputStreamAndChannel out = getOutput("utils.BloomFilter.bin")) 
+            {
+                FilterFactory.serialize(bf, out);
+            }
+        }
     }
 
     @Test
     public void testBloomFilterReadMURMUR3() throws IOException
     {
         if (EXECUTE_WRITES)
-            testBloomFilterWrite(FilterFactory.Type.MURMUR3);
+            testBloomFilterWrite(true);
 
-        DataInputStream in = getInput("utils.BloomFilter.bin");
-        assert FilterFactory.deserialize(in, FilterFactory.Type.MURMUR3) != null;
-        in.close();
-    }
-
-    private void testLegacyBloomFilterWrite() throws IOException
-    {
-        LegacyBloomFilter a = LegacyBloomFilter.getFilter(1000000, 1000);
-        LegacyBloomFilter b = LegacyBloomFilter.getFilter(1000000, 0.0001);
-        for (int i = 0; i < 100; i++)
+        try (DataInputStream in = getInput("utils.BloomFilter.bin");
+             IFilter filter = FilterFactory.deserialize(in, true))
         {
-            ByteBuffer key = StorageService.getPartitioner().getTokenFactory().toByteArray(StorageService.getPartitioner().getRandomToken());
-            a.add(key);
-            b.add(key);
+            Assert.assertNotNull(filter);
         }
-        DataOutputStream out = getOutput("utils.LegacyBloomFilter.bin");
-        FilterFactory.serialize(a, out, FilterFactory.Type.SHA);
-        FilterFactory.serialize(b, out, FilterFactory.Type.SHA);
-        out.close();
-    }
-
-    @Test
-    public void testLegacyBloomFilterRead() throws IOException
-    {
-        // We never write out a new LBF.  Copy the data file from 0.7 instead.
-        // if (EXECUTE_WRITES)
-        //      testLegacyBloomFilterWrite();
-        
-        DataInputStream in = getInput("utils.LegacyBloomFilter.bin");
-        assert FilterFactory.deserialize(in, FilterFactory.Type.SHA) != null;
-        in.close();
     }
 
     private void testEstimatedHistogramWrite() throws IOException
@@ -105,11 +72,12 @@ public class SerializationsTest extends AbstractSerializationsTester
         data[offsets.length] = 100000;
         EstimatedHistogram hist2 = new EstimatedHistogram(offsets, data);
 
-        DataOutputStream out = getOutput("utils.EstimatedHistogram.bin");
-        EstimatedHistogram.serializer.serialize(hist0, out);
-        EstimatedHistogram.serializer.serialize(hist1, out);
-        EstimatedHistogram.serializer.serialize(hist2, out);
-        out.close();
+        try (DataOutputStreamAndChannel out = getOutput("utils.EstimatedHistogram.bin"))
+        {
+            EstimatedHistogram.serializer.serialize(hist0, out);
+            EstimatedHistogram.serializer.serialize(hist1, out);
+            EstimatedHistogram.serializer.serialize(hist2, out);
+        }
     }
 
     @Test
@@ -118,10 +86,11 @@ public class SerializationsTest extends AbstractSerializationsTester
         if (EXECUTE_WRITES)
             testEstimatedHistogramWrite();
 
-        DataInputStream in = getInput("utils.EstimatedHistogram.bin");
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        assert EstimatedHistogram.serializer.deserialize(in) != null;
-        in.close();
+        try (DataInputStream in = getInput("utils.EstimatedHistogram.bin"))
+        {
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+            Assert.assertNotNull(EstimatedHistogram.serializer.deserialize(in));
+        }
     }
 }

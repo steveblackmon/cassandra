@@ -18,12 +18,11 @@
 package org.apache.cassandra.db.index;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.SortedSet;
+import java.util.Set;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.compaction.CompactionInfo;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
@@ -35,21 +34,19 @@ import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 public class SecondaryIndexBuilder extends CompactionInfo.Holder
 {
     private final ColumnFamilyStore cfs;
-    private final SortedSet<ByteBuffer> columns;
+    private final Set<String> idxNames;
     private final ReducingKeyIterator iter;
 
-    public SecondaryIndexBuilder(ColumnFamilyStore cfs, SortedSet<ByteBuffer> columns, ReducingKeyIterator iter)
+    public SecondaryIndexBuilder(ColumnFamilyStore cfs, Set<String> idxNames, ReducingKeyIterator iter)
     {
         this.cfs = cfs;
-        this.columns = columns;
+        this.idxNames = idxNames;
         this.iter = iter;
     }
 
     public CompactionInfo getCompactionInfo()
     {
-        return new CompactionInfo(this.hashCode(),
-                                  cfs.table.name,
-                                  cfs.columnFamily,
+        return new CompactionInfo(cfs.metadata,
                                   OperationType.INDEX_BUILD,
                                   iter.getBytesRead(),
                                   iter.getTotalBytes());
@@ -59,10 +56,10 @@ public class SecondaryIndexBuilder extends CompactionInfo.Holder
     {
         while (iter.hasNext())
         {
-            if (isStopped())
+            if (isStopRequested())
                 throw new CompactionInterruptedException(getCompactionInfo());
             DecoratedKey key = iter.next();
-            Table.indexRow(key, cfs, columns);
+            Keyspace.indexRow(key, cfs, idxNames);
         }
 
         try

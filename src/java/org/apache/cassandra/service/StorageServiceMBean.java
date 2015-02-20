@@ -21,17 +21,16 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.UnavailableException;
+import javax.management.NotificationEmitter;
+import javax.management.openmbean.TabularData;
 
-
-public interface StorageServiceMBean
+public interface StorageServiceMBean extends NotificationEmitter
 {
     /**
      * Retrieve the list of live nodes in the cluster, where "liveness" is
@@ -71,11 +70,19 @@ public interface StorageServiceMBean
     public List<String> getMovingNodes();
 
     /**
-     * Fetch a string representation of the token.
+     * Fetch string representations of the tokens for this node.
      *
-     * @return a string token
+     * @return a collection of tokens formatted as strings
      */
-    public String getToken();
+    public List<String> getTokens();
+
+    /**
+     * Fetch string representations of the tokens for a specified node.
+     *
+     * @param endpoint string representation of an node
+     * @return a collection of tokens formatted as strings
+     */
+    public List<String> getTokens(String endpoint) throws UnknownHostException;
 
     /**
      * Fetch a string representation of the Cassandra version.
@@ -130,15 +137,8 @@ public interface StorageServiceMBean
      * @param keyspace The keyspace to fetch information about
      *
      * @return a List of TokenRange(s) converted to String for the given keyspace
-     *
-     * @throws InvalidRequestException if there is no ring information available about keyspace
      */
-    public List <String> describeRingJMX(String keyspace) throws InvalidRequestException;
-
-    /**
-     * Returns the local node's primary range.
-     */
-    public List<String> getPrimaryRange();
+    public List <String> describeRingJMX(String keyspace) throws IOException;
 
     /**
      * Retrieve a map of pending ranges to endpoints that describe the ring topology
@@ -161,11 +161,6 @@ public interface StorageServiceMBean
     /** Retrieve the mapping of endpoint to host ID */
     public Map<String, String> getHostIdMap();
 
-    /**
-     * Numeric load value.
-     */
-    public double getLoad();
-
     /** Human-readable load value */
     public String getLoadString();
 
@@ -183,91 +178,127 @@ public interface StorageServiceMBean
      * This method returns the N endpoints that are responsible for storing the
      * specified key i.e for replication.
      *
-     * @param table keyspace name also known as table
+     * @param keyspaceName keyspace name
      * @param cf Column family name
      * @param key - key for which we need to find the endpoint return value -
      * the endpoint responsible for this key
      */
-    public List<InetAddress> getNaturalEndpoints(String table, String cf, String key);
-    public List<InetAddress> getNaturalEndpoints(String table, ByteBuffer key);
+    public List<InetAddress> getNaturalEndpoints(String keyspaceName, String cf, String key);
+    public List<InetAddress> getNaturalEndpoints(String keyspaceName, ByteBuffer key);
 
     /**
-     * Takes the snapshot for the given tables. A snapshot name must be specified.
+     * Takes the snapshot for the given keyspaces. A snapshot name must be specified.
      *
      * @param tag the tag given to the snapshot; may not be null or empty
-     * @param tableNames the name of the tables to snapshot; empty means "all."
+     * @param keyspaceNames the name of the keyspaces to snapshot; empty means "all."
      */
-    public void takeSnapshot(String tag, String... tableNames) throws IOException;
+    public void takeSnapshot(String tag, String... keyspaceNames) throws IOException;
 
     /**
      * Takes the snapshot of a specific column family. A snapshot name must be specified.
      *
-     * @param tableName the keyspace which holds the specified column family
+     * @param keyspaceName the keyspace which holds the specified column family
      * @param columnFamilyName the column family to snapshot
      * @param tag the tag given to the snapshot; may not be null or empty
      */
-    public void takeColumnFamilySnapshot(String tableName, String columnFamilyName, String tag) throws IOException;
+    public void takeColumnFamilySnapshot(String keyspaceName, String columnFamilyName, String tag) throws IOException;
 
     /**
-     * Remove the snapshot with the given name from the given tables.
+     * Remove the snapshot with the given name from the given keyspaces.
      * If no tag is specified we will remove all snapshots.
      */
-    public void clearSnapshot(String tag, String... tableNames) throws IOException;
+    public void clearSnapshot(String tag, String... keyspaceNames) throws IOException;
+
+    /**
+     *  Get the details of all the snapshot
+     * @return A map of snapshotName to all its details in Tabular form.
+     */
+    public Map<String, TabularData> getSnapshotDetails();
+
+    /**
+     * Get the true size taken by all snapshots across all keyspaces.
+     * @return True size taken by all the snapshots.
+     */
+    public long trueSnapshotsSize();
 
     /**
      * Forces major compaction of a single keyspace
      */
-    public void forceTableCompaction(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public void forceKeyspaceCompaction(String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Trigger a cleanup of keys on a single keyspace
      */
-    public void forceTableCleanup(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int forceKeyspaceCleanup(String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Scrub (deserialize + reserialize at the latest version, skipping bad rows if any) the given keyspace.
      * If columnFamilies array is empty, all CFs are scrubbed.
      *
-     * Scrubbed CFs will be snapshotted first.
+     * Scrubbed CFs will be snapshotted first, if disableSnapshot is false
      */
-    public void scrub(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Rewrite all sstables to the latest version.
      * Unlike scrub, it doesn't skip bad rows and do not snapshot sstables first.
      */
-    public void upgradeSSTables(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
-     * Flush all memtables for the given column families, or all columnfamilies for the given table
+     * Flush all memtables for the given column families, or all columnfamilies for the given keyspace
      * if none are explicitly listed.
-     * @param tableName
+     * @param keyspaceName
      * @param columnFamilies
      * @throws IOException
      */
-    public void forceTableFlush(String tableName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public void forceKeyspaceFlush(String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
-     * Triggers proactive repair for given column families, or all columnfamilies for the given table
-     * if none are explicitly listed.
-     * @param tableName
-     * @param columnFamilies
-     * @throws IOException
-     */
-    public void forceTableRepair(String tableName, boolean isSequential, String... columnFamilies) throws IOException;
-
-    /**
-     * Triggers proactive repair but only for the node primary range.
-     */
-    public void forceTableRepairPrimaryRange(String tableName, boolean isSequential, String... columnFamilies) throws IOException;
-
-    /**
-     * Perform repair of a specific range.
+     * Invoke repair asynchronously.
+     * You can track repair progress by subscribing JMX notification sent from this StorageServiceMBean.
+     * Notification format is:
+     *   type: "repair"
+     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
      *
-     * This allows incremental repair to be performed by having an external controller submitting repair jobs.
-     * Note that the provided range much be a subset of one of the node local range.
+     * @param keyspace Keyspace name to repair. Should not be null.
+     * @param options repair option.
+     * @return Repair command number, or 0 if nothing to repair
      */
-    public void forceTableRepairRange(String beginToken, String endToken, String tableName, boolean isSequential, String... columnFamilies) throws IOException;
+    public int repairAsync(String keyspace, Map<String, String> options);
+
+    @Deprecated
+    public int forceRepairAsync(String keyspace, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts,  boolean primaryRange, boolean repairedAt, String... columnFamilies) throws IOException;
+
+    /**
+     * Invoke repair asynchronously.
+     * You can track repair progress by subscribing JMX notification sent from this StorageServiceMBean.
+     * Notification format is:
+     *   type: "repair"
+     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
+     *
+     * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
+     * @return Repair command number, or 0 if nothing to repair
+     */
+    @Deprecated
+    public int forceRepairAsync(String keyspace, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean primaryRange, boolean fullRepair, String... columnFamilies);
+
+    @Deprecated
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts, boolean repairedAt, String... columnFamilies) throws IOException;
+
+    /**
+     * Same as forceRepairAsync, but handles a specified range
+     *
+     * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
+     */
+    @Deprecated
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean fullRepair, String... columnFamilies);
+
+    @Deprecated
+    public int forceRepairAsync(String keyspace, boolean isSequential, boolean isLocal, boolean primaryRange, boolean fullRepair, String... columnFamilies);
+
+    @Deprecated
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, boolean isLocal, boolean repairedAt, String... columnFamilies);
 
     public void forceTerminateAllRepairSessions();
 
@@ -280,7 +311,7 @@ public interface StorageServiceMBean
      * @param newToken token to move this node to.
      * This node will unload its data onto its neighbors, and bootstrap to the new token.
      */
-    public void move(String newToken) throws IOException, InterruptedException, ConfigurationException;
+    public void move(String newToken) throws IOException;
 
     /**
      * removeToken removes token (and all data associated with
@@ -298,11 +329,31 @@ public interface StorageServiceMBean
      */
     public void forceRemoveCompletion();
 
-    /** set the logging level at runtime */
-    public void setLog4jLevel(String classQualifier, String level);
+    /**
+     * set the logging level at runtime<br>
+     * <br>
+     * If both classQualifer and level are empty/null, it will reload the configuration to reset.<br>
+     * If classQualifer is not empty but level is empty/null, it will set the level to null for the defined classQualifer<br>
+     * If level cannot be parsed, then the level will be defaulted to DEBUG<br>
+     * <br>
+     * The logback configuration should have < jmxConfigurator /> set
+     * 
+     * @param classQualifier The logger's classQualifer
+     * @param level The log level
+     * @throws Exception 
+     * 
+     *  @see ch.qos.logback.classic.Level#toLevel(String)
+     */
+    public void setLoggingLevel(String classQualifier, String level) throws Exception;
+
+    /** get the runtime logging levels */
+    public Map<String,String> getLoggingLevels();
 
     /** get the operational mode (leaving, joining, normal, decommissioned, client) **/
     public String getOperationMode();
+
+    /** Returns whether the storage service is starting or not */
+    public boolean isStarting();
 
     /** get the progress of a drain operation */
     public String getDrainProgress();
@@ -319,16 +370,14 @@ public interface StorageServiceMBean
      *
      * @param keyspace The keyspace to delete from
      * @param columnFamily The column family to delete data from.
-     *
-     * @throws UnavailableException if some of the hosts in the ring are down.
      */
-    public void truncate(String keyspace, String columnFamily) throws UnavailableException, TimeoutException, IOException;
+    public void truncate(String keyspace, String columnFamily)throws TimeoutException, IOException;
 
     /**
      * given a list of tokens (representing the nodes in the cluster), returns
      *   a mapping from "token -> %age of cluster owned by that token"
      */
-    public Map<String, Float> getOwnership();
+    public Map<InetAddress, Float> getOwnership();
 
     /**
      * Effective ownership is % of the data each node owns given the keyspace
@@ -337,9 +386,11 @@ public interface StorageServiceMBean
      * in the cluster have the same replication strategies and if yes then we will
      * use the first else a empty Map is returned.
      */
-    public Map<String, Float> effectiveOwnership(String keyspace) throws ConfigurationException;
+    public Map<InetAddress, Float> effectiveOwnership(String keyspace) throws IllegalStateException;
 
     public List<String> getKeyspaces();
+
+    public List<String> getNonSystemKeyspaces();
 
     /**
      * Change endpointsnitch class and dynamic-ness (and dynamic attributes) at runtime
@@ -348,15 +399,20 @@ public interface StorageServiceMBean
      * @param dynamicUpdateInterval    integer, in ms (default 100)
      * @param dynamicResetInterval     integer, in ms (default 600,000)
      * @param dynamicBadnessThreshold  double, (default 0.0)
-     * @throws ConfigurationException  classname not found on classpath
      */
-    public void updateSnitch(String epSnitchClassName, Boolean dynamic, Integer dynamicUpdateInterval, Integer dynamicResetInterval, Double dynamicBadnessThreshold) throws ConfigurationException;
+    public void updateSnitch(String epSnitchClassName, Boolean dynamic, Integer dynamicUpdateInterval, Integer dynamicResetInterval, Double dynamicBadnessThreshold) throws ClassNotFoundException;
 
     // allows a user to forcibly 'kill' a sick node
     public void stopGossiping();
 
     // allows a user to recover a forcibly 'killed' node
     public void startGossiping();
+
+    // allows a user to see whether gossip is running or not
+    public boolean isGossipRunning();
+
+    // allows a user to forcibly completely stop cassandra
+    public void stopDaemon();
 
     // to determine if gossip is disabled
     public boolean isInitialized();
@@ -370,11 +426,13 @@ public interface StorageServiceMBean
     // to determine if thrift is running
     public boolean isRPCServerRunning();
 
-    // allows a node that have been started without joining the ring to join it
-    public void joinRing() throws IOException, org.apache.cassandra.config.ConfigurationException;
-    public boolean isJoined();
+    public void stopNativeTransport();
+    public void startNativeTransport();
+    public boolean isNativeTransportRunning();
 
-    public int getExceptionCount();
+    // allows a node that have been started without joining the ring to join it
+    public void joinRing() throws IOException;
+    public boolean isJoined();
 
     public void setStreamThroughputMbPerSec(int value);
     public int getStreamThroughputMbPerSec();
@@ -394,7 +452,14 @@ public interface StorageServiceMBean
      */
     public void rebuild(String sourceDc);
 
+    /** Starts a bulk load and blocks until it completes. */
     public void bulkLoad(String directory);
+
+    /**
+     * Starts a bulk load asynchronously and returns the String representation of the planID for the new
+     * streaming session.
+     */
+    public String bulkLoadAsync(String directory);
 
     public void rescheduleFailedDeletions();
 
@@ -407,12 +472,14 @@ public interface StorageServiceMBean
     public void loadNewSSTables(String ksName, String cfName);
 
     /**
-     * Return a List of Tokens representing a sample of keys
-     * across all ColumnFamilyStores
+     * Return a List of Tokens representing a sample of keys across all ColumnFamilyStores.
+     *
+     * Note: this should be left as an operation, not an attribute (methods starting with "get")
+     * to avoid sending potentially multiple MB of data when accessing this mbean by default.  See CASSANDRA-4452.
      *
      * @return set of Tokens as Strings
      */
-    public List<String> getRangeKeySample();
+    public List<String> sampleKeyRange();
 
     /**
      * rebuild the specified indexes
@@ -420,4 +487,46 @@ public interface StorageServiceMBean
     public void rebuildSecondaryIndex(String ksName, String cfName, String... idxNames);
 
     public void resetLocalSchema() throws IOException;
+
+    /**
+     * Enables/Disables tracing for the whole system. Only thrift requests can start tracing currently.
+     *
+     * @param probability
+     *            ]0,1[ will enable tracing on a partial number of requests with the provided probability. 0 will
+     *            disable tracing and 1 will enable tracing for all requests (which mich severely cripple the system)
+     */
+    public void setTraceProbability(double probability);
+
+    /**
+     * Returns the configured tracing probability.
+     */
+    public double getTraceProbability();
+
+    void disableAutoCompaction(String ks, String ... columnFamilies) throws IOException;
+    void enableAutoCompaction(String ks, String ... columnFamilies) throws IOException;
+
+    public void deliverHints(String host) throws UnknownHostException;
+
+    /** Returns the name of the cluster */
+    public String getClusterName();
+    /** Returns the cluster partitioner */
+    public String getPartitionerName();
+
+    /** Returns the threshold for warning of queries with many tombstones */
+    public int getTombstoneWarnThreshold();
+    /** Sets the threshold for warning queries with many tombstones */
+    public void setTombstoneWarnThreshold(int tombstoneDebugThreshold);
+
+    /** Returns the threshold for abandoning queries with many tombstones */
+    public int getTombstoneFailureThreshold();
+    /** Sets the threshold for abandoning queries with many tombstones */
+    public void setTombstoneFailureThreshold(int tombstoneDebugThreshold);
+
+    /** Returns the threshold for rejecting queries due to a large batch size */
+    public int getBatchSizeFailureThreshold();
+    /** Sets the threshold for rejecting queries due to a large batch size */
+    public void setBatchSizeFailureThreshold(int batchSizeDebugThreshold);
+
+    /** Sets the hinted handoff throttle in kb per second, per delivery thread. */
+    public void setHintedHandoffThrottleInKB(int throttleInKB);
 }

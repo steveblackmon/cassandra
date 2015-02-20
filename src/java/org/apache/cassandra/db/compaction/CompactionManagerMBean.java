@@ -19,6 +19,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.List;
 import java.util.Map;
+import javax.management.openmbean.TabularData;
 
 public interface CompactionManagerMBean
 {
@@ -28,33 +29,19 @@ public interface CompactionManagerMBean
     /** List of running compaction summary strings. */
     public List<String> getCompactionSummary();
 
-    /**
-     * @return estimated number of compactions remaining to perform
-     */
-    public int getPendingTasks();
-
-    /**
-     * @return number of completed compactions since server [re]start
-     */
-    public long getCompletedTasks();
-
-    /**
-     * @return total number of bytes compacted since server [re]start
-     */
-    public long getTotalBytesCompacted();
-
-    /**
-     * @return total number of compactions since server [re]start
-     */
-    public long getTotalCompactionsCompleted();
+    /** compaction history **/
+    public TabularData getCompactionHistory();
 
     /**
      * Triggers the compaction of user specified sstables.
+     * You can specify files from various keyspaces and columnfamilies.
+     * If you do so, user defined compaction is performed several times to the groups of files
+     * in the same keyspace/columnfamily.
      *
-     * @param ksname the keyspace for the sstables to compact
-     * @param dataFiles a comma separated list of sstable filename to compact
+     * @param dataFiles a comma separated list of sstable file to compact.
+     *                  must contain keyspace and columnfamily name in path(for 2.1+) or file name itself.
      */
-    public void forceUserDefinedCompaction(String ksname, String dataFiles);
+    public void forceUserDefinedCompaction(String dataFiles);
 
     /**
      * Stop all running compaction-like tasks having the provided {@code type}.
@@ -66,4 +53,48 @@ public interface CompactionManagerMBean
      *   - INDEX_BUILD
      */
     public void stopCompaction(String type);
+
+    /**
+     * Returns core size of compaction thread pool
+     */
+    public int getCoreCompactorThreads();
+
+    /**
+     * Allows user to resize maximum size of the compaction thread pool.
+     * @param number New maximum of compaction threads
+     */
+    public void setCoreCompactorThreads(int number);
+
+    /**
+     * Returns maximum size of compaction thread pool
+     */
+    public int getMaximumCompactorThreads();
+
+    /**
+     * Allows user to resize maximum size of the compaction thread pool.
+     * @param number New maximum of compaction threads
+     */
+    public void setMaximumCompactorThreads(int number);
+
+    /**
+     * Returns core size of validation thread pool
+     */
+    public int getCoreValidationThreads();
+
+    /**
+     * Allows user to resize maximum size of the compaction thread pool.
+     * @param number New maximum of compaction threads
+     */
+    public void setCoreValidationThreads(int number);
+
+    /**
+     * Returns size of validator thread pool
+     */
+    public int getMaximumValidatorThreads();
+
+    /**
+     * Allows user to resize maximum size of the validator thread pool.
+     * @param number New maximum of validator threads
+     */
+    public void setMaximumValidatorThreads(int number);
 }

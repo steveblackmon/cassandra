@@ -18,45 +18,70 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.Map;
 
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.filter.IDiskAtomFilter;
+import org.apache.cassandra.db.filter.NamesQueryFilter;
+import org.apache.cassandra.db.filter.SliceQueryFilter;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.IReadCommand;
-import org.apache.cassandra.service.RepairCallback;
+import org.apache.cassandra.service.RowDataResolver;
+import org.apache.cassandra.service.pager.Pageable;
 
-
-public abstract class ReadCommand implements IReadCommand
+public abstract class ReadCommand implements IReadCommand, Pageable
 {
-    public static final byte CMD_TYPE_GET_SLICE_BY_NAMES = 1;
-    public static final byte CMD_TYPE_GET_SLICE = 2;
+    public enum Type
+    {
+        GET_BY_NAMES((byte)1),
+        GET_SLICES((byte)2);
+
+        public final byte serializedValue;
+
+        private Type(byte b)
+        {
+            this.serializedValue = b;
+        }
+
+        public static Type fromSerializedValue(byte b)
+        {
+            return b == 1 ? GET_BY_NAMES : GET_SLICES;
+        }
+    }
 
     public static final ReadCommandSerializer serializer = new ReadCommandSerializer();
 
     public MessageOut<ReadCommand> createMessage()
     {
-        return new MessageOut<ReadCommand>(MessagingService.Verb.READ, this, serializer);
+        return new MessageOut<>(MessagingService.Verb.READ, this, serializer);
     }
 
-    public final QueryPath queryPath;
-    public final String table;
+    public final String ksName;
+    public final String cfName;
     public final ByteBuffer key;
+    public final long timestamp;
     private boolean isDigestQuery = false;
-    protected final byte commandType;
+    protected final Type commandType;
 
-    protected ReadCommand(String table, ByteBuffer key, QueryPath queryPath, byte cmdType)
+    protected ReadCommand(String ksName, ByteBuffer key, String cfName, long timestamp, Type cmdType)
     {
-        this.table = table;
+        this.ksName = ksName;
         this.key = key;
-        this.queryPath = queryPath;
+        this.cfName = cfName;
+        this.timestamp = timestamp;
         this.commandType = cmdType;
+    }
+
+    public static ReadCommand create(String ksName, ByteBuffer key, String cfName, long timestamp, IDiskAtomFilter filter)
+    {
+        if (filter instanceof SliceQueryFilter)
+            return new SliceFromReadCommand(ksName, key, cfName, timestamp, (SliceQueryFilter)filter);
+        else
+            return new SliceByNamesReadCommand(ksName, key, cfName, timestamp, (NamesQueryFilter)filter);
     }
 
     public boolean isDigestQuery()
@@ -64,32 +89,30 @@ public abstract class ReadCommand implements IReadCommand
         return isDigestQuery;
     }
 
-    public void setDigestQuery(boolean isDigestQuery)
+    public ReadCommand setIsDigestQuery(boolean isDigestQuery)
     {
         this.isDigestQuery = isDigestQuery;
+        return this;
     }
 
     public String getColumnFamilyName()
     {
-        return queryPath.columnFamilyName;
+        return cfName;
     }
 
     public abstract ReadCommand copy();
 
-    public abstract Row getRow(Table table) throws IOException;
+    public abstract Row getRow(Keyspace keyspace);
 
-    protected AbstractType<?> getComparator()
-    {
-        return ColumnFamily.getComparatorFor(table, getColumnFamilyName(), queryPath.superColumnName);
-    }
+    public abstract IDiskAtomFilter filter();
 
     public String getKeyspace()
     {
-        return table;
+        return ksName;
     }
 
     // maybeGenerateRetryCommand is used to generate a retry for short reads
-    public ReadCommand maybeGenerateRetryCommand(RepairCallback handler, Row row)
+    public ReadCommand maybeGenerateRetryCommand(RowDataResolver resolver, Row row)
     {
         return null;
     }
@@ -99,32 +122,55 @@ public abstract class ReadCommand implements IReadCommand
     {
         // noop
     }
+
+    public long getTimeout()
+    {
+        return DatabaseDescriptor.getReadRpcTimeout();
+    }
 }
 
 class ReadCommandSerializer implements IVersionedSerializer<ReadCommand>
 {
-    private static final Map<Byte, IVersionedSerializer<ReadCommand>> CMD_SERIALIZER_MAP = new HashMap<Byte, IVersionedSerializer<ReadCommand>>();
-    static
+    public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
     {
-        CMD_SERIALIZER_MAP.put(ReadCommand.CMD_TYPE_GET_SLICE_BY_NAMES, new SliceByNamesReadCommandSerializer());
-        CMD_SERIALIZER_MAP.put(ReadCommand.CMD_TYPE_GET_SLICE, new SliceFromReadCommandSerializer());
+        out.writeByte(command.commandType.serializedValue);
+        switch (command.commandType)
+        {
+            case GET_BY_NAMES:
+                SliceByNamesReadCommand.serializer.serialize(command, out, version);
+                break;
+            case GET_SLICES:
+                SliceFromReadCommand.serializer.serialize(command, out, version);
+                break;
+            default:
+                throw new AssertionError();
+        }
     }
 
-
-    public void serialize(ReadCommand command, DataOutput dos, int version) throws IOException
+    public ReadCommand deserialize(DataInput in, int version) throws IOException
     {
-        dos.writeByte(command.commandType);
-        CMD_SERIALIZER_MAP.get(command.commandType).serialize(command, dos, version);
-    }
-
-    public ReadCommand deserialize(DataInput dis, int version) throws IOException
-    {
-        byte msgType = dis.readByte();
-        return CMD_SERIALIZER_MAP.get(msgType).deserialize(dis, version);
+        ReadCommand.Type msgType = ReadCommand.Type.fromSerializedValue(in.readByte());
+        switch (msgType)
+        {
+            case GET_BY_NAMES:
+                return SliceByNamesReadCommand.serializer.deserialize(in, version);
+            case GET_SLICES:
+                return SliceFromReadCommand.serializer.deserialize(in, version);
+            default:
+                throw new AssertionError();
+        }
     }
 
     public long serializedSize(ReadCommand command, int version)
     {
-        return 1 + CMD_SERIALIZER_MAP.get(command.commandType).serializedSize(command, version);
+        switch (command.commandType)
+        {
+            case GET_BY_NAMES:
+                return 1 + SliceByNamesReadCommand.serializer.serializedSize(command, version);
+            case GET_SLICES:
+                return 1 + SliceFromReadCommand.serializer.serializedSize(command, version);
+            default:
+                throw new AssertionError();
+        }
     }
 }

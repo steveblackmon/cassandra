@@ -18,21 +18,25 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.IndexHelper;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.utils.Filter;
-import org.apache.cassandra.utils.FilterFactory;
+import com.google.common.primitives.Ints;
 
-public class RowIndexEntry
+import org.apache.cassandra.cache.IMeasurableMemory;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.sstable.IndexHelper;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.ObjectSizes;
+
+public class RowIndexEntry<T> implements IMeasurableMemory
 {
-    public static final Serializer serializer = new Serializer();
+    private static final long EMPTY_SIZE = ObjectSizes.measure(new RowIndexEntry(0));
 
     public final long position;
 
@@ -41,132 +45,169 @@ public class RowIndexEntry
         this.position = position;
     }
 
-    public static RowIndexEntry create(long position, DeletionInfo deletionInfo, ColumnIndex index)
+    public int promotedSize(ISerializer<T> idxSerializer)
     {
-        if (index != null && index.columnsIndex != null && index.columnsIndex.size() > 1)
-            return new IndexedEntry(position, deletionInfo, index.columnsIndex, index.bloomFilter);
-        else
-            return new RowIndexEntry(position);
+        return 0;
     }
 
+    public static RowIndexEntry<IndexHelper.IndexInfo> create(long position, DeletionTime deletionTime, ColumnIndex index)
+    {
+        assert index != null;
+        assert deletionTime != null;
+
+        // we only consider the columns summary when determining whether to create an IndexedEntry,
+        // since if there are insufficient columns to be worth indexing we're going to seek to
+        // the beginning of the row anyway, so we might as well read the tombstone there as well.
+        if (index.columnsIndex.size() > 1)
+            return new IndexedEntry(position, deletionTime, index.columnsIndex);
+        else
+            return new RowIndexEntry<>(position);
+    }
+
+    /**
+     * @return true if this index entry contains the row-level tombstone and column summary.  Otherwise,
+     * caller should fetch these from the row header.
+     */
     public boolean isIndexed()
     {
         return !columnsIndex().isEmpty();
     }
 
-    public DeletionInfo deletionInfo()
+    public DeletionTime deletionTime()
     {
         throw new UnsupportedOperationException();
     }
 
-    public List<IndexHelper.IndexInfo> columnsIndex()
+    /**
+     * @return the offset to the start of the header information for this row.
+     * For some formats this may not be the start of the row.
+     */
+    public long headerOffset()
     {
-        return Collections.<IndexHelper.IndexInfo>emptyList();
+        return 0;
     }
 
-    public Filter bloomFilter()
+    public List<T> columnsIndex()
     {
-        throw new UnsupportedOperationException();
+        return Collections.emptyList();
     }
 
-    public static class Serializer
+    public long unsharedHeapSize()
     {
-        public void serialize(RowIndexEntry rie, DataOutput dos) throws IOException
+        return EMPTY_SIZE;
+    }
+
+    public static interface IndexSerializer<T>
+    {
+        void serialize(RowIndexEntry<T> rie, DataOutputPlus out) throws IOException;
+        RowIndexEntry<T> deserialize(DataInput in, Version version) throws IOException;
+        public int serializedSize(RowIndexEntry<T> rie);
+    }
+
+    public static class Serializer implements IndexSerializer<IndexHelper.IndexInfo>
+    {
+        private final ISerializer<IndexHelper.IndexInfo> idxSerializer;
+
+        public Serializer(ISerializer<IndexHelper.IndexInfo> idxSerializer)
         {
-            dos.writeLong(rie.position);
+            this.idxSerializer = idxSerializer;
+        }
+
+        public void serialize(RowIndexEntry<IndexHelper.IndexInfo> rie, DataOutputPlus out) throws IOException
+        {
+            out.writeLong(rie.position);
+            out.writeInt(rie.promotedSize(idxSerializer));
+
             if (rie.isIndexed())
             {
-                dos.writeInt(((IndexedEntry)rie).serializedSize());
-                dos.writeInt(rie.deletionInfo().localDeletionTime);
-                dos.writeLong(rie.deletionInfo().markedForDeleteAt);
-                dos.writeInt(rie.columnsIndex().size());
+                DeletionTime.serializer.serialize(rie.deletionTime(), out);
+                out.writeInt(rie.columnsIndex().size());
                 for (IndexHelper.IndexInfo info : rie.columnsIndex())
-                    info.serialize(dos);
-                FilterFactory.serialize(rie.bloomFilter(), dos);
+                    idxSerializer.serialize(info, out);
+            }
+        }
+
+        public RowIndexEntry<IndexHelper.IndexInfo> deserialize(DataInput in, Version version) throws IOException
+        {
+            long position = in.readLong();
+
+            int size = in.readInt();
+            if (size > 0)
+            {
+                DeletionTime deletionTime = DeletionTime.serializer.deserialize(in);
+
+                int entries = in.readInt();
+                List<IndexHelper.IndexInfo> columnsIndex = new ArrayList<>(entries);
+                for (int i = 0; i < entries; i++)
+                    columnsIndex.add(idxSerializer.deserialize(in));
+
+                return new IndexedEntry(position, deletionTime, columnsIndex);
             }
             else
             {
-                dos.writeInt(0);
+                return new RowIndexEntry<>(position);
             }
         }
 
-        public RowIndexEntry deserializePositionOnly(DataInput dis, Descriptor descriptor) throws IOException
+        public static void skip(DataInput in) throws IOException
         {
-            long position = dis.readLong();
-            if (descriptor.hasPromotedIndexes)
-            {
-                int size = dis.readInt();
-                if (size > 0)
-                    FileUtils.skipBytesFully(dis, size);
-            }
-            return new RowIndexEntry(position);
+            in.readLong();
+            skipPromotedIndex(in);
         }
 
-        public RowIndexEntry deserialize(DataInput dis, Descriptor descriptor) throws IOException
+        public static void skipPromotedIndex(DataInput in) throws IOException
         {
-            long position = dis.readLong();
-            if (descriptor.hasPromotedIndexes)
-            {
-                int size = dis.readInt();
-                if (size > 0)
-                {
-                    int ldt = dis.readInt();
-                    long mfda = dis.readLong();
-                    int entries = dis.readInt();
-                    List<IndexHelper.IndexInfo> columnsIndex = new ArrayList<IndexHelper.IndexInfo>(entries);
-                    for (int i = 0; i < entries; i++)
-                        columnsIndex.add(IndexHelper.IndexInfo.deserialize(dis));
-                    Filter bf = FilterFactory.deserialize(dis, descriptor.filterType);
-                    return new IndexedEntry(position, new DeletionInfo(mfda, ldt), columnsIndex, bf);
-                }
-                else
-                {
-                    return new RowIndexEntry(position);
-                }
-            }
-            else
-            {
-                return new RowIndexEntry(position);
-            }
-        }
-
-        public void skip(DataInput dis, Descriptor descriptor) throws IOException
-        {
-            dis.readLong();
-            if (!descriptor.hasPromotedIndexes)
-                return;
-
-            int size = dis.readInt();
+            int size = in.readInt();
             if (size <= 0)
                 return;
 
-            FileUtils.skipBytesFully(dis, size);
+            FileUtils.skipBytesFully(in, size);
+        }
+
+        public int serializedSize(RowIndexEntry<IndexHelper.IndexInfo> rie)
+        {
+            int size = TypeSizes.NATIVE.sizeof(rie.position) + TypeSizes.NATIVE.sizeof(rie.promotedSize(idxSerializer));
+
+            if (rie.isIndexed())
+            {
+                List<IndexHelper.IndexInfo> index = rie.columnsIndex();
+
+                size += DeletionTime.serializer.serializedSize(rie.deletionTime(), TypeSizes.NATIVE);
+                size += TypeSizes.NATIVE.sizeof(index.size());
+
+                for (IndexHelper.IndexInfo info : index)
+                    size += idxSerializer.serializedSize(info, TypeSizes.NATIVE);
+            }
+
+
+            return size;
         }
     }
 
     /**
      * An entry in the row index for a row whose columns are indexed.
      */
-    private static class IndexedEntry extends RowIndexEntry
+    private static class IndexedEntry extends RowIndexEntry<IndexHelper.IndexInfo>
     {
-        private final DeletionInfo deletionInfo;
+        private final DeletionTime deletionTime;
         private final List<IndexHelper.IndexInfo> columnsIndex;
-        private final Filter bloomFilter;
+        private static final long BASE_SIZE =
+                ObjectSizes.measure(new IndexedEntry(0, DeletionTime.LIVE, Arrays.<IndexHelper.IndexInfo>asList(null, null)))
+              + ObjectSizes.measure(new ArrayList<>(1));
 
-        private IndexedEntry(long position, DeletionInfo deletionInfo, List<IndexHelper.IndexInfo> columnsIndex, Filter bloomFilter)
+        private IndexedEntry(long position, DeletionTime deletionTime, List<IndexHelper.IndexInfo> columnsIndex)
         {
             super(position);
-            assert deletionInfo != null;
+            assert deletionTime != null;
             assert columnsIndex != null && columnsIndex.size() > 1;
-            this.deletionInfo = deletionInfo;
+            this.deletionTime = deletionTime;
             this.columnsIndex = columnsIndex;
-            this.bloomFilter = bloomFilter;
         }
 
         @Override
-        public DeletionInfo deletionInfo()
+        public DeletionTime deletionTime()
         {
-            return deletionInfo;
+            return deletionTime;
         }
 
         @Override
@@ -176,20 +217,28 @@ public class RowIndexEntry
         }
 
         @Override
-        public Filter bloomFilter()
-        {
-            return bloomFilter;
-        }
-
-        public int serializedSize()
+        public int promotedSize(ISerializer<IndexHelper.IndexInfo> idxSerializer)
         {
             TypeSizes typeSizes = TypeSizes.NATIVE;
-            int size = typeSizes.sizeof(deletionInfo.localDeletionTime) + typeSizes.sizeof(deletionInfo.markedForDeleteAt); // deletion info
+            long size = DeletionTime.serializer.serializedSize(deletionTime, typeSizes);
             size += typeSizes.sizeof(columnsIndex.size()); // number of entries
             for (IndexHelper.IndexInfo info : columnsIndex)
-                size += info.serializedSize(typeSizes);
+                size += idxSerializer.serializedSize(info, typeSizes);
 
-            return size + (int) FilterFactory.serializedSize(bloomFilter);
+            return Ints.checkedCast(size);
+        }
+
+        @Override
+        public long unsharedHeapSize()
+        {
+            long entrySize = 0;
+            for (IndexHelper.IndexInfo idx : columnsIndex)
+                entrySize += idx.unsharedHeapSize();
+
+            return BASE_SIZE
+                   + entrySize
+                   + deletionTime.unsharedHeapSize()
+                   + ObjectSizes.sizeOfReferenceArray(columnsIndex.size());
         }
     }
 }

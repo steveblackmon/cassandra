@@ -19,11 +19,15 @@ package org.apache.cassandra.service;
 
 import java.net.InetAddress;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.metrics.StorageMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.gms.*;
 
 public class LoadBroadcaster implements IEndpointStateChangeSubscriber
@@ -34,7 +38,7 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
 
     private static final Logger logger = LoggerFactory.getLogger(LoadBroadcaster.class);
 
-    private final Map<InetAddress, Double> loadInfo = new HashMap<InetAddress, Double>();
+    private ConcurrentMap<InetAddress, Double> loadInfo = new ConcurrentHashMap<InetAddress, java.lang.Double>();
 
     private LoadBroadcaster()
     {
@@ -56,6 +60,8 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
             onChange(endpoint, ApplicationState.LOAD, localValue);
         }
     }
+    
+    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
 
     public void onAlive(InetAddress endpoint, EndpointState state) {}
 
@@ -70,7 +76,7 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
 
     public Map<InetAddress, Double> getLoadInfo()
     {
-        return loadInfo;
+        return Collections.unmodifiableMap(loadInfo);
     }
 
     public void startBroadcasting()
@@ -84,10 +90,10 @@ public class LoadBroadcaster implements IEndpointStateChangeSubscriber
                 if (logger.isDebugEnabled())
                     logger.debug("Disseminating load info ...");
                 Gossiper.instance.addLocalApplicationState(ApplicationState.LOAD,
-                                                           StorageService.instance.valueFactory.load(StorageService.instance.getLoad()));
+                                                           StorageService.instance.valueFactory.load(StorageMetrics.load.getCount()));
             }
         };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, 2 * Gossiper.intervalInMillis, BROADCAST_INTERVAL, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(runnable, 2 * Gossiper.intervalInMillis, BROADCAST_INTERVAL, TimeUnit.MILLISECONDS);
     }
 }
 

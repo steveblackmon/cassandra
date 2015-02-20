@@ -17,148 +17,36 @@
  */
 package org.apache.cassandra.db.index.keys;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.index.PerColumnSecondaryIndex;
+import org.apache.cassandra.db.Cell;
+import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.CellNames;
+import org.apache.cassandra.db.ColumnFamily;
+import org.apache.cassandra.db.index.AbstractSimplePerColumnSecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndexSearcher;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.db.marshal.LocalByPartionerType;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.cassandra.exceptions.ConfigurationException;
 
 /**
- * Implements a secondary index for a column family using a second column family
- * in which the row keys are indexed values, and column names are base row keys.
+ * Implements a secondary index for a column family using a second column family.
+ * The design uses inverted index http://en.wikipedia.org/wiki/Inverted_index.
+ * The row key is the indexed value. For example, if we're indexing a column named
+ * city, the index value of city is the row key.
+ * The column names are the keys of the records. To see a detailed example, please
+ * refer to wikipedia.
  */
-public class KeysIndex extends PerColumnSecondaryIndex
+public class KeysIndex extends AbstractSimplePerColumnSecondaryIndex
 {
-    private static final Logger logger = LoggerFactory.getLogger(KeysIndex.class);
-    private ColumnFamilyStore indexCfs;
-
-    public KeysIndex()
+    protected ByteBuffer getIndexedValue(ByteBuffer rowKey, Cell cell)
     {
+        return cell.value();
     }
 
-    public void init()
+    protected CellName makeIndexColumnName(ByteBuffer rowKey, Cell cell)
     {
-        assert baseCfs != null && columnDefs != null;
-
-        ColumnDefinition columnDef = columnDefs.iterator().next();
-        CFMetaData indexedCfMetadata = CFMetaData.newIndexMetadata(baseCfs.metadata, columnDef, indexComparator());
-        indexCfs = ColumnFamilyStore.createColumnFamilyStore(baseCfs.table,
-                                                             indexedCfMetadata.cfName,
-                                                             new LocalPartitioner(columnDef.getValidator()),
-                                                             indexedCfMetadata);
-
-        // enable and initialize row cache based on parent's setting and indexed column's cardinality
-        CFMetaData.Caching baseCaching = baseCfs.metadata.getCaching();
-        if (baseCaching == CFMetaData.Caching.ALL || baseCaching == CFMetaData.Caching.ROWS_ONLY)
-        {
-            /*
-             * # of index CF's key = cardinality of indexed column.
-             * if # of keys stored in index CF is more than average column counts (means tall table),
-             * then consider it as high cardinality.
-             */
-            double estimatedKeys = indexCfs.estimateKeys();
-            double averageColumnCount = indexCfs.getMeanColumns();
-            if (averageColumnCount > 0 && estimatedKeys / averageColumnCount > 1)
-            {
-                logger.debug("turning row cache on for " + indexCfs.getColumnFamilyName());
-                indexCfs.metadata.caching(baseCaching);
-                indexCfs.initRowCache();
-            }
-        }
-    }
-
-    public static AbstractType<?> indexComparator()
-    {
-        IPartitioner rowPartitioner = StorageService.getPartitioner();
-        return (rowPartitioner instanceof OrderPreservingPartitioner || rowPartitioner instanceof ByteOrderedPartitioner)
-               ? BytesType.instance
-               : new LocalByPartionerType(StorageService.getPartitioner());
-    }
-
-    public void deleteColumn(DecoratedKey valueKey, ByteBuffer rowKey, IColumn column)
-    {
-        if (column.isMarkedForDelete())
-            return;
-
-        int localDeletionTime = (int) (System.currentTimeMillis() / 1000);
-        ColumnFamily cfi = ColumnFamily.create(indexCfs.metadata);
-        cfi.addTombstone(rowKey, localDeletionTime, column.timestamp());
-        indexCfs.apply(valueKey, cfi);
-        if (logger.isDebugEnabled())
-            logger.debug("removed index entry for cleaned-up value {}:{}", valueKey, cfi);
-    }
-
-    public void insertColumn(DecoratedKey valueKey, ByteBuffer rowKey, IColumn column)
-    {
-        ColumnFamily cfi = ColumnFamily.create(indexCfs.metadata);
-        if (column instanceof ExpiringColumn)
-        {
-            ExpiringColumn ec = (ExpiringColumn)column;
-            cfi.addColumn(new ExpiringColumn(rowKey, ByteBufferUtil.EMPTY_BYTE_BUFFER, ec.timestamp(), ec.getTimeToLive(), ec.getLocalDeletionTime()));
-        }
-        else
-        {
-            cfi.addColumn(new Column(rowKey, ByteBufferUtil.EMPTY_BYTE_BUFFER, column.timestamp()));
-        }
-        if (logger.isDebugEnabled())
-            logger.debug("applying index row {} in {}", indexCfs.metadata.getKeyValidator().getString(valueKey.key), cfi);
-
-        indexCfs.apply(valueKey, cfi);
-    }
-
-    public void updateColumn(DecoratedKey valueKey, ByteBuffer rowKey, IColumn col)
-    {
-        insertColumn(valueKey, rowKey, col);
-    }
-
-    public void removeIndex(ByteBuffer columnName) throws IOException
-    {
-        indexCfs.invalidate();
-    }
-
-    public void forceBlockingFlush() throws IOException
-    {
-        try
-        {
-            indexCfs.forceBlockingFlush();
-        }
-        catch (ExecutionException e)
-        {
-            throw new IOException(e);
-        }
-        catch (InterruptedException e)
-        {
-            throw new IOException(e);
-        }
-    }
-
-    public void invalidate()
-    {
-        indexCfs.invalidate();
-    }
-
-    public void truncate(long truncatedAt)
-    {
-        indexCfs.discardSSTables(truncatedAt);
-    }
-
-    public ColumnFamilyStore getIndexCfs()
-    {
-       return indexCfs;
+        return CellNames.simpleDense(rowKey);
     }
 
     public SecondaryIndexSearcher createSecondaryIndexSearcher(Set<ByteBuffer> columns)
@@ -166,9 +54,10 @@ public class KeysIndex extends PerColumnSecondaryIndex
         return new KeysSearcher(baseCfs.indexManager, columns);
     }
 
-    public String getIndexName()
+    public boolean isIndexEntryStale(ByteBuffer indexedValue, ColumnFamily data, long now)
     {
-        return indexCfs.columnFamily;
+        Cell cell = data.getColumn(data.getComparator().makeCellName(columnDef.name.bytes));
+        return cell == null || !cell.isLive(now) || columnDef.type.compare(indexedValue, cell.value()) != 0;
     }
 
     public void validateOptions() throws ConfigurationException
@@ -176,8 +65,15 @@ public class KeysIndex extends PerColumnSecondaryIndex
         // no options used
     }
 
-    public long getLiveSize()
+    public boolean indexes(CellName name)
     {
-        return indexCfs.getMemtableDataSize();
+        // This consider the full cellName directly
+        AbstractType<?> comparator = baseCfs.metadata.getColumnDefinitionComparator(columnDef);
+        return comparator.compare(columnDef.name.bytes, name.toByteBuffer()) == 0;
+    }
+
+    protected AbstractType getExpressionComparator()
+    {
+        return baseCfs.getComparator().asAbstractType();
     }
 }

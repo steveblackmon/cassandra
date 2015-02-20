@@ -24,26 +24,35 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 import static org.junit.Assert.fail;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.composites.*;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.*;
 
-public class DynamicCompositeTypeTest extends SchemaLoader
+public class DynamicCompositeTypeTest
 {
-    private static final String cfName = "StandardDynamicComposite";
+    private static final String KEYSPACE1 = "DynamicCompositeType";
+    private static final String CF_STANDARDDYNCOMPOSITE = "StandardDynamicComposite";
+    private static Map<Byte, AbstractType<?>> aliases = new HashMap<>();
 
     private static final DynamicCompositeType comparator;
     static
     {
-        Map<Byte, AbstractType<?>> aliases = new HashMap<Byte, AbstractType<?>>();
         aliases.put((byte)'b', BytesType.instance);
+        aliases.put((byte)'B', ReversedType.getInstance(BytesType.instance));
         aliases.put((byte)'t', TimeUUIDType.instance);
+        aliases.put((byte)'T', ReversedType.getInstance(TimeUUIDType.instance));
         comparator = DynamicCompositeType.getInstance(aliases);
     }
 
@@ -52,7 +61,18 @@ public class DynamicCompositeTypeTest extends SchemaLoader
     static
     {
         for (int i = 0; i < UUID_COUNT; ++i)
-            uuids[i] = UUIDGen.makeType1UUIDFromHost(FBUtilities.getBroadcastAddress());
+            uuids[i] = UUIDGen.getTimeUUID();
+    }
+
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        AbstractType<?> dynamicComposite = DynamicCompositeType.getInstance(aliases);
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    CFMetaData.denseCFMetaData(KEYSPACE1, CF_STANDARDDYNCOMPOSITE, dynamicComposite));
     }
 
     @Test
@@ -144,7 +164,7 @@ public class DynamicCompositeTypeTest extends SchemaLoader
         }
         catch (MarshalException e)
         {
-            assert e.toString().contains("TimeUUID should be 16 or 0 bytes");
+            assert e.toString().contains("should be 16 or 0 bytes");
         }
 
         key = createDynamicCompositeKey("test1", UUID.randomUUID(), 42, false);
@@ -162,8 +182,8 @@ public class DynamicCompositeTypeTest extends SchemaLoader
     @Test
     public void testFullRound() throws Exception
     {
-        Table table = Table.open("Keyspace1");
-        ColumnFamilyStore cfs = table.getColumnFamilyStore(cfName);
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARDDYNCOMPOSITE);
 
         ByteBuffer cname1 = createDynamicCompositeKey("test1", null, -1, false);
         ByteBuffer cname2 = createDynamicCompositeKey("test1", uuids[0], 24, false);
@@ -172,7 +192,39 @@ public class DynamicCompositeTypeTest extends SchemaLoader
         ByteBuffer cname5 = createDynamicCompositeKey("test2", uuids[1], 42, false);
 
         ByteBuffer key = ByteBufferUtil.bytes("k");
-        RowMutation rm = new RowMutation("Keyspace1", key);
+        Mutation rm = new Mutation(KEYSPACE1, key);
+        addColumn(rm, cname5);
+        addColumn(rm, cname1);
+        addColumn(rm, cname4);
+        addColumn(rm, cname2);
+        addColumn(rm, cname3);
+        rm.applyUnsafe();
+
+        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("k"), CF_STANDARDDYNCOMPOSITE, System.currentTimeMillis()));
+
+        Iterator<Cell> iter = cf.getSortedColumns().iterator();
+
+        assert iter.next().name().toByteBuffer().equals(cname1);
+        assert iter.next().name().toByteBuffer().equals(cname2);
+        assert iter.next().name().toByteBuffer().equals(cname3);
+        assert iter.next().name().toByteBuffer().equals(cname4);
+        assert iter.next().name().toByteBuffer().equals(cname5);
+    }
+
+    @Test
+    public void testFullRoundReversed() throws Exception
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARDDYNCOMPOSITE);
+
+        ByteBuffer cname1 = createDynamicCompositeKey("test1", null, -1, false, true);
+        ByteBuffer cname2 = createDynamicCompositeKey("test1", uuids[0], 24, false, true);
+        ByteBuffer cname3 = createDynamicCompositeKey("test1", uuids[0], 42, false, true);
+        ByteBuffer cname4 = createDynamicCompositeKey("test2", uuids[0], -1, false, true);
+        ByteBuffer cname5 = createDynamicCompositeKey("test2", uuids[1], 42, false, true);
+
+        ByteBuffer key = ByteBufferUtil.bytes("kr");
+        Mutation rm = new Mutation(KEYSPACE1, key);
         addColumn(rm, cname5);
         addColumn(rm, cname1);
         addColumn(rm, cname4);
@@ -180,15 +232,15 @@ public class DynamicCompositeTypeTest extends SchemaLoader
         addColumn(rm, cname3);
         rm.apply();
 
-        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("k"), new QueryPath(cfName, null, null)));
+        ColumnFamily cf = cfs.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("kr"), CF_STANDARDDYNCOMPOSITE, System.currentTimeMillis()));
 
-        Iterator<IColumn> iter = cf.getSortedColumns().iterator();
+        Iterator<Cell> iter = cf.getSortedColumns().iterator();
 
-        assert iter.next().name().equals(cname1);
-        assert iter.next().name().equals(cname2);
-        assert iter.next().name().equals(cname3);
-        assert iter.next().name().equals(cname4);
-        assert iter.next().name().equals(cname5);
+        assert iter.next().name().toByteBuffer().equals(cname5);
+        assert iter.next().name().toByteBuffer().equals(cname4);
+        assert iter.next().name().toByteBuffer().equals(cname1); // null UUID < reversed value
+        assert iter.next().name().toByteBuffer().equals(cname3);
+        assert iter.next().name().toByteBuffer().equals(cname2);
     }
 
     @Test
@@ -219,6 +271,34 @@ public class DynamicCompositeTypeTest extends SchemaLoader
         }
     }
 
+    @Test
+    public void testUncomparableReversedColumns()
+    {
+        ByteBuffer uuid = ByteBuffer.allocate(2 + 2 + 16 + 1);
+        uuid.putShort((short)(0x8000 | 'T'));
+        uuid.putShort((short) 16);
+        uuid.put(UUIDGen.decompose(uuids[0]));
+        uuid.put((byte) 0);
+        uuid.rewind();
+
+        ByteBuffer bytes = ByteBuffer.allocate(2 + 2 + 4 + 1);
+        bytes.putShort((short)(0x8000 | 'B'));
+        bytes.putShort((short) 4);
+        bytes.put(new byte[4]);
+        bytes.put((byte) 0);
+        bytes.rewind();
+
+        try
+        {
+            int c = comparator.compare(uuid, bytes);
+            assert c == 1 : "Expecting bytes to sort before uuid, but got " + c;
+        }
+        catch (Exception e)
+        {
+            fail("Shouldn't throw exception");
+        }
+    }
+
     public void testCompatibility() throws Exception
     {
         assert TypeParser.parse("DynamicCompositeType()").isCompatibleWith(TypeParser.parse("DynamicCompositeType()"));
@@ -229,13 +309,20 @@ public class DynamicCompositeTypeTest extends SchemaLoader
         assert !TypeParser.parse("DynamicCompositeType(a => BytesType)").isCompatibleWith(TypeParser.parse("DynamicCompositeType(a => BytesType, b => AsciiType)"));
     }
 
-    private void addColumn(RowMutation rm, ByteBuffer cname)
+    private void addColumn(Mutation rm, ByteBuffer cname)
     {
-        rm.add(new QueryPath(cfName, null , cname), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
+        rm.add(CF_STANDARDDYNCOMPOSITE, CellNames.simpleDense(cname), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
     }
 
     private ByteBuffer createDynamicCompositeKey(String s, UUID uuid, int i, boolean lastIsOne)
     {
+        return createDynamicCompositeKey(s, uuid, i, lastIsOne, false);
+    }
+
+    private ByteBuffer createDynamicCompositeKey(String s, UUID uuid, int i, boolean lastIsOne,
+            final boolean reversed)
+    {
+        String intType = (reversed ? "ReversedType(IntegerType)" : "IntegerType");
         ByteBuffer bytes = ByteBufferUtil.bytes(s);
         int totalSize = 0;
         if (s != null)
@@ -246,7 +333,7 @@ public class DynamicCompositeTypeTest extends SchemaLoader
                 totalSize += 2 + 2 + 16 + 1;
                 if (i != -1)
                 {
-                    totalSize += 2 + "IntegerType".length() + 2 + 1 + 1;
+                    totalSize += 2 + intType.length() + 2 + 1 + 1;
                 }
             }
         }
@@ -255,20 +342,20 @@ public class DynamicCompositeTypeTest extends SchemaLoader
 
         if (s != null)
         {
-            bb.putShort((short)(0x8000 | 'b'));
+            bb.putShort((short)(0x8000 | (reversed ? 'B' : 'b')));
             bb.putShort((short) bytes.remaining());
             bb.put(bytes);
             bb.put(uuid == null && lastIsOne ? (byte)1 : (byte)0);
             if (uuid != null)
             {
-                bb.putShort((short)(0x8000 | 't'));
+                bb.putShort((short)(0x8000 | (reversed ? 'T' : 't')));
                 bb.putShort((short) 16);
                 bb.put(UUIDGen.decompose(uuid));
                 bb.put(i == -1 && lastIsOne ? (byte)1 : (byte)0);
                 if (i != -1)
                 {
-                    bb.putShort((short) "IntegerType".length());
-                    bb.put(ByteBufferUtil.bytes("IntegerType"));
+                    bb.putShort((short) intType.length());
+                    bb.put(ByteBufferUtil.bytes(intType));
                     // We are putting a byte only because our test use ints that fit in a byte *and* IntegerType.fromString() will
                     // return something compatible (i.e, putting a full int here would break 'fromStringTest')
                     bb.putShort((short) 1);

@@ -20,72 +20,39 @@ package org.apache.cassandra.service;
 import java.net.InetAddress;
 import java.util.Collection;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.gms.FailureDetector;
-import org.apache.cassandra.locator.IEndpointSnitch;
-import org.apache.cassandra.locator.NetworkTopologyStrategy;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.cassandra.thrift.UnavailableException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 
 /**
  * This class blocks for a quorum of responses _in the local datacenter only_ (CL.LOCAL_QUORUM).
  */
 public class DatacenterWriteResponseHandler extends WriteResponseHandler
 {
-    private static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
-
-    private static final String localdc;
-    static
+    public DatacenterWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
+                                          Collection<InetAddress> pendingEndpoints,
+                                          ConsistencyLevel consistencyLevel,
+                                          Keyspace keyspace,
+                                          Runnable callback,
+                                          WriteType writeType)
     {
-        localdc = snitch.getDatacenter(FBUtilities.getBroadcastAddress());
+        super(naturalEndpoints, pendingEndpoints, consistencyLevel, keyspace, callback, writeType);
+        assert consistencyLevel.isDatacenterLocal();
     }
-
-    protected DatacenterWriteResponseHandler(Collection<InetAddress> writeEndpoints, ConsistencyLevel consistencyLevel, String table)
-    {
-        super(writeEndpoints, consistencyLevel, table);
-        assert consistencyLevel == ConsistencyLevel.LOCAL_QUORUM;
-    }
-
-    public static IWriteResponseHandler create(Collection<InetAddress> writeEndpoints, ConsistencyLevel consistencyLevel, String table)
-    {
-        return new DatacenterWriteResponseHandler(writeEndpoints, consistencyLevel, table);
-    }
-
-    @Override
-    protected int determineBlockFor(String table)
-    {
-        NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) Table.open(table).getReplicationStrategy();
-        return (strategy.getReplicationFactor(localdc) / 2) + 1;
-    }
-
 
     @Override
     public void response(MessageIn message)
     {
-        if (message == null || localdc.equals(snitch.getDatacenter(message.from)))
-        {
-            if (responses.decrementAndGet() == 0)
-                condition.signal();
-        }
+        if (message == null || consistencyLevel.isLocal(message.from))
+            super.response(message);
     }
 
     @Override
-    public void assureSufficientLiveNodes() throws UnavailableException
+    protected int totalBlockFor()
     {
-        int liveNodes = 0;
-        for (InetAddress destination : writeEndpoints)
-        {
-            if (localdc.equals(snitch.getDatacenter(destination)) && FailureDetector.instance.isAlive(destination))
-                liveNodes++;
-        }
-
-        if (liveNodes < responses.get())
-        {
-            throw new UnavailableException();
-        }
+        // during bootstrap, include pending endpoints (only local here) in the count
+        // or we may fail the consistency level guarantees (see #833, #8058)
+        return consistencyLevel.blockFor(keyspace) + consistencyLevel.countLocalEndpoints(pendingEndpoints);
     }
-
 }

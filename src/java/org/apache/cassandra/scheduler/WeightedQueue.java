@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.scheduler;
 
-
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
@@ -25,11 +24,11 @@ import java.lang.management.ManagementFactory;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
-import org.apache.cassandra.utils.LatencyTracker;
+import org.apache.cassandra.metrics.LatencyMetrics;
 
-class WeightedQueue implements WeightedQueueMBean
+class WeightedQueue
 {
-    private final LatencyTracker stats = new LatencyTracker();
+    private final LatencyMetrics metric;
 
     public final String key;
     public final int weight;
@@ -39,20 +38,7 @@ class WeightedQueue implements WeightedQueueMBean
         this.key = key;
         this.weight = weight;
         this.queue = new SynchronousQueue<Entry>(true);
-    }
-
-    public void register()
-    {
-        // expose monitoring data
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.scheduler:type=WeightedQueue,queue=" + key));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        this.metric =  new LatencyMetrics("scheduler", "WeightedQueue", key);
     }
 
     public void put(Thread t, long timeoutMS) throws InterruptedException, TimeoutException
@@ -66,7 +52,7 @@ class WeightedQueue implements WeightedQueueMBean
         Entry e = queue.poll();
         if (e == null)
             return null;
-        stats.addNano(System.nanoTime() - e.creationTime);
+        metric.addNano(System.nanoTime() - e.creationTime);
         return e.thread;
     }
 
@@ -84,32 +70,5 @@ class WeightedQueue implements WeightedQueueMBean
         {
             this.thread = thread;
         }
-    }
-
-    /** MBean related methods */
-
-    public long getOperations()
-    {
-        return stats.getOpCount();
-    }
-
-    public long getTotalLatencyMicros()
-    {
-        return stats.getTotalLatencyMicros();
-    }
-
-    public double getRecentLatencyMicros()
-    {
-        return stats.getRecentLatencyMicros();
-    }
-
-    public long[] getTotalLatencyHistogramMicros()
-    {
-        return stats.getTotalLatencyHistogramMicros();
-    }
-
-    public long[] getRecentLatencyHistogramMicros()
-    {
-        return stats.getRecentLatencyHistogramMicros();
     }
 }

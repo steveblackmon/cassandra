@@ -17,27 +17,61 @@
  */
 package org.apache.cassandra.auth;
 
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
-import org.apache.cassandra.config.ConfigurationException;
-import org.apache.cassandra.thrift.AuthenticationException;
+import org.apache.cassandra.exceptions.AuthenticationException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 
 public class AllowAllAuthenticator implements IAuthenticator
 {
-    private final static AuthenticatedUser USER = new AuthenticatedUser("allow_all");
+    private static final SaslNegotiator AUTHENTICATOR_INSTANCE = new Negotiator();
 
-    public AuthenticatedUser defaultUser()
+    public boolean requireAuthentication()
     {
-        return USER;
+        return false;
     }
 
-    public AuthenticatedUser authenticate(Map<? extends CharSequence,? extends CharSequence> credentials) throws AuthenticationException
+    public Set<IResource> protectedResources()
     {
-        return USER;
+        return Collections.emptySet();
     }
 
     public void validateConfiguration() throws ConfigurationException
     {
-        // pass
+    }
+
+    public void setup()
+    {
+    }
+
+    public SaslNegotiator newSaslNegotiator()
+    {
+        return AUTHENTICATOR_INSTANCE;
+    }
+
+    public AuthenticatedUser legacyAuthenticate(Map<String, String> credentialsData)
+    {
+        return AuthenticatedUser.ANONYMOUS_USER;
+    }
+
+    private static class Negotiator implements SaslNegotiator
+    {
+
+        public byte[] evaluateResponse(byte[] clientResponse) throws AuthenticationException
+        {
+            return null;
+        }
+
+        public boolean isComplete()
+        {
+            return true;
+        }
+
+        public AuthenticatedUser getAuthenticatedUser() throws AuthenticationException
+        {
+            return AuthenticatedUser.ANONYMOUS_USER;
+        }
     }
 }

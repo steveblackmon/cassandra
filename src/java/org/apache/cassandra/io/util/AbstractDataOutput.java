@@ -17,12 +17,14 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.DataOutput;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UTFDataFormatException;
+import java.nio.ByteBuffer;
 
-public abstract class AbstractDataOutput extends OutputStream implements DataOutput
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+public abstract class AbstractDataOutput extends OutputStream implements DataOutputPlus
 {
     /*
     !! DataOutput methods below are copied from the implementation in Apache Harmony RandomAccessFile.
@@ -135,10 +137,8 @@ public abstract class AbstractDataOutput extends OutputStream implements DataOut
      *             DataOutputStream.
      */
     public final void writeChar(int val) throws IOException {
-        byte[] buffer = new byte[2];
-        buffer[0] = (byte) (val >> 8);
-        buffer[1] = (byte) val;
-        write(buffer, 0, buffer.length);
+        write((val >>> 8) & 0xFF);
+        write((val >>> 0) & 0xFF);
     }
 
     /**
@@ -206,12 +206,10 @@ public abstract class AbstractDataOutput extends OutputStream implements DataOut
      *             DataOutputStream.
      */
     public void writeInt(int val) throws IOException {
-        byte[] buffer = new byte[4];
-        buffer[0] = (byte) (val >> 24);
-        buffer[1] = (byte) (val >> 16);
-        buffer[2] = (byte) (val >> 8);
-        buffer[3] = (byte) val;
-        write(buffer, 0, buffer.length);
+        write((val >>> 24) & 0xFF);
+        write((val >>> 16) & 0xFF);
+        write((val >>>  8) & 0xFF);
+        write((val >>> 0) & 0xFF);
     }
 
     /**
@@ -226,17 +224,14 @@ public abstract class AbstractDataOutput extends OutputStream implements DataOut
      *             DataOutputStream.
      */
     public void writeLong(long val) throws IOException {
-        byte[] buffer = new byte[8];
-        int t = (int) (val >> 32);
-        buffer[0] = (byte) (t >> 24);
-        buffer[1] = (byte) (t >> 16);
-        buffer[2] = (byte) (t >> 8);
-        buffer[3] = (byte) t;
-        buffer[4] = (byte) (val >> 24);
-        buffer[5] = (byte) (val >> 16);
-        buffer[6] = (byte) (val >> 8);
-        buffer[7] = (byte) val;
-        write(buffer, 0, buffer.length);
+        write((int)(val >>> 56) & 0xFF);
+        write((int)(val >>> 48) & 0xFF);
+        write((int)(val >>> 40) & 0xFF);
+        write((int)(val >>> 32) & 0xFF);
+        write((int)(val >>> 24) & 0xFF);
+        write((int)(val >>> 16) & 0xFF);
+        write((int)(val >>>  8) & 0xFF);
+        write((int) (val >>> 0) & 0xFF);
     }
 
     /**
@@ -297,5 +292,38 @@ public abstract class AbstractDataOutput extends OutputStream implements DataOut
         utfBytes[0] = (byte) (utfCount >> 8);
         utfBytes[1] = (byte) utfCount;
         write(utfBytes);
+    }
+
+    private byte[] buf;
+    public synchronized void write(ByteBuffer buffer) throws IOException
+    {
+        int len = buffer.remaining();
+        if (len < 16)
+        {
+            int offset = buffer.position();
+            for (int i = 0 ; i < len ; i++)
+                write(buffer.get(i + offset));
+            return;
+        }
+
+        byte[] buf = this.buf;
+        if (buf == null)
+            this.buf = buf = new byte[256];
+
+        int offset = 0;
+        while (len > 0)
+        {
+            int sublen = Math.min(buf.length, len);
+            ByteBufferUtil.arrayCopy(buffer, buffer.position() + offset, buf, 0, sublen);
+            write(buf, 0, sublen);
+            offset += sublen;
+            len -= sublen;
+        }
+    }
+
+    public void write(Memory memory) throws IOException
+    {
+        for (ByteBuffer buffer : memory.asByteBuffers())
+            write(buffer);
     }
 }

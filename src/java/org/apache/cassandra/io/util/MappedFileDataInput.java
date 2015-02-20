@@ -24,21 +24,12 @@ import java.nio.channels.FileChannel;
 
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public class MappedFileDataInput extends AbstractDataInput implements FileDataInput
+public class MappedFileDataInput extends AbstractDataInput implements FileDataInput, DataInput
 {
     private final MappedByteBuffer buffer;
     private final String filename;
     private final long segmentOffset;
     private int position;
-
-    public MappedFileDataInput(FileInputStream stream, String filename, long segmentOffset, int position) throws IOException
-    {
-        FileChannel channel = stream.getChannel();
-        buffer = channel.map(FileChannel.MapMode.READ_ONLY, position, channel.size());
-        this.filename = filename;
-        this.segmentOffset = segmentOffset;
-        this.position = position;
-    }
 
     public MappedFileDataInput(MappedByteBuffer buffer, String filename, long segmentOffset, int position)
     {
@@ -49,12 +40,6 @@ public class MappedFileDataInput extends AbstractDataInput implements FileDataIn
         this.position = position;
     }
 
-    // don't make this public, this is only for seeking WITHIN the current mapped segment
-    protected void seekInternal(int pos)
-    {
-        position = pos;
-    }
-
     // Only use when we know the seek in within the mapped segment. Throws an
     // IOException otherwise.
     public void seek(long pos) throws IOException
@@ -63,17 +48,22 @@ public class MappedFileDataInput extends AbstractDataInput implements FileDataIn
         if (inSegmentPos < 0 || inSegmentPos > buffer.capacity())
             throw new IOException(String.format("Seek position %d is not within mmap segment (seg offs: %d, length: %d)", pos, segmentOffset, buffer.capacity()));
 
-        seekInternal((int) inSegmentPos);
+        position = (int) inSegmentPos;
     }
 
     public long getFilePointer()
     {
-        return segmentOffset + (long)position;
+        return segmentOffset + position;
     }
 
-    protected int getPosition()
+    public long getPosition()
     {
-        return position;
+        return segmentOffset + position;
+    }
+
+    public long getPositionLimit()
+    {
+        return segmentOffset + buffer.capacity();
     }
 
     @Override
@@ -85,7 +75,7 @@ public class MappedFileDataInput extends AbstractDataInput implements FileDataIn
     public void reset(FileMark mark) throws IOException
     {
         assert mark instanceof MappedFileDataInputMark;
-        seekInternal(((MappedFileDataInputMark) mark).position);
+        position = ((MappedFileDataInputMark) mark).position;
     }
 
     public FileMark mark()
@@ -128,7 +118,7 @@ public class MappedFileDataInput extends AbstractDataInput implements FileDataIn
      * @return buffer with portion of file content
      * @throws IOException on any fail of I/O operation
      */
-    public synchronized ByteBuffer readBytes(int length) throws IOException
+    public ByteBuffer readBytes(int length) throws IOException
     {
         int remaining = buffer.remaining() - position;
         if (length > remaining)
@@ -150,26 +140,16 @@ public class MappedFileDataInput extends AbstractDataInput implements FileDataIn
     }
 
     @Override
-    public final void readFully(byte[] buffer) throws IOException
+    public final void readFully(byte[] bytes) throws IOException
     {
-        throw new UnsupportedOperationException("use readBytes instead");
+        ByteBufferUtil.arrayCopy(buffer, buffer.position() + position, bytes, 0, bytes.length);
+        position += bytes.length;
     }
 
     @Override
     public final void readFully(byte[] buffer, int offset, int count) throws IOException
     {
         throw new UnsupportedOperationException("use readBytes instead");
-    }
-
-    public int skipBytes(int n) throws IOException
-    {
-        assert n >= 0 : "skipping negative bytes is illegal: " + n;
-        if (n == 0)
-            return 0;
-        int oldPosition = position;
-        assert ((long)oldPosition) + n <= Integer.MAX_VALUE;
-        position = Math.min(buffer.capacity(), position + n);
-        return position - oldPosition;
     }
 
     private static class MappedFileDataInputMark implements FileMark

@@ -17,7 +17,7 @@
  */
 package org.apache.cassandra.cache;
 
-import java.util.Set;
+import java.util.Iterator;
 
 /**
  * This is similar to the Map interface, but requires maintaining a given capacity
@@ -26,9 +26,9 @@ import java.util.Set;
  */
 public interface ICache<K, V>
 {
-    public int capacity();
+    public long capacity();
 
-    public void setCapacity(int capacity);
+    public void setCapacity(long capacity);
 
     public void put(K key, V value);
 
@@ -42,19 +42,13 @@ public interface ICache<K, V>
 
     public int size();
 
-    public int weightedSize();
+    public long weightedSize();
 
     public void clear();
 
-    public Set<K> keySet();
+    public Iterator<K> keyIterator();
 
-    public Set<K> hotKeySet(int n);
+    public Iterator<K> hotKeyIterator(int n);
 
     public boolean containsKey(K key);
-
-    /**
-     * @return true if the cache implementation inherently copies the cached values; otherwise,
-     * the caller should copy manually before caching shared values like Thrift ByteBuffers.
-     */
-    public boolean isPutCopying();
 }

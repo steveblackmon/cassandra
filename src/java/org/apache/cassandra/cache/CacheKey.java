@@ -17,25 +17,12 @@
  */
 package org.apache.cassandra.cache;
 
-import java.io.DataOutputStream;
-import java.io.IOException;
+import java.util.UUID;
 
-import org.apache.cassandra.utils.Pair;
-
-public interface CacheKey
+public interface CacheKey extends IMeasurableMemory
 {
     /**
-     * @return Serialized part of the key which should be persisted
+     * @return The cf id of the cache key.
      */
-    public void write(DataOutputStream out) throws IOException;
-
-    /**
-     * @return The size of the serialized key
-     */
-    public int serializedSize();
-
-    /**
-     * @return The keyspace and ColumnFamily names to which this key belongs
-     */
-    public Pair<String, String> getPathInfo();
+    public UUID getCFId();
 }

@@ -17,98 +17,93 @@
  */
 package org.apache.cassandra.db;
 
+import java.io.DataInputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.utils.*;
-import org.apache.commons.lang.builder.HashCodeBuilder;
+import com.google.common.collect.ImmutableMap;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 
 import org.apache.cassandra.cache.IRowCacheEntry;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.MarshalException;
-import org.apache.cassandra.io.IColumnSerializer;
+import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.CellNameType;
+import org.apache.cassandra.db.composites.CellNames;
+import org.apache.cassandra.db.filter.ColumnCounter;
+import org.apache.cassandra.db.filter.ColumnSlice;
+import org.apache.cassandra.io.sstable.ColumnNameHelper;
 import org.apache.cassandra.io.sstable.ColumnStats;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.*;
 
-public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEntry
+/**
+ * A sorted map of columns.
+ * This represents the backing map of a colum family.
+ *
+ * Whether the implementation is thread safe or not is left to the
+ * implementing classes.
+ */
+public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
 {
     /* The column serializer for this Column Family. Create based on config. */
     public static final ColumnFamilySerializer serializer = new ColumnFamilySerializer();
-    private final CFMetaData cfm;
 
-    public static ColumnFamily create(Integer cfId)
+    protected final CFMetaData metadata;
+
+    protected ColumnFamily(CFMetaData metadata)
     {
-        return create(Schema.instance.getCFMetaData(cfId));
+        assert metadata != null;
+        this.metadata = metadata;
     }
 
-    public static ColumnFamily create(Integer cfId, ISortedColumns.Factory factory)
+    public <T extends ColumnFamily> T cloneMeShallow(ColumnFamily.Factory<T> factory, boolean reversedInsertOrder)
     {
-        return create(Schema.instance.getCFMetaData(cfId), factory);
-    }
-
-    public static ColumnFamily create(String tableName, String cfName)
-    {
-        return create(Schema.instance.getCFMetaData(tableName, cfName));
-    }
-
-    public static ColumnFamily create(CFMetaData cfm)
-    {
-        return create(cfm, TreeMapBackedSortedColumns.factory());
-    }
-
-    public static ColumnFamily create(CFMetaData cfm, ISortedColumns.Factory factory)
-    {
-        return create(cfm, factory, false);
-    }
-
-    public static ColumnFamily create(CFMetaData cfm, ISortedColumns.Factory factory, boolean reversedInsertOrder)
-    {
-        return new ColumnFamily(cfm, factory.create(cfm.comparator, reversedInsertOrder));
-    }
-
-    protected ColumnFamily(CFMetaData cfm, ISortedColumns map)
-    {
-        super(map);
-        assert cfm != null;
-        this.cfm = cfm;
-    }
-
-    public ColumnFamily cloneMeShallow(ISortedColumns.Factory factory, boolean reversedInsertOrder)
-    {
-        ColumnFamily cf = ColumnFamily.create(cfm, factory, reversedInsertOrder);
+        T cf = factory.create(metadata, reversedInsertOrder);
         cf.delete(this);
         return cf;
     }
 
     public ColumnFamily cloneMeShallow()
     {
-        return cloneMeShallow(columns.getFactory(), columns.isInsertReversed());
+        return cloneMeShallow(false);
     }
 
-    public AbstractType<?> getSubComparator()
+    public ColumnFamily cloneMeShallow(boolean reversed)
     {
-        IColumnSerializer s = getColumnSerializer();
-        return (s instanceof SuperColumnSerializer) ? ((SuperColumnSerializer) s).getComparator() : null;
+        return cloneMeShallow(getFactory(), reversed);
     }
 
     public ColumnFamilyType getType()
     {
-        return cfm.cfType;
+        return metadata.cfType;
     }
 
-    public ColumnFamily cloneMe()
+    public int liveCQL3RowCount(long now)
     {
-        ColumnFamily cf = new ColumnFamily(cfm, columns.cloneMe());
-        cf.delete(this);
-        return cf;
+        ColumnCounter counter = getComparator().isDense()
+                              ? new ColumnCounter(now)
+                              : new ColumnCounter.GroupByPrefix(now, getComparator(), metadata.clusteringColumns().size());
+        return counter.countAll(this).live();
     }
 
-    public Integer id()
+    /**
+     * Clones the column map.
+     */
+    public abstract ColumnFamily cloneMe();
+
+    public UUID id()
     {
-        return cfm.cfId;
+        return metadata.cfId;
     }
 
     /**
@@ -116,98 +111,177 @@ public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEn
      */
     public CFMetaData metadata()
     {
-        return cfm;
+        return metadata;
     }
 
-    public IColumnSerializer getColumnSerializer()
+    public void addColumn(CellName name, ByteBuffer value, long timestamp)
     {
-        return cfm.getColumnSerializer();
+        addColumn(name, value, timestamp, 0);
     }
 
-    public boolean isSuper()
+    public void addColumn(CellName name, ByteBuffer value, long timestamp, int timeToLive)
     {
-        return getType() == ColumnFamilyType.Super;
+        assert !metadata().isCounter();
+        Cell cell = AbstractCell.create(name, value, timestamp, timeToLive, metadata());
+        addColumn(cell);
+    }
+
+    public void addCounter(CellName name, long value)
+    {
+        addColumn(new BufferCounterUpdateCell(name, value, FBUtilities.timestampMicros()));
+    }
+
+    public void addTombstone(CellName name, ByteBuffer localDeletionTime, long timestamp)
+    {
+        addColumn(new BufferDeletedCell(name, localDeletionTime, timestamp));
+    }
+
+    public void addTombstone(CellName name, int localDeletionTime, long timestamp)
+    {
+        addColumn(new BufferDeletedCell(name, localDeletionTime, timestamp));
+    }
+
+    public void addAtom(OnDiskAtom atom)
+    {
+        if (atom instanceof Cell)
+        {
+            addColumn((Cell)atom);
+        }
+        else
+        {
+            assert atom instanceof RangeTombstone;
+            delete((RangeTombstone)atom);
+        }
     }
 
     /**
-     * Same as addAll() but do a cloneMe of SuperColumn if necessary to
-     * avoid keeping references to the structure (see #3957).
+     * Clear this column family, removing all columns and deletion info.
      */
-    public void addAllWithSCCopy(ColumnFamily cf, Allocator allocator)
+    public abstract void clear();
+
+    /**
+     * Returns a {@link DeletionInfo.InOrderTester} for the deletionInfo() of
+     * this column family. Please note that for ThreadSafe implementation of ColumnFamily,
+     * this tester will remain valid even if new tombstones are added to this ColumnFamily
+     * *as long as said addition is done in comparator order*. For AtomicSortedColumns,
+     * the tester will correspond to the state of when this method is called.
+     */
+    public DeletionInfo.InOrderTester inOrderDeletionTester()
     {
-        if (cf.isSuper())
-        {
-            for (IColumn c : cf)
-            {
-                columns.addColumn(((SuperColumn)c).cloneMe(), allocator);
-            }
-            delete(cf);
-        }
-        else
-        {
-            addAll(cf, allocator);
-        }
+        return deletionInfo().inOrderTester();
     }
 
-    public void addColumn(QueryPath path, ByteBuffer value, long timestamp)
+    /**
+     * Returns the factory used for this ISortedColumns implementation.
+     */
+    public abstract Factory getFactory();
+
+    public abstract DeletionInfo deletionInfo();
+    public abstract void setDeletionInfo(DeletionInfo info);
+
+    public abstract void delete(DeletionInfo info);
+    public abstract void delete(DeletionTime deletionTime);
+    protected abstract void delete(RangeTombstone tombstone);
+
+    public abstract SearchIterator<CellName, Cell> searchIterator();
+
+    /**
+     * Purges top-level and range tombstones whose localDeletionTime is older than gcBefore.
+     * @param gcBefore a timestamp (in seconds) before which tombstones should be purged
+     */
+    public abstract void purgeTombstones(int gcBefore);
+
+    /**
+     * Adds a cell to this cell map.
+     * If a cell with the same name is already present in the map, it will
+     * be replaced by the newly added cell.
+     */
+    public abstract void addColumn(Cell cell);
+
+    /**
+     * Adds a cell if it's non-gc-able and isn't shadowed by a partition/range tombstone with a higher timestamp.
+     * Requires that the cell to add is sorted strictly after the last cell in the container.
+     */
+    public abstract void maybeAppendColumn(Cell cell, DeletionInfo.InOrderTester tester, int gcBefore);
+
+    /**
+     * Adds all the columns of a given column map to this column map.
+     * This is equivalent to:
+     *   <code>
+     *   for (Cell c : cm)
+     *      addColumn(c, ...);
+     *   </code>
+     *  but is potentially faster.
+     */
+    public abstract void addAll(ColumnFamily cm);
+
+    /**
+     * Get a column given its name, returning null if the column is not
+     * present.
+     */
+    public abstract Cell getColumn(CellName name);
+
+    /**
+     * Returns an iterable with the names of columns in this column map in the same order
+     * as the underlying columns themselves.
+     */
+    public abstract Iterable<CellName> getColumnNames();
+
+    /**
+     * Returns the columns of this column map as a collection.
+     * The columns in the returned collection should be sorted as the columns
+     * in this map.
+     */
+    public abstract Collection<Cell> getSortedColumns();
+
+    /**
+     * Returns the columns of this column map as a collection.
+     * The columns in the returned collection should be sorted in reverse
+     * order of the columns in this map.
+     */
+    public abstract Collection<Cell> getReverseSortedColumns();
+
+    /**
+     * Returns the number of columns in this map.
+     */
+    public abstract int getColumnCount();
+
+    /**
+     * Returns whether or not there are any columns present.
+     */
+    public abstract boolean hasColumns();
+
+    /**
+     * Returns true if this contains no columns or deletion info
+     */
+    public boolean isEmpty()
     {
-        addColumn(path, value, timestamp, 0);
+        return deletionInfo().isLive() && !hasColumns();
     }
 
-    public void addColumn(QueryPath path, ByteBuffer value, long timestamp, int timeToLive)
-    {
-        assert path.columnName != null : path;
-        assert !metadata().getDefaultValidator().isCommutative();
-        Column column;
-        if (timeToLive > 0)
-            column = new ExpiringColumn(path.columnName, value, timestamp, timeToLive);
-        else
-            column = new Column(path.columnName, value, timestamp);
-        addColumn(path.superColumnName, column);
-    }
+    /**
+     * Returns an iterator over the columns of this map that returns only the matching @param slices.
+     * The provided slices must be in order and must be non-overlapping.
+     */
+    public abstract Iterator<Cell> iterator(ColumnSlice[] slices);
 
-    public void addCounter(QueryPath path, long value)
-    {
-        assert path.columnName != null : path;
-        addColumn(path.superColumnName, new CounterUpdateColumn(path.columnName, value, System.currentTimeMillis()));
-    }
+    /**
+     * Returns a reversed iterator over the columns of this map that returns only the matching @param slices.
+     * The provided slices must be in reversed order and must be non-overlapping.
+     */
+    public abstract Iterator<Cell> reverseIterator(ColumnSlice[] slices);
 
-    public void addTombstone(QueryPath path, ByteBuffer localDeletionTime, long timestamp)
-    {
-        assert path.columnName != null : path;
-        addColumn(path.superColumnName, new DeletedColumn(path.columnName, localDeletionTime, timestamp));
-    }
+    /**
+     * Returns if this map only support inserts in reverse order.
+     */
+    public abstract boolean isInsertReversed();
 
-    public void addTombstone(QueryPath path, int localDeletionTime, long timestamp)
+    /**
+     * If `columns` has any tombstones (top-level or range tombstones), they will be applied to this set of columns.
+     */
+    public void delete(ColumnFamily columns)
     {
-        assert path.columnName != null : path;
-        addColumn(path.superColumnName, new DeletedColumn(path.columnName, localDeletionTime, timestamp));
-    }
-
-    public void addTombstone(ByteBuffer name, int localDeletionTime, long timestamp)
-    {
-        addColumn(null, new DeletedColumn(name, localDeletionTime, timestamp));
-    }
-
-    public void addColumn(ByteBuffer superColumnName, Column column)
-    {
-        IColumn c;
-        if (superColumnName == null)
-        {
-            c = column;
-        }
-        else
-        {
-            assert isSuper();
-            c = new SuperColumn(superColumnName, getSubComparator());
-            c.addColumn(column); // checks subcolumn name
-        }
-        addColumn(c);
-    }
-
-    public void clear()
-    {
-        columns.clear();
+        delete(columns.deletionInfo());
     }
 
     /*
@@ -217,63 +291,63 @@ public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEn
     public ColumnFamily diff(ColumnFamily cfComposite)
     {
         assert cfComposite.id().equals(id());
-        ColumnFamily cfDiff = ColumnFamily.create(cfm);
-        if (cfComposite.getMarkedForDeleteAt() > getMarkedForDeleteAt())
-        {
-            cfDiff.delete(cfComposite.getLocalDeletionTime(), cfComposite.getMarkedForDeleteAt());
-        }
+        ColumnFamily cfDiff = ArrayBackedSortedColumns.factory.create(metadata);
+        cfDiff.delete(cfComposite.deletionInfo());
 
-        // (don't need to worry about cfNew containing IColumns that are shadowed by
+        // (don't need to worry about cfNew containing Columns that are shadowed by
         // the delete tombstone, since cfNew was generated by CF.resolve, which
         // takes care of those for us.)
-        for (IColumn columnExternal : cfComposite)
+        for (Cell cellExternal : cfComposite)
         {
-            ByteBuffer cName = columnExternal.name();
-            IColumn columnInternal = this.columns.getColumn(cName);
-            if (columnInternal == null)
+            CellName cName = cellExternal.name();
+            Cell cellInternal = getColumn(cName);
+            if (cellInternal == null)
             {
-                cfDiff.addColumn(columnExternal);
+                cfDiff.addColumn(cellExternal);
             }
             else
             {
-                IColumn columnDiff = columnInternal.diff(columnExternal);
-                if (columnDiff != null)
+                Cell cellDiff = cellInternal.diff(cellExternal);
+                if (cellDiff != null)
                 {
-                    cfDiff.addColumn(columnDiff);
+                    cfDiff.addColumn(cellDiff);
                 }
             }
         }
 
-        if (!cfDiff.isEmpty() || cfDiff.isMarkedForDelete())
+        cfDiff.setDeletionInfo(deletionInfo().diff(cfComposite.deletionInfo()));
+
+        if (!cfDiff.isEmpty())
             return cfDiff;
+        
         return null;
     }
 
-    int size(TypeSizes typeSizes)
+    public long dataSize()
     {
-        int size = TypeSizes.NATIVE.sizeof(1L) + TypeSizes.NATIVE.sizeof(1); // tombstone tracking
-        for (IColumn column : columns)
-        {
-            size += column.size(typeSizes);
-        }
+        long size = 0;
+        for (Cell cell : this)
+            size += cell.cellDataSize();
         return size;
     }
 
     public long maxTimestamp()
     {
-        long maxTimestamp = getMarkedForDeleteAt();
-        for (IColumn column : columns)
-            maxTimestamp = Math.max(maxTimestamp, column.maxTimestamp());
+        long maxTimestamp = deletionInfo().maxTimestamp();
+        for (Cell cell : this)
+            maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
         return maxTimestamp;
     }
 
     @Override
     public int hashCode()
     {
-        return new HashCodeBuilder(373, 75437)
-                    .append(cfm)
-                    .append(getMarkedForDeleteAt())
-                    .append(columns).toHashCode();
+        HashCodeBuilder builder = new HashCodeBuilder(373, 75437)
+                .append(metadata)
+                .append(deletionInfo());
+        for (Cell cell : this)
+            builder.append(cell);
+        return builder.toHashCode();
     }
 
     @Override
@@ -281,27 +355,26 @@ public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEn
     {
         if (this == o)
             return true;
-        if (o == null || this.getClass() != o.getClass())
+        if (o == null || !(o instanceof ColumnFamily))
             return false;
 
         ColumnFamily comparison = (ColumnFamily) o;
 
-        return cfm.equals(comparison.cfm)
-                && getMarkedForDeleteAt() == comparison.getMarkedForDeleteAt()
-                && ByteBufferUtil.compareUnsigned(digest(this), digest(comparison)) == 0;
+        return metadata.equals(comparison.metadata)
+               && deletionInfo().equals(comparison.deletionInfo())
+               && ByteBufferUtil.compareUnsigned(digest(this), digest(comparison)) == 0;
     }
 
     @Override
     public String toString()
     {
         StringBuilder sb = new StringBuilder("ColumnFamily(");
-        CFMetaData cfm = metadata();
-        sb.append(cfm == null ? "<anonymous>" : cfm.cfName);
+        sb.append(metadata.cfName);
 
         if (isMarkedForDelete())
-            sb.append(" -deleted at ").append(getMarkedForDeleteAt()).append("-");
+            sb.append(" -").append(deletionInfo()).append("-");
 
-        sb.append(" [").append(getComparator().getColumnsString(getSortedColumns())).append("])");
+        sb.append(" [").append(CellNames.getColumnsString(getComparator(), this)).append("])");
         return sb.toString();
     }
 
@@ -315,15 +388,10 @@ public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEn
 
     public void updateDigest(MessageDigest digest)
     {
-        for (IColumn column : columns)
-            column.updateDigest(digest);
-    }
-
-    public static AbstractType<?> getComparatorFor(String table, String columnFamilyName, ByteBuffer superColumnName)
-    {
-        return superColumnName == null
-               ? Schema.instance.getComparator(table, columnFamilyName)
-               : Schema.instance.getSubComparator(table, columnFamilyName);
+        for (Cell cell : this)
+            cell.updateDigest(digest);
+        if (MessagingService.instance().areAllNodesAtLeast21())
+            deletionInfo().updateDigest(digest);
     }
 
     public static ColumnFamily diff(ColumnFamily cf1, ColumnFamily cf2)
@@ -333,45 +401,158 @@ public class ColumnFamily extends AbstractColumnContainer implements IRowCacheEn
         return cf1.diff(cf2);
     }
 
-    public void resolve(ColumnFamily cf)
+    public ColumnStats getColumnStats()
     {
-        resolve(cf, HeapAllocator.instance);
+        // note that we default to MIN_VALUE/MAX_VALUE here to be able to override them later in this method
+        // we are checking row/range tombstones and actual cells - there should always be data that overrides
+        // these with actual values
+        ColumnStats.MinLongTracker minTimestampTracker = new ColumnStats.MinLongTracker(Long.MIN_VALUE);
+        ColumnStats.MaxLongTracker maxTimestampTracker = new ColumnStats.MaxLongTracker(Long.MAX_VALUE);
+        StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
+        ColumnStats.MaxIntTracker maxDeletionTimeTracker = new ColumnStats.MaxIntTracker(Integer.MAX_VALUE);
+        List<ByteBuffer> minColumnNamesSeen = Collections.emptyList();
+        List<ByteBuffer> maxColumnNamesSeen = Collections.emptyList();
+        boolean hasLegacyCounterShards = false;
+
+        if (deletionInfo().getTopLevelDeletion().localDeletionTime < Integer.MAX_VALUE)
+        {
+            tombstones.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
+            maxDeletionTimeTracker.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
+            minTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
+            maxTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
+        }
+        Iterator<RangeTombstone> it = deletionInfo().rangeIterator();
+        while (it.hasNext())
+        {
+            RangeTombstone rangeTombstone = it.next();
+            tombstones.update(rangeTombstone.getLocalDeletionTime());
+            minTimestampTracker.update(rangeTombstone.timestamp());
+            maxTimestampTracker.update(rangeTombstone.timestamp());
+            maxDeletionTimeTracker.update(rangeTombstone.getLocalDeletionTime());
+            minColumnNamesSeen = ColumnNameHelper.minComponents(minColumnNamesSeen, rangeTombstone.min, metadata.comparator);
+            maxColumnNamesSeen = ColumnNameHelper.maxComponents(maxColumnNamesSeen, rangeTombstone.max, metadata.comparator);
+        }
+
+        for (Cell cell : this)
+        {
+            minTimestampTracker.update(cell.timestamp());
+            maxTimestampTracker.update(cell.timestamp());
+            maxDeletionTimeTracker.update(cell.getLocalDeletionTime());
+
+            int deletionTime = cell.getLocalDeletionTime();
+            if (deletionTime < Integer.MAX_VALUE)
+                tombstones.update(deletionTime);
+            minColumnNamesSeen = ColumnNameHelper.minComponents(minColumnNamesSeen, cell.name(), metadata.comparator);
+            maxColumnNamesSeen = ColumnNameHelper.maxComponents(maxColumnNamesSeen, cell.name(), metadata.comparator);
+            if (cell instanceof CounterCell)
+                hasLegacyCounterShards = hasLegacyCounterShards || ((CounterCell) cell).hasLegacyShards();
+        }
+        return new ColumnStats(getColumnCount(),
+                               minTimestampTracker.get(),
+                               maxTimestampTracker.get(),
+                               maxDeletionTimeTracker.get(),
+                               tombstones,
+                               minColumnNamesSeen,
+                               maxColumnNamesSeen,
+                               hasLegacyCounterShards);
     }
 
-    public void resolve(ColumnFamily cf, Allocator allocator)
+    public boolean isMarkedForDelete()
     {
-        // Row _does_ allow null CF objects :(  seems a necessary evil for efficiency
-        if (cf == null)
-            return;
-        addAll(cf, allocator);
+        return !deletionInfo().isLive();
     }
 
     /**
-     * Goes over all columns and check the fields are valid (as far as we can
-     * tell).
-     * This is used to detect corruption after deserialization.
+     * @return the comparator whose sorting order the contained columns conform to
      */
-    public void validateColumnFields() throws MarshalException
+    public CellNameType getComparator()
     {
-        CFMetaData metadata = metadata();
-        for (IColumn column : this)
+        return metadata.comparator;
+    }
+
+    public boolean hasOnlyTombstones(long now)
+    {
+        for (Cell cell : this)
+            if (cell.isLive(now))
+                return false;
+        return true;
+    }
+
+    public Iterator<Cell> iterator()
+    {
+        return getSortedColumns().iterator();
+    }
+
+    public Iterator<Cell> reverseIterator()
+    {
+        return getReverseSortedColumns().iterator();
+    }
+
+    public Map<CellName, ByteBuffer> asMap()
+    {
+        ImmutableMap.Builder<CellName, ByteBuffer> builder = ImmutableMap.builder();
+        for (Cell cell : this)
+            builder.put(cell.name(), cell.value());
+        return builder.build();
+    }
+
+    public static ColumnFamily fromBytes(ByteBuffer bytes)
+    {
+        if (bytes == null)
+            return null;
+
+        try
         {
-            column.validateFields(metadata);
+            return serializer.deserialize(new DataInputStream(ByteBufferUtil.inputStream(bytes)),
+                                                              ArrayBackedSortedColumns.factory,
+                                                              ColumnSerializer.Flag.LOCAL,
+                                                              MessagingService.current_version);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
         }
     }
 
-    public ColumnStats getColumnStats()
+    public ByteBuffer toBytes()
     {
-        long maxTimestampSeen = getMarkedForDeleteAt();
-        StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
-
-        for (IColumn column : columns)
-        {
-            maxTimestampSeen = Math.max(maxTimestampSeen, column.maxTimestamp());
-            int deletionTime = column.getLocalDeletionTime();
-            if (deletionTime < Integer.MAX_VALUE)
-                tombstones.update(deletionTime);
-        }
-        return new ColumnStats(getColumnCount(), maxTimestampSeen, tombstones);
+        DataOutputBuffer out = new DataOutputBuffer();
+        serializer.serialize(this, out, MessagingService.current_version);
+        return ByteBuffer.wrap(out.getData(), 0, out.getLength());
     }
+
+
+    /**
+     * @return an iterator where the removes are carried out once everything has been iterated
+     */
+    public abstract BatchRemoveIterator<Cell> batchRemoveIterator();
+
+    public abstract static class Factory <T extends ColumnFamily>
+    {
+        /**
+         * Returns a (initially empty) column map whose columns are sorted
+         * according to the provided comparator.
+         * The {@code insertReversed} flag is an hint on how we expect insertion to be perfomed,
+         * either in sorted or reverse sorted order. This is used by ArrayBackedSortedColumns to
+         * allow optimizing for both forward and reversed slices. This does not matter for ThreadSafeSortedColumns.
+         * Note that this is only an hint on how we expect to do insertion, this does not change the map sorting.
+         */
+        public abstract T create(CFMetaData metadata, boolean insertReversed, int initialCapacity);
+
+        public T create(CFMetaData metadata, boolean insertReversed)
+        {
+            return create(metadata, insertReversed, 0);
+        }
+
+        public T create(CFMetaData metadata)
+        {
+            return create(metadata, false);
+        }
+
+        public T create(String keyspace, String cfName)
+        {
+            return create(Schema.instance.getCFMetaData(keyspace, cfName));
+        }
+    }
+
 }

@@ -18,48 +18,80 @@
 package org.apache.cassandra.cache;
 
 import java.io.*;
-import java.nio.ByteBuffer;
 import java.util.*;
-
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import org.cliffc.high_scale_lib.NonBlockingHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.compaction.CompactionInfo;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.service.CacheService;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 
 public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K, V>
 {
+    public interface IStreamFactory
+    {
+        public InputStream getInputStream(File path) throws FileNotFoundException;
+        public OutputStream getOutputStream(File path) throws FileNotFoundException;
+    }
+
     private static final Logger logger = LoggerFactory.getLogger(AutoSavingCache.class);
 
     /** True if a cache flush is currently executing: only one may execute at a time. */
-    public static final AtomicBoolean flushInProgress = new AtomicBoolean(false);
+    public static final Set<CacheService.CacheType> flushInProgress = new NonBlockingHashSet<CacheService.CacheType>();
 
     protected volatile ScheduledFuture<?> saveTask;
     protected final CacheService.CacheType cacheType;
 
-    public AutoSavingCache(ICache<K, V> cache, CacheService.CacheType cacheType)
+    private final CacheSerializer<K, V> cacheLoader;
+    private static final String CURRENT_VERSION = "b";
+
+    private static volatile IStreamFactory streamFactory = new IStreamFactory()
     {
-        super(cache);
-        this.cacheType = cacheType;
+        public InputStream getInputStream(File path) throws FileNotFoundException
+        {
+            return new FileInputStream(path);
+        }
+
+        public OutputStream getOutputStream(File path) throws FileNotFoundException
+        {
+            return new FileOutputStream(path);
+        }
+    };
+
+    // Unused, but exposed for a reason. See CASSANDRA-8096.
+    public static void setStreamFactory(IStreamFactory streamFactory)
+    {
+        AutoSavingCache.streamFactory = streamFactory;
     }
 
-    public File getCachePath(String ksName, String cfName)
+    public AutoSavingCache(ICache<K, V> cache, CacheService.CacheType cacheType, CacheSerializer<K, V> cacheloader)
     {
-        return DatabaseDescriptor.getSerializedCachePath(ksName, cfName, cacheType);
+        super(cacheType.toString(), cache);
+        this.cacheType = cacheType;
+        this.cacheLoader = cacheloader;
+    }
+
+    public File getCachePath(UUID cfId, String version)
+    {
+        Pair<String, String> names = Schema.instance.getCF(cfId);
+        return DatabaseDescriptor.getSerializedCachePath(names.left, names.right, cfId, cacheType, version);
     }
 
     public Writer getWriter(int keysToSave)
@@ -76,66 +108,66 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
         }
         if (savePeriodInSeconds > 0)
         {
-            Runnable runnable = new WrappedRunnable()
+            Runnable runnable = new Runnable()
             {
-                public void runMayThrow()
+                public void run()
                 {
                     submitWrite(keysToSave);
                 }
             };
-            saveTask = StorageService.optionalTasks.scheduleWithFixedDelay(runnable,
-                                                                           savePeriodInSeconds,
-                                                                           savePeriodInSeconds,
-                                                                           TimeUnit.SECONDS);
+            saveTask = ScheduledExecutors.optionalTasks.scheduleWithFixedDelay(runnable,
+                                                                               savePeriodInSeconds,
+                                                                               savePeriodInSeconds,
+                                                                               TimeUnit.SECONDS);
         }
     }
 
-    public Set<DecoratedKey> readSaved(String ksName, String cfName)
+    public int loadSaved(ColumnFamilyStore cfs)
     {
-        File path = getCachePath(ksName, cfName);
-        Set<DecoratedKey> keys = new TreeSet<DecoratedKey>();
+        int count = 0;
+        long start = System.nanoTime();
+
+        // modern format, allows both key and value (so key cache load can be purely sequential)
+        File path = getCachePath(cfs.metadata.cfId, CURRENT_VERSION);
         if (path.exists())
         {
             DataInputStream in = null;
             try
             {
-                long start = System.currentTimeMillis();
-
                 logger.info(String.format("reading saved cache %s", path));
-                in = new DataInputStream(new BufferedInputStream(new FileInputStream(path)));
+                in = new DataInputStream(new LengthAvailableInputStream(new BufferedInputStream(streamFactory.getInputStream(path)), path.length()));
+                List<Future<Pair<K, V>>> futures = new ArrayList<Future<Pair<K, V>>>();
                 while (in.available() > 0)
                 {
-                    int size = in.readInt();
-                    byte[] bytes = new byte[size];
-                    in.readFully(bytes);
-                    ByteBuffer buffer = ByteBuffer.wrap(bytes);
-                    DecoratedKey key;
-                    try
-                    {
-                        key = StorageService.getPartitioner().decorateKey(buffer);
-                    }
-                    catch (Exception e)
-                    {
-                        logger.info(String.format("unable to read entry #%s from saved cache %s; skipping remaining entries",
-                                keys.size(), path.getAbsolutePath()), e);
-                        break;
-                    }
-                    keys.add(key);
+                    Future<Pair<K, V>> entry = cacheLoader.deserialize(in, cfs);
+                    // Key cache entry can return null, if the SSTable doesn't exist.
+                    if (entry == null)
+                        continue;
+                    futures.add(entry);
+                    count++;
                 }
-                if (logger.isDebugEnabled())
-                    logger.debug(String.format("completed reading (%d ms; %d keys) saved cache %s",
-                            System.currentTimeMillis() - start, keys.size(), path));
+
+                for (Future<Pair<K, V>> future : futures)
+                {
+                    Pair<K, V> entry = future.get();
+                    if (entry != null)
+                        put(entry.left, entry.right);
+                }
             }
             catch (Exception e)
             {
-                logger.warn(String.format("error reading saved cache %s", path.getAbsolutePath()), e);
+                JVMStabilityInspector.inspectThrowable(e);
+                logger.debug(String.format("harmless error reading saved cache %s", path.getAbsolutePath()), e);
             }
             finally
             {
                 FileUtils.closeQuietly(in);
             }
         }
-        return keys;
+        if (logger.isDebugEnabled())
+            logger.debug("completed reading ({} ms; {} keys) saved cache {}",
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), count, path);
+        return count;
     }
 
     public Future<?> submitWrite(int keysToSave)
@@ -143,148 +175,184 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
         return CompactionManager.instance.submitCacheWrite(getWriter(keysToSave));
     }
 
-    public void reduceCacheSize()
-    {
-        if (getCapacity() > 0)
-        {
-            int newCapacity = (int) (DatabaseDescriptor.getReduceCacheCapacityTo() * weightedSize());
-
-            logger.warn(String.format("Reducing %s capacity from %d to %s to reduce memory pressure",
-                                      cacheType, getCapacity(), newCapacity));
-
-            setCapacity(newCapacity);
-        }
-    }
-
-    public int estimateSizeToSave(Set<K> keys)
-    {
-        int bytes = 0;
-
-        for (K key : keys)
-            bytes += key.serializedSize();
-
-        return bytes;
-    }
-
     public class Writer extends CompactionInfo.Holder
     {
-        private final Set<K> keys;
+        private final Iterator<K> keyIterator;
         private final CompactionInfo info;
-        private final long estimatedTotalBytes;
-        private long bytesWritten;
+        private long keysWritten;
+        private final long keysEstimate;
 
         protected Writer(int keysToSave)
         {
-            if (keysToSave >= getKeySet().size())
-                keys = getKeySet();
+            int size = size();
+            if (keysToSave >= size || keysToSave == 0)
+            {
+                keyIterator = keyIterator();
+                keysEstimate = size;
+            }
             else
-                keys = hotKeySet(keysToSave);
-
-            // an approximation -- the keyset can change while saving
-            estimatedTotalBytes = estimateSizeToSave(keys);
+            {
+                keyIterator = hotKeyIterator(keysToSave);
+                keysEstimate = keysToSave;
+            }
 
             OperationType type;
             if (cacheType == CacheService.CacheType.KEY_CACHE)
                 type = OperationType.KEY_CACHE_SAVE;
             else if (cacheType == CacheService.CacheType.ROW_CACHE)
                 type = OperationType.ROW_CACHE_SAVE;
+            else if (cacheType == CacheService.CacheType.COUNTER_CACHE)
+                type = OperationType.COUNTER_CACHE_SAVE;
             else
                 type = OperationType.UNKNOWN;
 
-            info = new CompactionInfo(this.hashCode(),
-                                      "Global",
-                                      cacheType.toString(),
+            info = new CompactionInfo(CFMetaData.denseCFMetaData(SystemKeyspace.NAME, cacheType.toString(), BytesType.instance),
                                       type,
                                       0,
-                                      estimatedTotalBytes);
+                                      keysEstimate,
+                                      "keys");
+        }
+
+        public CacheService.CacheType cacheType()
+        {
+            return cacheType;
         }
 
         public CompactionInfo getCompactionInfo()
         {
-            long bytesWritten = this.bytesWritten;
-            // keyset can change in size, thus totalBytes can too
-            return info.forProgress(bytesWritten,
-                                    Math.max(bytesWritten, estimatedTotalBytes));
+            // keyset can change in size, thus total can too
+            // TODO need to check for this one... was: info.forProgress(keysWritten, Math.max(keysWritten, keys.size()));
+            return info.forProgress(keysWritten, Math.max(keysWritten, keysEstimate));
         }
 
-        public void saveCache() throws IOException
+        public void saveCache()
         {
             logger.debug("Deleting old {} files.", cacheType);
             deleteOldCacheFiles();
 
-            if (keys.size() == 0 || estimatedTotalBytes == 0)
+            if (!keyIterator.hasNext())
             {
                 logger.debug("Skipping {} save, cache is empty.", cacheType);
                 return;
             }
 
-            long start = System.currentTimeMillis();
+            long start = System.nanoTime();
 
-            HashMap<Pair<String, String>, SequentialWriter> writers = new HashMap<Pair<String, String>, SequentialWriter>();
+            HashMap<UUID, DataOutputPlus> writers = new HashMap<>();
+            HashMap<UUID, OutputStream> streams = new HashMap<>();
+            HashMap<UUID, File> paths = new HashMap<>();
 
             try
             {
-                for (CacheKey key : keys)
+                while (keyIterator.hasNext())
                 {
-                    Pair<String, String> path = key.getPathInfo();
-                    SequentialWriter writer = writers.get(path);
+                    K key = keyIterator.next();
+                    UUID cfId = key.getCFId();
+                    if (!Schema.instance.hasCF(key.getCFId()))
+                        continue; // the table has been dropped.
 
+                    DataOutputPlus writer = writers.get(cfId);
                     if (writer == null)
                     {
-                        writer = tempCacheFile(path);
-                        writers.put(path, writer);
+                        File writerPath = tempCacheFile(cfId);
+                        OutputStream stream;
+                        try
+                        {
+                            stream = streamFactory.getOutputStream(writerPath);
+                            writer = new DataOutputStreamPlus(stream);
+                        }
+                        catch (FileNotFoundException e)
+                        {
+                            throw new RuntimeException(e);
+                        }
+                        paths.put(cfId, writerPath);
+                        streams.put(cfId, stream);
+                        writers.put(cfId, writer);
                     }
 
-                    key.write(writer.stream);
-                    bytesWritten += key.serializedSize();
+                    try
+                    {
+                        cacheLoader.serialize(key, writer);
+                    }
+                    catch (IOException e)
+                    {
+                        throw new FSWriteError(e, paths.get(cfId));
+                    }
+
+                    keysWritten++;
+                    if (keysWritten >= keysEstimate)
+                        break;
                 }
             }
             finally
             {
-                for (SequentialWriter writer : writers.values())
+                if (keyIterator instanceof Closeable)
+                    try
+                    {
+                        ((Closeable)keyIterator).close();
+                    }
+                    catch (IOException ignored)
+                    {
+                        // not thrown (by OHC)
+                    }
+
+                for (OutputStream writer : streams.values())
                     FileUtils.closeQuietly(writer);
             }
 
-            for (Map.Entry<Pair<String, String>, SequentialWriter> info : writers.entrySet())
+            for (Map.Entry<UUID, DataOutputPlus> entry : writers.entrySet())
             {
-                Pair<String, String> path = info.getKey();
-                SequentialWriter writer = info.getValue();
+                UUID cfId = entry.getKey();
 
-                File tmpFile = new File(writer.getPath());
-                File cacheFile = getCachePath(path.left, path.right);
+                File tmpFile = paths.get(cfId);
+                File cacheFile = getCachePath(cfId, CURRENT_VERSION);
 
                 cacheFile.delete(); // ignore error if it didn't exist
                 if (!tmpFile.renameTo(cacheFile))
-                    logger.error("Unable to rename " + tmpFile + " to " + cacheFile);
+                    logger.error("Unable to rename {} to {}", tmpFile, cacheFile);
             }
 
-            logger.info(String.format("Saved %s (%d items) in %d ms", cacheType, keys.size(), System.currentTimeMillis() - start));
+            logger.info("Saved {} ({} items) in {} ms", cacheType, keysWritten, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
         }
 
-        private SequentialWriter tempCacheFile(Pair<String, String> pathInfo) throws IOException
+        private File tempCacheFile(UUID cfId)
         {
-            File path = getCachePath(pathInfo.left, pathInfo.right);
-            File tmpFile = File.createTempFile(path.getName(), null, path.getParentFile());
-
-            return SequentialWriter.open(tmpFile, true);
+            File path = getCachePath(cfId, CURRENT_VERSION);
+            return FileUtils.createTempFile(path.getName(), null, path.getParentFile());
         }
-
 
         private void deleteOldCacheFiles()
         {
             File savedCachesDir = new File(DatabaseDescriptor.getSavedCachesLocation());
-
-            if (savedCachesDir.exists() && savedCachesDir.isDirectory())
+            assert savedCachesDir.exists() && savedCachesDir.isDirectory();
+            File[] files = savedCachesDir.listFiles();
+            if (files != null)
             {
-                for (File file : savedCachesDir.listFiles())
+                String cacheNameFormat = String.format("%s-%s.db", cacheType.toString(), CURRENT_VERSION);
+                for (File file : files)
                 {
-                    if (file.isFile() && file.getName().endsWith(cacheType.toString()))
+                    if (!file.isFile())
+                        continue; // someone's been messing with our directory.  naughty!
+
+                    if (file.getName().endsWith(cacheNameFormat) 
+                     || file.getName().endsWith(cacheType.toString()))
                     {
                         if (!file.delete())
                             logger.warn("Failed to delete {}", file.getAbsolutePath());
                     }
                 }
             }
+            else
+            {
+                logger.warn("Could not list files in {}", savedCachesDir);
+            }
         }
+    }
+
+    public interface CacheSerializer<K extends CacheKey, V>
+    {
+        void serialize(K key, DataOutputPlus out) throws IOException;
+
+        Future<Pair<K, V>> deserialize(DataInputStream in, ColumnFamilyStore cfs) throws IOException;
     }
 }

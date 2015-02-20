@@ -17,17 +17,15 @@
  */
 package org.apache.cassandra.io.util;
 
+import java.io.DataInput;
 import java.io.IOException;
 
-import org.apache.cassandra.cache.FreeableMemory;
-
-
-public class MemoryInputStream extends AbstractDataInput
+public class MemoryInputStream extends AbstractDataInput implements DataInput
 {
-    private final FreeableMemory mem;
+    private final Memory mem;
     private int position = 0;
 
-    public MemoryInputStream(FreeableMemory mem)
+    public MemoryInputStream(Memory mem)
     {
         this.mem = mem;
     }
@@ -43,20 +41,24 @@ public class MemoryInputStream extends AbstractDataInput
         position += count;
     }
 
-    protected void seekInternal(int pos)
+    public void seek(long pos)
     {
-        position = pos;
+        position = (int) pos;
     }
 
-    protected int getPosition()
+    public long getPosition()
     {
         return position;
     }
 
-    public int skipBytes(int n) throws IOException
+    public long getPositionLimit()
     {
-        seekInternal(getPosition() + n);
-        return position;
+        return mem.size();
+    }
+
+    protected long length()
+    {
+        return mem.size();
     }
 
     public void close()

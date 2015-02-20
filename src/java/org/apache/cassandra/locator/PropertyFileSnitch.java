@@ -17,10 +17,10 @@
  */
 package org.apache.cassandra.locator;
 
-import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -28,16 +28,18 @@ import java.util.Properties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ResourceWatcher;
 import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.commons.lang3.StringUtils;
 
 /**
+ * <p>
  * Used to determine if two IP's are in the same datacenter or on the same rack.
- * <p/>
+ * </p>
  * Based on a properties file in the following format:
  *
  * 10.0.0.13=DC1:RAC2
@@ -49,17 +51,20 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
 {
     private static final Logger logger = LoggerFactory.getLogger(PropertyFileSnitch.class);
 
-    private static final String RACK_PROPERTY_FILENAME = "cassandra-topology.properties";
+    public static final String SNITCH_PROPERTIES_FILENAME = "cassandra-topology.properties";
 
     private static volatile Map<InetAddress, String[]> endpointMap;
     private static volatile String[] defaultDCRack;
 
+    private volatile boolean gossipStarted;
+
     public PropertyFileSnitch() throws ConfigurationException
     {
         reloadConfiguration();
+
         try
         {
-            FBUtilities.resourceToFile(RACK_PROPERTY_FILENAME);
+            FBUtilities.resourceToFile(SNITCH_PROPERTIES_FILENAME);
             Runnable runnable = new WrappedRunnable()
             {
                 protected void runMayThrow() throws ConfigurationException
@@ -67,11 +72,11 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
                     reloadConfiguration();
                 }
             };
-            ResourceWatcher.watch(RACK_PROPERTY_FILENAME, runnable, 60 * 1000);
+            ResourceWatcher.watch(SNITCH_PROPERTIES_FILENAME, runnable, 60 * 1000);
         }
         catch (ConfigurationException ex)
         {
-            logger.debug(RACK_PROPERTY_FILENAME + " found, but does not look like a plain file. Will not watch it for changes");
+            logger.error("{} found, but does not look like a plain file. Will not watch it for changes", SNITCH_PROPERTIES_FILENAME);
         }
     }
 
@@ -82,6 +87,14 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
      * @return a array of string with the first index being the data center and the second being the rack
      */
     public String[] getEndpointInfo(InetAddress endpoint)
+    {
+        String[] rawEndpointInfo = getRawEndpointInfo(endpoint);
+        if (rawEndpointInfo == null)
+            throw new RuntimeException("Unknown host " + endpoint + " with no default configured");
+        return rawEndpointInfo;
+    }
+
+    private String[] getRawEndpointInfo(InetAddress endpoint)
     {
         String[] value = endpointMap.get(endpoint);
         if (value == null)
@@ -100,7 +113,9 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
      */
     public String getDatacenter(InetAddress endpoint)
     {
-        return getEndpointInfo(endpoint)[0];
+        String[] info = getEndpointInfo(endpoint);
+        assert info != null : "No location defined for endpoint " + endpoint;
+        return info[0];
     }
 
     /**
@@ -111,7 +126,9 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
      */
     public String getRack(InetAddress endpoint)
     {
-        return getEndpointInfo(endpoint)[1];
+        String[] info = getEndpointInfo(endpoint);
+        assert info != null : "No location defined for endpoint " + endpoint;
+        return info[1];
     }
 
     public void reloadConfiguration() throws ConfigurationException
@@ -122,12 +139,12 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
         InputStream stream = null;
         try
         {
-            stream = getClass().getClassLoader().getResourceAsStream(RACK_PROPERTY_FILENAME);
+            stream = getClass().getClassLoader().getResourceAsStream(SNITCH_PROPERTIES_FILENAME);
             properties.load(stream);
         }
-        catch (IOException e)
+        catch (Exception e)
         {
-            throw new ConfigurationException("Unable to read " + RACK_PROPERTY_FILENAME, e);
+            throw new ConfigurationException("Unable to read " + SNITCH_PROPERTIES_FILENAME, e);
         }
         finally
         {
@@ -143,8 +160,9 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
             {
                 String[] newDefault = value.split(":");
                 if (newDefault.length < 2)
-                    newDefault = new String[] { "default", "default" };
-                defaultDCRack = newDefault;
+                    defaultDCRack = new String[] { "default", "default" };
+                else
+                    defaultDCRack = new String[] { newDefault[0].trim(), newDefault[1].trim() };
             }
             else
             {
@@ -161,13 +179,34 @@ public class PropertyFileSnitch extends AbstractNetworkTopologySnitch
                 String[] token = value.split(":");
                 if (token.length < 2)
                     token = new String[] { "default", "default" };
+                else
+                    token = new String[] { token[0].trim(), token[1].trim() };
                 reloadedMap.put(host, token);
             }
         }
+        if (defaultDCRack == null && !reloadedMap.containsKey(FBUtilities.getBroadcastAddress()))
+            throw new ConfigurationException(String.format("Snitch definitions at %s do not define a location for this node's broadcast address %s, nor does it provides a default",
+                                                           SNITCH_PROPERTIES_FILENAME, FBUtilities.getBroadcastAddress()));
 
-        logger.debug("loaded network topology {}", FBUtilities.toString(reloadedMap));
+        if (logger.isDebugEnabled())
+        {
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<InetAddress, String[]> entry : reloadedMap.entrySet())
+                sb.append(entry.getKey()).append(":").append(Arrays.toString(entry.getValue())).append(", ");
+            logger.debug("Loaded network topology from property file: {}", StringUtils.removeEnd(sb.toString(), ", "));
+        }
+
         endpointMap = reloadedMap;
         if (StorageService.instance != null) // null check tolerates circular dependency; see CASSANDRA-4145
-            StorageService.instance.getTokenMetadata().invalidateCaches();
+            StorageService.instance.getTokenMetadata().invalidateCachedRings();
+
+        if (gossipStarted)
+            StorageService.instance.gossipSnitchInfo();
+    }
+
+    @Override
+    public void gossiperStarting()
+    {
+        gossipStarted = true;
     }
 }

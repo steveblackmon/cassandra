@@ -18,39 +18,68 @@
 package org.apache.cassandra.net;
 
 import java.io.BufferedOutputStream;
-import java.io.DataOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.Socket;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.Checksum;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.gms.Gossiper;
+import net.jpountz.lz4.LZ4BlockOutputStream;
+import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.xxhash.XXHashFactory;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.tracing.TraceState;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.UUIDGen;
+import org.xerial.snappy.SnappyOutputStream;
+
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+
+import com.google.common.util.concurrent.Uninterruptibles;
 
 public class OutboundTcpConnection extends Thread
 {
     private static final Logger logger = LoggerFactory.getLogger(OutboundTcpConnection.class);
 
     private static final MessageOut CLOSE_SENTINEL = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE);
+    private volatile boolean isStopped = false;
 
     private static final int OPEN_RETRY_DELAY = 100; // ms between retries
+    public static final int WAIT_FOR_VERSION_MAX_TIME = 5000;
+    private static final int NO_VERSION = Integer.MIN_VALUE;
 
-    // sending thread reads from "active" (one of queue1, queue2) until it is empty.
-    // then it swaps it with "backlog."
-    private volatile BlockingQueue<Entry> backlog = new LinkedBlockingQueue<Entry>();
-    private volatile BlockingQueue<Entry> active = new LinkedBlockingQueue<Entry>();
+    static final int LZ4_HASH_SEED = 0x9747b28c;
+
+    private final BlockingQueue<QueuedMessage> backlog = new LinkedBlockingQueue<>();
 
     private final OutboundTcpConnectionPool poolReference;
 
-    private DataOutputStream out;
+    private DataOutputStreamPlus out;
     private Socket socket;
     private volatile long completed;
     private final AtomicLong dropped = new AtomicLong();
+    private volatile int currentMsgBufferCount = 0;
+    private int targetVersion;
 
     public OutboundTcpConnection(OutboundTcpConnectionPool pool)
     {
@@ -58,12 +87,20 @@ public class OutboundTcpConnection extends Thread
         this.poolReference = pool;
     }
 
-    public void enqueue(MessageOut<?> message, String id)
+    private static boolean isLocalDC(InetAddress targetHost)
     {
-        expireMessages();
+        String remoteDC = DatabaseDescriptor.getEndpointSnitch().getDatacenter(targetHost);
+        String localDC = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+        return remoteDC.equals(localDC);
+    }
+
+    public void enqueue(MessageOut<?> message, int id)
+    {
+        if (backlog.size() > 1024)
+            expireMessages();
         try
         {
-            backlog.put(new Entry(message, id, System.currentTimeMillis()));
+            backlog.put(new QueuedMessage(message, id));
         }
         catch (InterruptedException e)
         {
@@ -71,60 +108,81 @@ public class OutboundTcpConnection extends Thread
         }
     }
 
-    void closeSocket()
+    void closeSocket(boolean destroyThread)
     {
-        active.clear();
         backlog.clear();
-        enqueue(CLOSE_SENTINEL, null);
+        isStopped = destroyThread; // Exit loop to stop the thread
+        enqueue(CLOSE_SENTINEL, -1);
     }
 
     void softCloseSocket()
     {
-        enqueue(CLOSE_SENTINEL, null);
+        enqueue(CLOSE_SENTINEL, -1);
+    }
+
+    public int getTargetVersion()
+    {
+        return targetVersion;
     }
 
     public void run()
     {
+        // keeping list (batch) size small for now; that way we don't have an unbounded array (that we never resize)
+        final List<QueuedMessage> drainedMessages = new ArrayList<>(128);
+        outer:
         while (true)
         {
-            Entry entry = active.poll();
-            if (entry == null)
+            if (backlog.drainTo(drainedMessages, drainedMessages.size()) == 0)
             {
-                // exhausted the active queue.  switch to backlog, once there's something to process there
                 try
                 {
-                    entry = backlog.take();
+                    drainedMessages.add(backlog.take());
                 }
                 catch (InterruptedException e)
                 {
                     throw new AssertionError(e);
                 }
 
-                BlockingQueue<Entry> tmp = backlog;
-                backlog = active;
-                active = tmp;
             }
+            currentMsgBufferCount = drainedMessages.size();
 
-            MessageOut<?> m = entry.message;
-            String id = entry.id;
-            if (m == CLOSE_SENTINEL)
+            int count = drainedMessages.size();
+            for (QueuedMessage qm : drainedMessages)
             {
-                disconnect();
-                continue;
+                try
+                {
+                    MessageOut<?> m = qm.message;
+                    if (m == CLOSE_SENTINEL)
+                    {
+                        disconnect();
+                        if (isStopped)
+                            break outer;
+                        continue;
+                    }
+                    if (qm.isTimedOut(m.getTimeout()))
+                        dropped.incrementAndGet();
+                    else if (socket != null || connect())
+                        writeConnected(qm, count == 1 && backlog.size() == 0);
+                    else
+                        // clear out the queue, else gossip messages back up.
+                        backlog.clear();
+                }
+                catch (Exception e)
+                {
+                    JVMStabilityInspector.inspectThrowable(e);
+                    // really shouldn't get here, as exception handling in writeConnected() is reasonably robust
+                    // but we want to catch anything bad we don't drop the messages in the current batch
+                    logger.error("error processing a message intended for {}", poolReference.endPoint(), e);
+                }
+                currentMsgBufferCount = --count;
             }
-            if (entry.timestamp < System.currentTimeMillis() - DatabaseDescriptor.getRpcTimeout())
-                dropped.incrementAndGet();
-            else if (socket != null || connect())
-                writeConnected(m, id);
-            else
-                // clear out the queue, else gossip messages back up.
-                active.clear();
+            drainedMessages.clear();
         }
     }
 
     public int getPendingMessages()
     {
-        return active.size() + backlog.size();
+        return backlog.size() + currentMsgBufferCount;
     }
 
     public long getCompletedMesssages()
@@ -137,63 +195,102 @@ public class OutboundTcpConnection extends Thread
         return dropped.get();
     }
 
-    private void writeConnected(MessageOut<?> message, String id)
+    private boolean shouldCompressConnection()
+    {
+        // assumes version >= 1.2
+        return DatabaseDescriptor.internodeCompression() == Config.InternodeCompression.all
+               || (DatabaseDescriptor.internodeCompression() == Config.InternodeCompression.dc && !isLocalDC(poolReference.endPoint()));
+    }
+
+    private void writeConnected(QueuedMessage qm, boolean flush)
     {
         try
         {
-            write(message, id, out);
-            completed++;
-            if (active.peek() == null)
+            byte[] sessionBytes = qm.message.parameters.get(Tracing.TRACE_HEADER);
+            if (sessionBytes != null)
             {
-                out.flush();
+                UUID sessionId = UUIDGen.getUUID(ByteBuffer.wrap(sessionBytes));
+                TraceState state = Tracing.instance.get(sessionId);
+                String message = String.format("Sending message to %s", poolReference.endPoint());
+                // session may have already finished; see CASSANDRA-5668
+                if (state == null)
+                {
+                    byte[] traceTypeBytes = qm.message.parameters.get(Tracing.TRACE_TYPE);
+                    Tracing.TraceType traceType = traceTypeBytes == null ? Tracing.TraceType.QUERY : Tracing.TraceType.deserialize(traceTypeBytes[0]);
+                    TraceState.trace(ByteBuffer.wrap(sessionBytes), message, -1, traceType.getTTL(), null);
+                }
+                else
+                {
+                    state.trace(message);
+                    if (qm.message.verb == MessagingService.Verb.REQUEST_RESPONSE)
+                        Tracing.instance.doneWithNonLocalSession(state);
+                }
             }
+
+            writeInternal(qm.message, qm.id, qm.timestamp);
+
+            completed++;
+            if (flush)
+                out.flush();
         }
         catch (Exception e)
         {
-            // Non IO exceptions is likely a programming error so let's not silence it
-            if (!(e instanceof IOException))
-                logger.error("error writing to " + poolReference.endPoint(), e);
-            else if (logger.isDebugEnabled())
-                logger.debug("error writing to " + poolReference.endPoint(), e);
             disconnect();
+            if (e instanceof IOException)
+            {
+                if (logger.isDebugEnabled())
+                    logger.debug("error writing to {}", poolReference.endPoint(), e);
+
+                // if the message was important, such as a repair acknowledgement, put it back on the queue
+                // to retry after re-connecting.  See CASSANDRA-5393
+                if (qm.shouldRetry())
+                {
+                    try
+                    {
+                        backlog.put(new RetriedQueuedMessage(qm));
+                    }
+                    catch (InterruptedException e1)
+                    {
+                        throw new AssertionError(e1);
+                    }
+                }
+            }
+            else
+            {
+                // Non IO exceptions are likely a programming error so let's not silence them
+                logger.error("error writing to {}", poolReference.endPoint(), e);
+            }
         }
     }
 
-    public void write(MessageOut<?> message, String id, DataOutputStream out) throws IOException
+    private void writeInternal(MessageOut message, int id, long timestamp) throws IOException
     {
-        write(message, id, out, Gossiper.instance.getVersion(poolReference.endPoint()));
+        out.writeInt(MessagingService.PROTOCOL_MAGIC);
+
+        if (targetVersion < MessagingService.VERSION_20)
+            out.writeUTF(String.valueOf(id));
+        else
+            out.writeInt(id);
+
+        // int cast cuts off the high-order half of the timestamp, which we can assume remains
+        // the same between now and when the recipient reconstructs it.
+        out.writeInt((int) timestamp);
+        message.serialize(out, targetVersion);
     }
 
-    public static void write(MessageOut message, String id, DataOutputStream out, int version) throws IOException
+    private static void writeHeader(DataOutput out, int version, boolean compressionEnabled) throws IOException
     {
-        /*
-         Setting up the protocol header. This is 4 bytes long
-         represented as an integer. The first 2 bits indicate
-         the serializer type. The 3rd bit indicates if compression
-         is turned on or off. It is turned off by default. The 4th
-         bit indicates if we are in streaming mode. It is turned off
-         by default. The 5th-8th bits are reserved for future use.
-         The next 8 bits indicate a version number. Remaining 15 bits
-         are not used currently.
-        */
+        // 2 bits: unused.  used to be "serializer type," which was always Binary
+        // 1 bit: compression
+        // 1 bit: streaming mode
+        // 3 bits: unused
+        // 8 bits: version
+        // 15 bits: unused
         int header = 0;
-        // Setting up the serializer bit
-        header |= MessagingService.serializerType.ordinal();
-        // set compression bit.
-        if (false)
+        if (compressionEnabled)
             header |= 4;
-        // Setting up the version bit
         header |= (version << 8);
-
-        out.writeInt(MessagingService.PROTOCOL_MAGIC);
         out.writeInt(header);
-
-        // 0.8 included a total message size int.  1.0 doesn't need it but expects it to be there.
-        if (version <= MessagingService.VERSION_11)
-            out.writeInt(-1);
-
-        out.writeUTF(id);
-        message.serialize(out, version);
     }
 
     private void disconnect()
@@ -206,8 +303,8 @@ public class OutboundTcpConnection extends Thread
             }
             catch (IOException e)
             {
-                if (logger.isDebugEnabled())
-                    logger.debug("exception closing connection to " + poolReference.endPoint(), e);
+                if (logger.isTraceEnabled())
+                    logger.trace("exception closing connection to " + poolReference.endPoint(), e);
             }
             out = null;
             socket = null;
@@ -217,16 +314,96 @@ public class OutboundTcpConnection extends Thread
     private boolean connect()
     {
         if (logger.isDebugEnabled())
-            logger.debug("attempting to connect to " + poolReference.endPoint());
-        long start = System.currentTimeMillis();
-        while (System.currentTimeMillis() < start + DatabaseDescriptor.getRpcTimeout())
+            logger.debug("attempting to connect to {}", poolReference.endPoint());
+
+        long start = System.nanoTime();
+        long timeout = TimeUnit.MILLISECONDS.toNanos(DatabaseDescriptor.getRpcTimeout());
+        while (System.nanoTime() - start < timeout)
         {
+            targetVersion = MessagingService.instance().getVersion(poolReference.endPoint());
             try
             {
                 socket = poolReference.newSocket();
                 socket.setKeepAlive(true);
-                socket.setTcpNoDelay(true);
-                out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 4096));
+                if (isLocalDC(poolReference.endPoint()))
+                {
+                    socket.setTcpNoDelay(true);
+                }
+                else
+                {
+                    socket.setTcpNoDelay(DatabaseDescriptor.getInterDCTcpNoDelay());
+                }
+                if (DatabaseDescriptor.getInternodeSendBufferSize() != null)
+                {
+                    try
+                    {
+                        socket.setSendBufferSize(DatabaseDescriptor.getInternodeSendBufferSize());
+                    }
+                    catch (SocketException se)
+                    {
+                        logger.warn("Failed to set send buffer size on internode socket.", se);
+                    }
+                }
+                out = new DataOutputStreamPlus(new BufferedOutputStream(socket.getOutputStream(), 4096));
+
+                out.writeInt(MessagingService.PROTOCOL_MAGIC);
+                writeHeader(out, targetVersion, shouldCompressConnection());
+                out.flush();
+
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                int maxTargetVersion = handshakeVersion(in);
+                if (maxTargetVersion == NO_VERSION)
+                {
+                    // no version is returned, so disconnect an try again: we will either get
+                    // a different target version (targetVersion < MessagingService.VERSION_12)
+                    // or if the same version the handshake will finally succeed
+                    logger.debug("Target max version is {}; no version information yet, will retry", maxTargetVersion);
+                    disconnect();
+                    continue;
+                }
+                else
+                {
+                    MessagingService.instance().setVersion(poolReference.endPoint(), maxTargetVersion);
+                }
+
+                if (targetVersion > maxTargetVersion)
+                {
+                    logger.debug("Target max version is {}; will reconnect with that version", maxTargetVersion);
+                    disconnect();
+                    return false;
+                }
+
+                if (targetVersion < maxTargetVersion && targetVersion < MessagingService.current_version)
+                {
+                    logger.trace("Detected higher max version {} (using {}); will reconnect when queued messages are done",
+                                 maxTargetVersion, targetVersion);
+                    softCloseSocket();
+                }
+
+                out.writeInt(MessagingService.current_version);
+                CompactEndpointSerializationHelper.serialize(FBUtilities.getBroadcastAddress(), out);
+                if (shouldCompressConnection())
+                {
+                    out.flush();
+                    logger.trace("Upgrading OutputStream to be compressed");
+                    if (targetVersion < MessagingService.VERSION_21)
+                    {
+                        // Snappy is buffered, so no need for extra buffering output stream
+                        out = new DataOutputStreamPlus(new SnappyOutputStream(socket.getOutputStream()));
+                    }
+                    else
+                    {
+                        // TODO: custom LZ4 OS that supports BB write methods
+                        LZ4Compressor compressor = LZ4Factory.fastestInstance().fastCompressor();
+                        Checksum checksum = XXHashFactory.fastestInstance().newStreamingHash32(LZ4_HASH_SEED).asChecksum();
+                        out = new DataOutputStreamPlus(new LZ4BlockOutputStream(socket.getOutputStream(),
+                                                                            1 << 14,  // 16k block size
+                                                                            compressor,
+                                                                            checksum,
+                                                                            true)); // no async flushing
+                    }
+                }
+
                 return true;
             }
             catch (IOException e)
@@ -234,53 +411,104 @@ public class OutboundTcpConnection extends Thread
                 socket = null;
                 if (logger.isTraceEnabled())
                     logger.trace("unable to connect to " + poolReference.endPoint(), e);
-                try
-                {
-                    Thread.sleep(OPEN_RETRY_DELAY);
-                }
-                catch (InterruptedException e1)
-                {
-                    throw new AssertionError(e1);
-                }
+                Uninterruptibles.sleepUninterruptibly(OPEN_RETRY_DELAY, TimeUnit.MILLISECONDS);
             }
         }
         return false;
     }
+    
+    private int handshakeVersion(final DataInputStream inputStream)
+    {
+        final AtomicInteger version = new AtomicInteger(NO_VERSION);
+        final CountDownLatch versionLatch = new CountDownLatch(1);
+        new Thread("HANDSHAKE-" + poolReference.endPoint())
+        {
+            @Override
+            public void run()
+            {
+                try
+                {
+                    logger.info("Handshaking version with {}", poolReference.endPoint());
+                    version.set(inputStream.readInt());
+                }
+                catch (IOException ex) 
+                {
+                    final String msg = "Cannot handshake version with " + poolReference.endPoint();
+                    if (logger.isTraceEnabled())
+                        logger.trace(msg, ex);
+                    else
+                        logger.info(msg);
+                }
+                finally
+                {
+                    //unblock the waiting thread on either success or fail
+                    versionLatch.countDown();
+                }
+            }
+        }.start();
+
+        try
+        {
+            versionLatch.await(WAIT_FOR_VERSION_MAX_TIME, TimeUnit.MILLISECONDS);
+        }
+        catch (InterruptedException ex)
+        {
+            throw new AssertionError(ex);
+        }
+        return version.get();
+    }
 
     private void expireMessages()
     {
-        while (true)
+        Iterator<QueuedMessage> iter = backlog.iterator();
+        while (iter.hasNext())
         {
-            Entry entry = backlog.peek();
-            if (entry == null || entry.timestamp >= System.currentTimeMillis() - DatabaseDescriptor.getRpcTimeout())
-                break;
-
-            Entry entry2 = backlog.poll();
-            if (entry2 != entry)
-            {
-                // sending thread switched queues.  add this entry (from the "new" backlog)
-                // at the end of the active queue, which keeps it in the same position relative to the other entries
-                // without having to contend with other clients for the head-of-backlog lock.
-                if (entry2 != null)
-                    active.add(entry2);
-                break;
-            }
-
+            QueuedMessage qm = iter.next();
+            if (qm.timestamp >= System.currentTimeMillis() - qm.message.getTimeout())
+                return;
+            iter.remove();
             dropped.incrementAndGet();
         }
     }
 
-    private static class Entry
+    /** messages that have not been retried yet */
+    private static class QueuedMessage
     {
         final MessageOut<?> message;
-        final String id;
+        final int id;
         final long timestamp;
+        final boolean droppable;
 
-        Entry(MessageOut<?> message, String id, long timestamp)
+        QueuedMessage(MessageOut<?> message, int id)
         {
             this.message = message;
             this.id = id;
-            this.timestamp = timestamp;
+            this.timestamp = System.currentTimeMillis();
+            this.droppable = MessagingService.DROPPABLE_VERBS.contains(message.verb);
+        }
+
+        /** don't drop a non-droppable message just because it's timestamp is expired */
+        boolean isTimedOut(long maxTime)
+        {
+            return droppable && timestamp < System.currentTimeMillis() - maxTime;
+        }
+
+        boolean shouldRetry()
+        {
+            return !droppable;
+        }
+    }
+
+    private static class RetriedQueuedMessage extends QueuedMessage
+    {
+        RetriedQueuedMessage(QueuedMessage msg)
+        {
+            super(msg.message, msg.id);
+        }
+
+        boolean shouldRetry()
+        {
+            return false;
         }
     }
 }

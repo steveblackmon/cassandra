@@ -17,61 +17,32 @@
  */
 package org.apache.cassandra.db.marshal;
 
-import static org.apache.cassandra.cql.jdbc.JdbcDate.iso8601Patterns;
-
 import java.nio.ByteBuffer;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import java.util.Date;
 
-import org.apache.cassandra.cql.jdbc.JdbcDate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.commons.lang.time.DateUtils;
 
 public class DateType extends AbstractType<Date>
 {
+    private static final Logger logger = LoggerFactory.getLogger(DateType.class);
+
     public static final DateType instance = new DateType();
-
-    static final String DEFAULT_FORMAT = iso8601Patterns[3];
-
-    static final SimpleDateFormat FORMATTER = new SimpleDateFormat(DEFAULT_FORMAT);
 
     DateType() {} // singleton
 
-    public Date compose(ByteBuffer bytes)
-    {
-        return JdbcDate.instance.compose(bytes);
-    }
-
-    public ByteBuffer decompose(Date value)
-    {
-        return JdbcDate.instance.decompose(value);
-    }
-
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        if (!o1.hasRemaining() || !o2.hasRemaining())
+            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
 
         return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        try
-        {
-            return JdbcDate.instance.getString(bytes);
-        }
-        catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-        {
-            throw new MarshalException(e.getMessage());
-        }
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -80,48 +51,46 @@ public class DateType extends AbstractType<Date>
       if (source.isEmpty())
           return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
-      return ByteBufferUtil.bytes(dateStringToTimestamp(source));
+      return ByteBufferUtil.bytes(TimestampSerializer.dateStringToTimestamp(source));
     }
 
-    public static long dateStringToTimestamp(String source) throws MarshalException
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
     {
-      long millis;
+        if (super.isCompatibleWith(previous))
+            return true;
 
-      if (source.toLowerCase().equals("now"))
-      {
-          millis = System.currentTimeMillis();
-      }
-      // Milliseconds since epoch?
-      else if (source.matches("^\\d+$"))
-      {
-          try
-          {
-              millis = Long.parseLong(source);
-          }
-          catch (NumberFormatException e)
-          {
-              throw new MarshalException(String.format("unable to make long (for date) from: '%s'", source), e);
-          }
-      }
-      // Last chance, attempt to parse as date-time string
-      else
-      {
-          try
-          {
-              millis = DateUtils.parseDate(source, iso8601Patterns).getTime();
-          }
-          catch (ParseException e1)
-          {
-              throw new MarshalException(String.format("unable to coerce '%s' to a  formatted date (long)", source), e1);
-          }
-      }
+        if (previous instanceof TimestampType)
+        {
+            logger.warn("Changing from TimestampType to DateType is allowed, but be wary that they sort differently for pre-unix-epoch timestamps "
+                      + "(negative timestamp values) and thus this change will corrupt your data if you have such negative timestamp. There is no "
+                      + "reason to switch from DateType to TimestampType except if you were using DateType in the first place and switched to "
+                      + "TimestampType by mistake.");
+            return true;
+        }
 
-      return millis;
+        return false;
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public boolean isByteOrderComparable()
     {
-        if (bytes.remaining() != 8 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("Expected 8 or 0 byte long for date (%d)", bytes.remaining()));
+        return true;
+    }
+
+    @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return this == otherType || otherType == TimestampType.instance || otherType == LongType.instance;
+    }
+
+    @Override
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.TIMESTAMP;
+    }
+
+    public TypeSerializer<Date> getSerializer()
+    {
+        return TimestampSerializer.instance;
     }
 }

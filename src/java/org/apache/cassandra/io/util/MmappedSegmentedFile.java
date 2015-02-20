@@ -17,13 +17,7 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.File;
-import java.io.IOError;
-import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.lang.reflect.Method;
+import java.io.*;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
@@ -33,14 +27,16 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
 public class MmappedSegmentedFile extends SegmentedFile
 {
     private static final Logger logger = LoggerFactory.getLogger(MmappedSegmentedFile.class);
 
     // in a perfect world, MAX_SEGMENT_SIZE would be final, but we need to test with a smaller size to stay sane.
     public static long MAX_SEGMENT_SIZE = Integer.MAX_VALUE;
-
-    private static Method cleanerMethod = null;
 
     /**
      * Sorted array of segment offsets and MappedByteBuffers for segments. If mmap is completely disabled, or if the
@@ -51,8 +47,19 @@ public class MmappedSegmentedFile extends SegmentedFile
 
     public MmappedSegmentedFile(String path, long length, Segment[] segments)
     {
-        super(path, length);
+        super(new Cleanup(path, segments), path, length);
         this.segments = segments;
+    }
+
+    private MmappedSegmentedFile(MmappedSegmentedFile copy)
+    {
+        super(copy);
+        this.segments = copy.segments;
+    }
+
+    public MmappedSegmentedFile sharedCopy()
+    {
+        return new MmappedSegmentedFile(this);
     }
 
     /**
@@ -60,10 +67,10 @@ public class MmappedSegmentedFile extends SegmentedFile
      */
     private Segment floor(long position)
     {
-        assert 0 <= position && position < length: position + " vs " + length;
+        assert 0 <= position && position < length: String.format("%d >= %d in %s", position, length, path);
         Segment seg = new Segment(position, null);
         int idx = Arrays.binarySearch(segments, seg);
-        assert idx != -1 : "Bad position " + position + " in segments " + Arrays.toString(segments);
+        assert idx != -1 : String.format("Bad position %d for segments %s in %s", position, Arrays.toString(segments), path);
         if (idx < 0)
             // round down to entry at insertion point
             idx = -(idx + 2);
@@ -82,64 +89,49 @@ public class MmappedSegmentedFile extends SegmentedFile
             return new MappedFileDataInput(segment.right, path, segment.left, (int) (position - segment.left));
         }
 
-        // not mmap'd: open a braf covering the segment
-        try
-        {
-            // FIXME: brafs are unbounded, so this segment will cover the rest of the file, rather than just the row
-            RandomAccessReader file = RandomAccessReader.open(new File(path));
-            file.seek(position);
-            return file;
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+        // we can have single cells or partitions larger than 2Gb, which is our maximum addressable range in a single segment;
+        // in this case we open as a normal random access reader
+        // FIXME: brafs are unbounded, so this segment will cover the rest of the file, rather than just the row
+        RandomAccessReader file = RandomAccessReader.open(new File(path));
+        file.seek(position);
+        return file;
     }
 
-    public static void initCleaner()
+    private static final class Cleanup extends SegmentedFile.Cleanup
     {
-        try
+        final Segment[] segments;
+        protected Cleanup(String path, Segment[] segments)
         {
-            cleanerMethod = Class.forName("sun.nio.ch.DirectBuffer").getMethod("cleaner");
+            super(path);
+            this.segments = segments;
         }
-        catch (Exception e)
+
+        public void tidy()
         {
-            // Perhaps a non-sun-derived JVM - contributions welcome
-            logger.info("Cannot initialize un-mmaper.  (Are you using a non-SUN JVM?)  Compacted data files will not be removed promptly.  Consider using a SUN JVM or using standard disk access mode");
-        }
-    }
-
-    public static boolean isCleanerAvailable()
-    {
-        return cleanerMethod != null;
-    }
-
-    public void cleanup()
-    {
-        if (cleanerMethod == null)
-            return;
+            if (!FileUtils.isCleanerAvailable())
+                return;
 
         /*
          * Try forcing the unmapping of segments using undocumented unsafe sun APIs.
          * If this fails (non Sun JVM), we'll have to wait for the GC to finalize the mapping.
          * If this works and a thread tries to access any segment, hell will unleash on earth.
          */
-        try
-        {
-            for (Segment segment : segments)
+            try
             {
-                if (segment.right == null)
-                    continue;
-
-                Object cleaner = cleanerMethod.invoke(segment.right);
-                cleaner.getClass().getMethod("clean").invoke(cleaner);
+                for (Segment segment : segments)
+                {
+                    if (segment.right == null)
+                        continue;
+                    FileUtils.clean(segment.right);
+                }
+                logger.debug("All segments have been unmapped successfully");
             }
-            logger.debug("All segments have been unmapped successfully");
-        }
-        catch (Exception e)
-        {
-            // This is not supposed to happen
-            logger.error("Error while unmapping segments", e);
+            catch (Exception e)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                // This is not supposed to happen
+                logger.error("Error while unmapping segments", e);
+            }
         }
     }
 
@@ -161,7 +153,7 @@ public class MmappedSegmentedFile extends SegmentedFile
         public Builder()
         {
             super();
-            boundaries = new ArrayList<Long>();
+            boundaries = new ArrayList<>();
             boundaries.add(0L);
         }
 
@@ -191,24 +183,43 @@ public class MmappedSegmentedFile extends SegmentedFile
             }
         }
 
-        public SegmentedFile complete(String path)
+        public SegmentedFile complete(String path, long overrideLength, boolean isFinal)
         {
-            long length = new File(path).length();
-            // add a sentinel value == length
-            if (length != boundaries.get(boundaries.size() - 1))
-                boundaries.add(length);
+            assert !isFinal || overrideLength <= 0;
+            long length = overrideLength > 0 ? overrideLength : new File(path).length();
             // create the segments
-            return new MmappedSegmentedFile(path, length, createSegments(path));
+            return new MmappedSegmentedFile(path, length, createSegments(path, length));
         }
 
-        private Segment[] createSegments(String path)
+        private Segment[] createSegments(String path, long length)
         {
-            int segcount = boundaries.size() - 1;
-            Segment[] segments = new Segment[segcount];
-            RandomAccessFile raf = null;
+            RandomAccessFile raf;
             try
             {
                 raf = new RandomAccessFile(path, "r");
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+
+            // if we're early finishing a range that doesn't span multiple segments, but the finished file now does,
+            // we remove these from the end (we loop incase somehow this spans multiple segments, but that would
+            // be a loco dataset
+            while (length < boundaries.get(boundaries.size() - 1))
+                boundaries.remove(boundaries.size() -1);
+
+            // add a sentinel value == length
+            List<Long> boundaries = new ArrayList<>(this.boundaries);
+            if (length != boundaries.get(boundaries.size() - 1))
+                boundaries.add(length);
+
+
+            int segcount = boundaries.size() - 1;
+            Segment[] segments = new Segment[segcount];
+
+            try
+            {
                 for (int i = 0; i < segcount; i++)
                 {
                     long start = boundaries.get(i);
@@ -221,7 +232,7 @@ public class MmappedSegmentedFile extends SegmentedFile
             }
             catch (IOException e)
             {
-                throw new IOError(e);
+                throw new FSReadError(e, path);
             }
             finally
             {
@@ -231,23 +242,24 @@ public class MmappedSegmentedFile extends SegmentedFile
         }
 
         @Override
-        public void serializeBounds(DataOutput dos) throws IOException
+        public void serializeBounds(DataOutput out) throws IOException
         {
-            super.serializeBounds(dos);
-            dos.writeInt(boundaries.size());
+            super.serializeBounds(out);
+            out.writeInt(boundaries.size());
             for (long position: boundaries)
-                dos.writeLong(position);
+                out.writeLong(position);
         }
 
         @Override
-        public void deserializeBounds(DataInput dis) throws IOException
+        public void deserializeBounds(DataInput in) throws IOException
         {
-            super.deserializeBounds(dis);
-            List<Long> temp = new ArrayList<Long>();
+            super.deserializeBounds(in);
 
-            int size = dis.readInt();
+            int size = in.readInt();
+            List<Long> temp = new ArrayList<>(size);
+            
             for (int i = 0; i < size; i++)
-                temp.add(dis.readLong());
+                temp.add(in.readLong());
 
             boundaries = temp;
         }

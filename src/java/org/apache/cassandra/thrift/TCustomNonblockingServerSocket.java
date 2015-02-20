@@ -21,7 +21,6 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 
-import org.apache.cassandra.service.SocketSessionManagementService;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TNonblockingSocket;
 import org.apache.thrift.transport.TTransportException;
@@ -50,12 +49,11 @@ public class TCustomNonblockingServerSocket extends TNonblockingServerSocket
         if (tsocket == null || tsocket.getSocketChannel() == null)
             return tsocket;
         Socket socket = tsocket.getSocketChannel().socket();
-        // clean up the old information.
-        SocketSessionManagementService.instance.remove(socket.getRemoteSocketAddress());
         try
         {
             socket.setKeepAlive(this.keepAlive);
-        } catch (SocketException se)
+        }
+        catch (SocketException se)
         {
             logger.warn("Failed to set keep-alive on Thrift socket.", se);
         }

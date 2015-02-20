@@ -18,16 +18,16 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-public abstract class RowPosition implements RingPosition<RowPosition>
+public interface RowPosition extends RingPosition<RowPosition>
 {
     public static enum Kind
     {
@@ -43,22 +43,20 @@ public abstract class RowPosition implements RingPosition<RowPosition>
         }
     }
 
+    public static final class ForKey
+    {
+        public static RowPosition get(ByteBuffer key, IPartitioner p)
+        {
+            return key == null || key.remaining() == 0 ? p.getMinimumToken().minKeyBound() : p.decorateKey(key);
+        }
+    }
+
     public static final RowPositionSerializer serializer = new RowPositionSerializer();
 
-    public static RowPosition forKey(ByteBuffer key, IPartitioner p)
-    {
-        return key == null || key.remaining() == 0 ? p.getMinimumToken().minKeyBound() : p.decorateKey(key);
-    }
+    public Kind kind();
+    public boolean isMinimum();
 
-    public abstract Token getToken();
-    public abstract Kind kind();
-
-    public boolean isMinimum()
-    {
-        return isMinimum(StorageService.getPartitioner());
-    }
-
-    public static class RowPositionSerializer implements ISerializer<RowPosition>
+    public static class RowPositionSerializer implements IPartitionerDependentSerializer<RowPosition>
     {
         /*
          * We need to be able to serialize both Token.KeyBound and
@@ -71,43 +69,43 @@ public abstract class RowPosition implements RingPosition<RowPosition>
          * token is recreated on the other side). In the other cases, we then
          * serialize the token.
          */
-        public void serialize(RowPosition pos, DataOutput dos) throws IOException
+        public void serialize(RowPosition pos, DataOutputPlus out, int version) throws IOException
         {
             Kind kind = pos.kind();
-            dos.writeByte(kind.ordinal());
+            out.writeByte(kind.ordinal());
             if (kind == Kind.ROW_KEY)
-                ByteBufferUtil.writeWithShortLength(((DecoratedKey)pos).key, dos);
+                ByteBufferUtil.writeWithShortLength(((DecoratedKey)pos).getKey(), out);
             else
-                Token.serializer.serialize(pos.getToken(), dos);
+                Token.serializer.serialize(pos.getToken(), out, version);
         }
 
-        public RowPosition deserialize(DataInput dis) throws IOException
+        public RowPosition deserialize(DataInput in, IPartitioner p, int version) throws IOException
         {
-            Kind kind = Kind.fromOrdinal(dis.readByte());
+            Kind kind = Kind.fromOrdinal(in.readByte());
             if (kind == Kind.ROW_KEY)
             {
-                ByteBuffer k = ByteBufferUtil.readWithShortLength(dis);
+                ByteBuffer k = ByteBufferUtil.readWithShortLength(in);
                 return StorageService.getPartitioner().decorateKey(k);
             }
             else
             {
-                Token t = Token.serializer.deserialize(dis);
+                Token t = Token.serializer.deserialize(in, p, version);
                 return kind == Kind.MIN_BOUND ? t.minKeyBound() : t.maxKeyBound();
             }
         }
 
-        public long serializedSize(RowPosition pos, TypeSizes typeSizes)
+        public long serializedSize(RowPosition pos, int version)
         {
             Kind kind = pos.kind();
             int size = 1; // 1 byte for enum
             if (kind == Kind.ROW_KEY)
             {
-                int keySize = ((DecoratedKey)pos).key.remaining();
-                size += (typeSizes.sizeof((short) keySize) + keySize);
+                int keySize = ((DecoratedKey)pos).getKey().remaining();
+                size += TypeSizes.NATIVE.sizeof((short) keySize) + keySize;
             }
             else
             {
-                Token.serializer.serializedSize(pos.getToken(), typeSizes);
+                size += Token.serializer.serializedSize(pos.getToken(), version);
             }
             return size;
         }

@@ -19,54 +19,30 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.cql.jdbc.JdbcInt32;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.Int32Serializer;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class Int32Type extends AbstractType<Integer>
 {
     public static final Int32Type instance = new Int32Type();
 
-    Int32Type() {} // singleton
-
-    public Integer compose(ByteBuffer bytes)
+    Int32Type()
     {
-        return JdbcInt32.instance.compose(bytes);
-    }
-
-    public ByteBuffer decompose(Integer value)
-    {
-        return JdbcInt32.instance.decompose(value);
-    }
+    } // singleton
 
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        if (!o1.hasRemaining() || !o2.hasRemaining())
+            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
 
         int diff = o1.get(o1.position()) - o2.get(o2.position());
         if (diff != 0)
             return diff;
 
-
         return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        try
-        {
-            return JdbcInt32.instance.getString(bytes);
-        }
-        catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-        {
-            throw new MarshalException(e.getMessage());
-        }
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -89,10 +65,14 @@ public class Int32Type extends AbstractType<Integer>
         return decompose(int32Type);
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public CQL3Type asCQL3Type()
     {
-        if (bytes.remaining() != 4 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("Expected 4 or 0 byte int (%d)", bytes.remaining()));
+        return CQL3Type.Native.INT;
+    }
+
+    public TypeSerializer<Integer> getSerializer()
+    {
+        return Int32Serializer.instance;
     }
 
 }

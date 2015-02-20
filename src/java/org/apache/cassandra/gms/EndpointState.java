@@ -25,6 +25,8 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 /**
@@ -49,7 +51,7 @@ public class EndpointState
     EndpointState(HeartBeatState initialHbState)
     {
         hbState = initialHbState;
-        updateTimestamp = System.currentTimeMillis();
+        updateTimestamp = System.nanoTime();
         isAlive = true;
     }
 
@@ -84,6 +86,9 @@ public class EndpointState
     }
 
     /* getters and setters */
+    /**
+     * @return System.nanoTime() when state was updated last time.
+     */
     public long getUpdateTimestamp()
     {
         return updateTimestamp;
@@ -91,7 +96,7 @@ public class EndpointState
 
     void updateTimestamp()
     {
-        updateTimestamp = System.currentTimeMillis();
+        updateTimestamp = System.nanoTime();
     }
 
     public boolean isAlive()
@@ -108,39 +113,42 @@ public class EndpointState
     {
         isAlive = false;
     }
+
+    public String toString()
+    {
+        return "EndpointState: HeartBeatState = " + hbState + ", AppStateMap = " + applicationState;
+    }
 }
 
 class EndpointStateSerializer implements IVersionedSerializer<EndpointState>
 {
-    private static final Logger logger = LoggerFactory.getLogger(EndpointStateSerializer.class);
-
-    public void serialize(EndpointState epState, DataOutput dos, int version) throws IOException
+    public void serialize(EndpointState epState, DataOutputPlus out, int version) throws IOException
     {
         /* serialize the HeartBeatState */
         HeartBeatState hbState = epState.getHeartBeatState();
-        HeartBeatState.serializer.serialize(hbState, dos, version);
+        HeartBeatState.serializer.serialize(hbState, out, version);
 
         /* serialize the map of ApplicationState objects */
         int size = epState.applicationState.size();
-        dos.writeInt(size);
+        out.writeInt(size);
         for (Map.Entry<ApplicationState, VersionedValue> entry : epState.applicationState.entrySet())
         {
             VersionedValue value = entry.getValue();
-            dos.writeInt(entry.getKey().ordinal());
-            VersionedValue.serializer.serialize(value, dos, version);
+            out.writeInt(entry.getKey().ordinal());
+            VersionedValue.serializer.serialize(value, out, version);
         }
     }
 
-    public EndpointState deserialize(DataInput dis, int version) throws IOException
+    public EndpointState deserialize(DataInput in, int version) throws IOException
     {
-        HeartBeatState hbState = HeartBeatState.serializer.deserialize(dis, version);
+        HeartBeatState hbState = HeartBeatState.serializer.deserialize(in, version);
         EndpointState epState = new EndpointState(hbState);
 
-        int appStateSize = dis.readInt();
-        for ( int i = 0; i < appStateSize; ++i )
+        int appStateSize = in.readInt();
+        for (int i = 0; i < appStateSize; ++i)
         {
-            int key = dis.readInt();
-            VersionedValue value = VersionedValue.serializer.deserialize(dis, version);
+            int key = in.readInt();
+            VersionedValue value = VersionedValue.serializer.deserialize(in, version);
             epState.addApplicationState(Gossiper.STATES[key], value);
         }
         return epState;

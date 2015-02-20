@@ -21,12 +21,12 @@ import java.net.UnknownHostException;
 
 public interface GossiperMBean
 {
-    public int getVersion(String address) throws UnknownHostException;
-
     public long getEndpointDowntime(String address) throws UnknownHostException;
 
     public int getCurrentGenerationNumber(String address) throws UnknownHostException;
 
     public void unsafeAssassinateEndpoint(String address) throws UnknownHostException;
+
+    public void assassinateEndpoint(String address) throws UnknownHostException;
 
 }

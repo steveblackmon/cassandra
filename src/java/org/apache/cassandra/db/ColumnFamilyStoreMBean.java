@@ -21,7 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
-import org.apache.cassandra.config.ConfigurationException;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
 
 /**
  * The MBean interface for ColumnFamilyStore
@@ -34,137 +35,9 @@ public interface ColumnFamilyStoreMBean
     public String getColumnFamilyName();
 
     /**
-     * Returns the total amount of data stored in the memtable, including
-     * column related overhead.
-     *
-     * @return The size in bytes.
-     */
-    public long getMemtableDataSize();
-
-    /**
-     * Returns the total number of columns present in the memtable.
-     *
-     * @return The number of columns.
-     */
-    public long getMemtableColumnsCount();
-
-    /**
-     * Returns the number of times that a flush has resulted in the
-     * memtable being switched out.
-     *
-     * @return the number of memtable switches
-     */
-    public int getMemtableSwitchCount();
-
-    /**
-     * @return a histogram of the number of sstable data files accessed per read: reading this property resets it
-     */
-    public long[] getRecentSSTablesPerReadHistogram();
-
-    /**
-     * @return a histogram of the number of sstable data files accessed per read
-     */
-    public long[] getSSTablesPerReadHistogram();
-
-    /**
-     * @return the number of read operations on this column family
-     */
-    public long getReadCount();
-
-    /**
-     * @return total read latency (divide by getReadCount() for average)
-     */
-    public long getTotalReadLatencyMicros();
-
-    /**
-     * @return an array representing the latency histogram
-     */
-    public long[] getLifetimeReadLatencyHistogramMicros();
-
-    /**
-     * @return an array representing the latency histogram
-     */
-    public long[] getRecentReadLatencyHistogramMicros();
-
-    /**
-     * @return average latency per read operation since the last call
-     */
-    public double getRecentReadLatencyMicros();
-
-    /**
-     * @return the number of write operations on this column family
-     */
-    public long getWriteCount();
-
-    /**
-     * @return total write latency (divide by getReadCount() for average)
-     */
-    public long getTotalWriteLatencyMicros();
-
-    /**
-     * @return an array representing the latency histogram
-     */
-    public long[] getLifetimeWriteLatencyHistogramMicros();
-
-    /**
-     * @return an array representing the latency histogram
-     */
-    public long[] getRecentWriteLatencyHistogramMicros();
-
-    /**
-     * @return average latency per write operation since the last call
-     */
-    public double getRecentWriteLatencyMicros();
-
-    /**
-     * @return the estimated number of tasks pending for this column family
-     */
-    public int getPendingTasks();
-
-    /**
-     * @return the number of SSTables on disk for this CF
-     */
-    public int getLiveSSTableCount();
-
-    /**
-     * @return disk space used by SSTables belonging to this CF
-     */
-    public long getLiveDiskSpaceUsed();
-
-    /**
-     * @return total disk space used by SSTables belonging to this CF, including obsolete ones waiting to be GC'd
-     */
-    public long getTotalDiskSpaceUsed();
-
-    /**
      * force a major compaction of this column family
      */
     public void forceMajorCompaction() throws ExecutionException, InterruptedException;
-
-    /**
-     * @return the size of the smallest compacted row
-     */
-    public long getMinRowSize();
-
-    /**
-     * @return the size of the largest compacted row
-     */
-    public long getMaxRowSize();
-
-    /**
-     * @return the size of the smallest compacted row
-     */
-    public long getMeanRowSize();
-
-    public long getBloomFilterFalsePositives();
-
-    public long getRecentBloomFilterFalsePositives();
-
-    public double getBloomFilterFalseRatio();
-
-    public double getRecentBloomFilterFalseRatio();
-
-    public long getBloomFilterDiskSpaceUsed();
 
     /**
      * Gets the minimum number of sstables in queue before compaction kicks off
@@ -182,6 +55,11 @@ public interface ColumnFamilyStoreMBean
     public int getMaximumCompactionThreshold();
 
     /**
+     * Sets the maximum and maximum number of SSTables in queue before compaction kicks off
+     */
+    public void setCompactionThresholds(int minThreshold, int maxThreshold);
+
+    /**
      * Sets the maximum number of sstables in queue before compaction kicks off
      */
     public void setMaximumCompactionThreshold(int threshold);
@@ -190,7 +68,7 @@ public interface ColumnFamilyStoreMBean
      * Sets the compaction strategy by class name
      * @param className the name of the compaction strategy class
      */
-    public void setCompactionStrategyClass(String className) throws ConfigurationException;
+    public void setCompactionStrategyClass(String className);
 
     /**
      * Gets the compaction strategy class name
@@ -206,24 +84,30 @@ public interface ColumnFamilyStoreMBean
      * Set the compression parameters
      * @param opts map of string names to values
      */
-    public void setCompressionParameters(Map<String,String> opts) throws ConfigurationException;
+    public void setCompressionParameters(Map<String,String> opts);
 
     /**
-     * Disable automatic compaction.
+     * Set new crc check chance
      */
-    public void disableAutoCompaction();
+    public void setCrcCheckChance(double crcCheckChance);
+
+    public boolean isAutoCompactionDisabled();
 
     public long estimateKeys();
 
-    public long[] getEstimatedRowSizeHistogram();
-    public long[] getEstimatedColumnCountHistogram();
-    public double getCompressionRatio();
 
     /**
      * Returns a list of the names of the built column indexes for current store
      * @return list of the index names
      */
     public List<String> getBuiltIndexes();
+
+    /**
+     * Returns a list of filenames that contain the given key on this node
+     * @param key
+     * @return list of filenames containing the key
+     */
+    public List<String> getSSTablesForKey(String key);
 
     /**
      * Scan through Keyspace/ColumnFamily's data directory
@@ -235,4 +119,32 @@ public interface ColumnFamilyStoreMBean
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
      */
     public int getUnleveledSSTables();
+
+    /**
+     * @return sstable count for each level. null unless leveled compaction is used.
+     *         array index corresponds to level(int[0] is for level 0, ...).
+     */
+    public int[] getSSTableCountPerLevel();
+
+    /**
+     * Get the ratio of droppable tombstones to real columns (and non-droppable tombstones)
+     * @return ratio
+     */
+    public double getDroppableTombstoneRatio();
+
+    /**
+     * @return the size of SSTables in "snapshots" subdirectory which aren't live anymore
+     */
+    public long trueSnapshotsSize();
+
+    /**
+     * begin sampling for a specific sampler with a given capacity.  The cardinality may
+     * be larger than the capacity, but depending on the use case it may affect its accuracy
+     */
+    public void beginLocalSampling(String sampler, int capacity);
+
+    /**
+     * @return top <i>count</i> items for the sampler since beginLocalSampling was called
+     */
+    public CompositeData finishLocalSampling(String sampler, int count) throws OpenDataException;
 }

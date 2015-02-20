@@ -19,6 +19,7 @@ package org.apache.cassandra.net;
 
 
 
+import java.net.UnknownHostException;
 import java.util.Map;
 
 /**
@@ -58,11 +59,6 @@ public interface MessagingServiceMBean
     public Map<String, Integer> getDroppedMessages();
 
     /**
-     * dropped message counts since last called
-     */
-    public Map<String, Integer> getRecentlyDroppedMessages();
-
-    /**
      * Total number of timeouts happened on this node
      */
     public long getTotalTimeouts();
@@ -72,13 +68,5 @@ public interface MessagingServiceMBean
      */
     public Map<String, Long> getTimeoutsPerHost();
 
-    /**
-     * Number of timeouts since last check.
-     */
-    public long getRecentTotalTimouts();
-
-    /**
-     * Number of timeouts since last check per host.
-     */
-    public Map<String, Long> getRecentTimeoutsPerHost();
+    public int getVersion(String address) throws UnknownHostException;
 }

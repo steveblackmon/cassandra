@@ -19,7 +19,10 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.cql.jdbc.JdbcBytes;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.BytesSerializer;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Hex;
 
@@ -29,34 +32,9 @@ public class BytesType extends AbstractType<ByteBuffer>
 
     BytesType() {} // singleton
 
-    public ByteBuffer compose(ByteBuffer bytes)
-    {
-        return JdbcBytes.instance.compose(bytes);
-    }
-
-    public ByteBuffer decompose(ByteBuffer value)
-    {
-        return JdbcBytes.instance.decompose(value);
-    }
-
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        return BytesType.bytesCompare(o1, o2);
-    }
-
-    public static int bytesCompare(ByteBuffer o1, ByteBuffer o2)
-    {
-        if(null == o1){
-            if(null == o2) return 0;
-            else return -1;
-        }
-
         return ByteBufferUtil.compareUnsigned(o1, o2);
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        return JdbcBytes.instance.getString(bytes);
     }
 
     public ByteBuffer fromString(String source)
@@ -71,16 +49,33 @@ public class BytesType extends AbstractType<ByteBuffer>
         }
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
-    {
-        // all bytes are legal.
-    }
-
     @Override
     public boolean isCompatibleWith(AbstractType<?> previous)
     {
         // Both asciiType and utf8Type really use bytes comparison and
         // bytesType validate everything, so it is compatible with the former.
         return this == previous || previous == AsciiType.instance || previous == UTF8Type.instance;
+    }
+
+    @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        // BytesType can read anything
+        return true;
+    }
+
+    public boolean isByteOrderComparable()
+    {
+        return true;
+    }
+
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.BLOB;
+    }
+
+    public TypeSerializer<ByteBuffer> getSerializer()
+    {
+        return BytesSerializer.instance;
     }
 }

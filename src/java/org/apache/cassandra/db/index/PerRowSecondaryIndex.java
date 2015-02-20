@@ -17,15 +17,13 @@
  */
 package org.apache.cassandra.db.index;
 
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.util.List;
-import java.util.SortedSet;
 
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.db.Cell;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.IColumn;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -34,32 +32,21 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 public abstract class PerRowSecondaryIndex extends SecondaryIndex
 {
     /**
-     * Removes obsolete index entries and creates new ones for the given row key
-     * and mutated columns.
+     * Index the given row.
      *
      * @param rowKey the row key
-     * @param cf the current rows data
-     * @param mutatedIndexedColumns the set of columns that were changed or added
-     * @param oldIndexedColumns the columns which were deleted
-     * @throws IOException
+     * @param cf the cf data to be indexed
      */
-    public abstract void applyIndexUpdates(ByteBuffer rowKey,
-                                           ColumnFamily cf,
-                                           SortedSet<ByteBuffer> mutatedIndexedColumns,
-                                           ColumnFamily oldIndexedColumns) throws IOException;
-
+    public abstract void index(ByteBuffer rowKey, ColumnFamily cf);
 
     /**
      * cleans up deleted columns from cassandra cleanup compaction
      *
      * @param key
-     * @param indexedColumnsInRow
      */
-    public abstract void deleteFromIndex(DecoratedKey key, List<IColumn> indexedColumnsInRow);
+    public abstract void delete(DecoratedKey key, OpOrder.Group opGroup);
 
-
-    @Override
-    public String getNameForSystemTable(ByteBuffer columnName)
+    public String getNameForSystemKeyspace(ByteBuffer columnName)
     {
         try
         {
@@ -69,5 +56,10 @@ public abstract class PerRowSecondaryIndex extends SecondaryIndex
         {
             throw new RuntimeException(e);
         }
+    }
+
+    public boolean validate(Cell cell)
+    {
+        return true;
     }
 }

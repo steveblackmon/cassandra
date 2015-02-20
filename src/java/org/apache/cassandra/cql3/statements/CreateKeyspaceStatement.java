@@ -17,28 +17,21 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.util.HashMap;
-import java.util.Map;
-
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.auth.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
-import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.SchemaDisagreementException;
+import org.apache.cassandra.service.*;
 import org.apache.cassandra.thrift.ThriftValidation;
+import org.apache.cassandra.transport.Event;
 
 /** A <code>CREATE KEYSPACE</code> statement parsed from a CQL query. */
 public class CreateKeyspaceStatement extends SchemaAlteringStatement
 {
     private final String name;
-    private final Map<String, String> attrs;
-    private String strategyClass;
-    private final Map<String, String> strategyOptions = new HashMap<String, String>();
+    private final KSPropDefs attrs;
+    private final boolean ifNotExists;
 
     /**
      * Creates a new <code>CreateKeyspaceStatement</code> instance for a given
@@ -47,11 +40,23 @@ public class CreateKeyspaceStatement extends SchemaAlteringStatement
      * @param name the name of the keyspace to create
      * @param attrs map of the raw keyword arguments that followed the <code>WITH</code> keyword.
      */
-    public CreateKeyspaceStatement(String name, Map<String, String> attrs)
+    public CreateKeyspaceStatement(String name, KSPropDefs attrs, boolean ifNotExists)
     {
         super();
         this.name = name;
         this.attrs = attrs;
+        this.ifNotExists = ifNotExists;
+    }
+
+    @Override
+    public String keyspace()
+    {
+        return name;
+    }
+
+    public void checkAccess(ClientState state) throws UnauthorizedException
+    {
+        state.hasAllKeyspacesAccess(Permission.CREATE);
     }
 
     /**
@@ -61,10 +66,8 @@ public class CreateKeyspaceStatement extends SchemaAlteringStatement
      *
      * @throws InvalidRequestException if arguments are missing or unacceptable
      */
-    @Override
-    public void validate(ClientState state) throws InvalidRequestException, SchemaDisagreementException
+    public void validate(ClientState state) throws RequestValidationException
     {
-        super.validate(state);
         ThriftValidation.validateKeyspaceNotSystem(name);
 
         // keyspace name
@@ -73,35 +76,54 @@ public class CreateKeyspaceStatement extends SchemaAlteringStatement
         if (name.length() > Schema.NAME_LENGTH)
             throw new InvalidRequestException(String.format("Keyspace names shouldn't be more than %s characters long (got \"%s\")", Schema.NAME_LENGTH, name));
 
-        // required
-        if (!attrs.containsKey("strategy_class"))
-            throw new InvalidRequestException("missing required argument \"strategy_class\"");
-        strategyClass = attrs.get("strategy_class");
+        attrs.validate();
 
-        // optional
-        for (String key : attrs.keySet())
-            if ((key.contains(":")) && (key.startsWith("strategy_options")))
-                strategyOptions.put(key.split(":")[1], attrs.get(key));
+        if (attrs.getReplicationStrategyClass() == null)
+            throw new ConfigurationException("Missing mandatory replication strategy class");
 
-        // trial run to let ARS validate class + per-class options
+        // The strategy is validated through KSMetaData.validate() in announceNewKeyspace below.
+        // However, for backward compatibility with thrift, this doesn't validate unexpected options yet,
+        // so doing proper validation here.
+        AbstractReplicationStrategy.validateReplicationStrategy(name,
+                                                                AbstractReplicationStrategy.getClass(attrs.getReplicationStrategyClass()),
+                                                                StorageService.instance.getTokenMetadata(),
+                                                                DatabaseDescriptor.getEndpointSnitch(),
+                                                                attrs.getReplicationOptions());
+    }
+
+    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
+    {
         try
         {
-            AbstractReplicationStrategy.createReplicationStrategy(name,
-                                                                  AbstractReplicationStrategy.getClass(strategyClass),
-                                                                  StorageService.instance.getTokenMetadata(),
-                                                                  DatabaseDescriptor.getEndpointSnitch(),
-                                                                  strategyOptions);
+            MigrationManager.announceNewKeyspace(attrs.asKSMetadata(name), isLocalOnly);
+            return true;
         }
-        catch (ConfigurationException e)
+        catch (AlreadyExistsException e)
         {
-            throw new InvalidRequestException(e.getMessage());
+            if (ifNotExists)
+                return false;
+            throw e;
         }
     }
 
-    public void announceMigration() throws InvalidRequestException, ConfigurationException
+    public Event.SchemaChange changeEvent()
     {
-        KSMetaData ksm = KSMetaData.newKeyspace(name, strategyClass, strategyOptions);
-        ThriftValidation.validateKeyspaceNotYetExisting(name);
-        MigrationManager.announceNewKeyspace(ksm);
+        return new Event.SchemaChange(Event.SchemaChange.Change.CREATED, keyspace());
+    }
+
+    protected void grantPermissionsToCreator(QueryState state)
+    {
+        try
+        {
+            DataResource resource = DataResource.keyspace(keyspace());
+            DatabaseDescriptor.getAuthorizer().grant(AuthenticatedUser.SYSTEM_USER,
+                                                     resource.applicablePermissions(),
+                                                     resource,
+                                                     RoleResource.role(state.getClientState().getUser().getName()));
+        }
+        catch (RequestExecutionException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 }

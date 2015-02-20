@@ -17,26 +17,13 @@
  */
 package org.apache.cassandra.config;
 
-import java.io.IOException;
 import java.util.*;
 
 import com.google.common.base.Objects;
-import org.apache.commons.lang.ObjectUtils;
-import org.apache.commons.lang.StringUtils;
 
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.*;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.CfDef;
-import org.apache.cassandra.thrift.KsDef;
-import org.apache.cassandra.thrift.ColumnDef;
-
-import static org.apache.cassandra.utils.FBUtilities.*;
 
 public final class KSMetaData
 {
@@ -46,47 +33,79 @@ public final class KSMetaData
     private final Map<String, CFMetaData> cfMetaData;
     public final boolean durableWrites;
 
-    KSMetaData(String name, Class<? extends AbstractReplicationStrategy> strategyClass, Map<String, String> strategyOptions, boolean durableWrites, Iterable<CFMetaData> cfDefs)
+    public final UTMetaData userTypes;
+
+    public KSMetaData(String name,
+                      Class<? extends AbstractReplicationStrategy> strategyClass,
+                      Map<String, String> strategyOptions,
+                      boolean durableWrites)
+    {
+        this(name, strategyClass, strategyOptions, durableWrites, Collections.<CFMetaData>emptyList(), new UTMetaData());
+    }
+
+    public KSMetaData(String name,
+                      Class<? extends AbstractReplicationStrategy> strategyClass,
+                      Map<String, String> strategyOptions,
+                      boolean durableWrites,
+                      Iterable<CFMetaData> cfDefs)
+    {
+        this(name, strategyClass, strategyOptions, durableWrites, cfDefs, new UTMetaData());
+    }
+
+    private KSMetaData(String name,
+                       Class<? extends AbstractReplicationStrategy> strategyClass,
+                       Map<String, String> strategyOptions,
+                       boolean durableWrites,
+                       Iterable<CFMetaData> cfDefs,
+                       UTMetaData userTypes)
     {
         this.name = name;
         this.strategyClass = strategyClass == null ? NetworkTopologyStrategy.class : strategyClass;
         this.strategyOptions = strategyOptions;
-        Map<String, CFMetaData> cfmap = new HashMap<String, CFMetaData>();
+        Map<String, CFMetaData> cfmap = new HashMap<>();
         for (CFMetaData cfm : cfDefs)
             cfmap.put(cfm.cfName, cfm);
         this.cfMetaData = Collections.unmodifiableMap(cfmap);
         this.durableWrites = durableWrites;
+        this.userTypes = userTypes;
     }
 
     // For new user created keyspaces (through CQL)
-    public static KSMetaData newKeyspace(String name, String strategyName, Map<String, String> options) throws ConfigurationException
+    public static KSMetaData newKeyspace(String name, String strategyName, Map<String, String> options, boolean durableWrites) throws ConfigurationException
     {
         Class<? extends AbstractReplicationStrategy> cls = AbstractReplicationStrategy.getClass(strategyName);
         if (cls.equals(LocalStrategy.class))
             throw new ConfigurationException("Unable to use given strategy class: LocalStrategy is reserved for internal use.");
 
-        return new KSMetaData(name, cls, options, true, Collections.<CFMetaData>emptyList());
+        return newKeyspace(name, cls, options, durableWrites, Collections.<CFMetaData>emptyList());
     }
 
-    public static KSMetaData cloneWith(KSMetaData ksm, Iterable<CFMetaData> cfDefs)
+    public static KSMetaData newKeyspace(String name, Class<? extends AbstractReplicationStrategy> strategyClass, Map<String, String> options, boolean durablesWrites, Iterable<CFMetaData> cfDefs)
     {
-        return new KSMetaData(ksm.name, ksm.strategyClass, ksm.strategyOptions, ksm.durableWrites, cfDefs);
+        return new KSMetaData(name, strategyClass, options, durablesWrites, cfDefs, new UTMetaData());
     }
 
-    public static KSMetaData systemKeyspace()
+    public KSMetaData cloneWithTableRemoved(CFMetaData table)
     {
-        List<CFMetaData> cfDefs = Arrays.asList(CFMetaData.StatusCf,
-                                                CFMetaData.HintsCf,
-                                                CFMetaData.MigrationsCf,
-                                                CFMetaData.SchemaCf,
-                                                CFMetaData.IndexCf,
-                                                CFMetaData.NodeIdCf,
-                                                CFMetaData.VersionCf,
-                                                CFMetaData.SchemaKeyspacesCf,
-                                                CFMetaData.SchemaColumnFamiliesCf,
-                                                CFMetaData.SchemaColumnsCf,
-                                                CFMetaData.HostIdCf);
-        return new KSMetaData(Table.SYSTEM_TABLE, LocalStrategy.class, Collections.<String, String>emptyMap(), true, cfDefs);
+        // clone ksm but do not include the new table
+        List<CFMetaData> newTables = new ArrayList<>(cfMetaData().values());
+        newTables.remove(table);
+        assert newTables.size() == cfMetaData().size() - 1;
+        return cloneWith(newTables, userTypes);
+    }
+
+    public KSMetaData cloneWithTableAdded(CFMetaData table)
+    {
+        // clone ksm but include the new table
+        List<CFMetaData> newTables = new ArrayList<>(cfMetaData().values());
+        newTables.add(table);
+        assert newTables.size() == cfMetaData().size() + 1;
+        return cloneWith(newTables, userTypes);
+    }
+
+    public KSMetaData cloneWith(Iterable<CFMetaData> tables, UTMetaData types)
+    {
+        return new KSMetaData(name, strategyClass, strategyOptions, durableWrites, tables, types);
     }
 
     public static KSMetaData testMetadata(String name, Class<? extends AbstractReplicationStrategy> strategyClass, Map<String, String> strategyOptions, CFMetaData... cfDefs)
@@ -99,21 +118,29 @@ public final class KSMetaData
         return new KSMetaData(name, strategyClass, strategyOptions, false, Arrays.asList(cfDefs));
     }
 
+    @Override
     public int hashCode()
     {
-        return name.hashCode();
+        return Objects.hashCode(name, strategyClass, strategyOptions, cfMetaData, durableWrites, userTypes);
     }
 
-    public boolean equals(Object obj)
+    @Override
+    public boolean equals(Object o)
     {
-        if (!(obj instanceof KSMetaData))
+        if (this == o)
+            return true;
+
+        if (!(o instanceof KSMetaData))
             return false;
-        KSMetaData other = (KSMetaData)obj;
-        return other.name.equals(name)
-                && ObjectUtils.equals(other.strategyClass, strategyClass)
-                && ObjectUtils.equals(other.strategyOptions, strategyOptions)
-                && other.cfMetaData.equals(cfMetaData)
-                && other.durableWrites == durableWrites;
+
+        KSMetaData other = (KSMetaData) o;
+
+        return Objects.equal(name, other.name)
+            && Objects.equal(strategyClass, other.strategyClass)
+            && Objects.equal(strategyOptions, other.strategyOptions)
+            && Objects.equal(cfMetaData, other.cfMetaData)
+            && Objects.equal(durableWrites, other.durableWrites)
+            && Objects.equal(userTypes, other.userTypes);
     }
 
     public Map<String, CFMetaData> cfMetaData()
@@ -124,181 +151,34 @@ public final class KSMetaData
     @Override
     public String toString()
     {
-        StringBuilder sb = new StringBuilder();
-        sb.append(name)
-          .append(", rep strategy:")
-          .append(strategyClass.getSimpleName())
-          .append("{")
-          .append(StringUtils.join(cfMetaData.values(), ", "))
-          .append("}")
-          .append(", durable_writes: ").append(durableWrites);
-        return sb.toString();
-    }
-
-    public static String convertOldStrategyName(String name)
-    {
-        return name.replace("RackUnawareStrategy", "SimpleStrategy")
-                   .replace("RackAwareStrategy", "OldNetworkTopologyStrategy");
+        return Objects.toStringHelper(this)
+                      .add("name", name)
+                      .add("strategyClass", strategyClass.getSimpleName())
+                      .add("strategyOptions", strategyOptions)
+                      .add("cfMetaData", cfMetaData)
+                      .add("durableWrites", durableWrites)
+                      .add("userTypes", userTypes)
+                      .toString();
     }
 
     public static Map<String,String> optsWithRF(final Integer rf)
     {
-        Map<String, String> ret = new HashMap<String,String>();
-        ret.put("replication_factor", rf.toString());
-        return ret;
-    }
-
-    public static KSMetaData fromThrift(KsDef ksd, CFMetaData... cfDefs) throws ConfigurationException
-    {
-        Class<? extends AbstractReplicationStrategy> cls = AbstractReplicationStrategy.getClass(ksd.strategy_class);
-        if (cls.equals(LocalStrategy.class))
-            throw new ConfigurationException("Unable to use given strategy class: LocalStrategy is reserved for internal use.");
-
-        return new KSMetaData(ksd.name,
-                              cls,
-                              ksd.strategy_options == null ? Collections.<String, String>emptyMap() : ksd.strategy_options,
-                              ksd.durable_writes,
-                              Arrays.asList(cfDefs));
-    }
-
-    public KsDef toThrift()
-    {
-        List<CfDef> cfDefs = new ArrayList<CfDef>(cfMetaData.size());
-        for (CFMetaData cfm : cfMetaData().values())
-            cfDefs.add(cfm.toThrift());
-        KsDef ksdef = new KsDef(name, strategyClass.getName(), cfDefs);
-        ksdef.setStrategy_options(strategyOptions);
-        ksdef.setDurable_writes(durableWrites);
-
-        return ksdef;
-    }
-
-    public RowMutation toSchemaUpdate(KSMetaData newState, long modificationTimestamp)
-    {
-        return newState.toSchema(modificationTimestamp);
+        return Collections.singletonMap("replication_factor", rf.toString());
     }
 
     public KSMetaData validate() throws ConfigurationException
     {
         if (!CFMetaData.isNameValid(name))
-            throw new ConfigurationException(String.format("Invalid keyspace name: shouldn't be empty nor more than %s characters long (got \"%s\")", Schema.NAME_LENGTH, name));
+            throw new ConfigurationException(String.format("Keyspace name must not be empty, more than %s characters long, or contain non-alphanumeric-underscore characters (got \"%s\")", Schema.NAME_LENGTH, name));
 
         // Attempt to instantiate the ARS, which will throw a ConfigException if the strategy_options aren't fully formed
         TokenMetadata tmd = StorageService.instance.getTokenMetadata();
         IEndpointSnitch eps = DatabaseDescriptor.getEndpointSnitch();
-        AbstractReplicationStrategy.createReplicationStrategy(name, strategyClass, tmd, eps, strategyOptions);
+        AbstractReplicationStrategy.validateReplicationStrategy(name, strategyClass, tmd, eps, strategyOptions);
 
         for (CFMetaData cfm : cfMetaData.values())
             cfm.validate();
 
         return this;
-    }
-
-
-    public KSMetaData reloadAttributes() throws IOException
-    {
-        Row ksDefRow = SystemTable.readSchemaRow(name);
-
-        if (ksDefRow.cf == null)
-            throw new IOException(String.format("%s not found in the schema definitions table (%s).", name, SystemTable.SCHEMA_KEYSPACES_CF));
-
-        return fromSchema(ksDefRow, Collections.<CFMetaData>emptyList());
-    }
-
-    public RowMutation dropFromSchema(long timestamp)
-    {
-        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, SystemTable.getSchemaKSKey(name));
-        rm.delete(new QueryPath(SystemTable.SCHEMA_KEYSPACES_CF), timestamp);
-        rm.delete(new QueryPath(SystemTable.SCHEMA_COLUMNFAMILIES_CF), timestamp);
-        rm.delete(new QueryPath(SystemTable.SCHEMA_COLUMNS_CF), timestamp);
-
-        return rm;
-    }
-
-    public RowMutation toSchema(long timestamp)
-    {
-        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, SystemTable.getSchemaKSKey(name));
-        ColumnFamily cf = rm.addOrGet(SystemTable.SCHEMA_KEYSPACES_CF);
-
-        cf.addColumn(Column.create(name, timestamp, "name"));
-        cf.addColumn(Column.create(durableWrites, timestamp, "durable_writes"));
-        cf.addColumn(Column.create(strategyClass.getName(), timestamp, "strategy_class"));
-        cf.addColumn(Column.create(json(strategyOptions), timestamp, "strategy_options"));
-
-        for (CFMetaData cfm : cfMetaData.values())
-            cfm.toSchema(rm, timestamp);
-
-        return rm;
-    }
-
-    /**
-     * Deserialize only Keyspace attributes without nested ColumnFamilies
-     *
-     * @param row Keyspace attributes in serialized form
-     *
-     * @return deserialized keyspace without cf_defs
-     *
-     * @throws IOException if deserialization failed
-     */
-    public static KSMetaData fromSchema(Row row, Iterable<CFMetaData> cfms) throws IOException
-    {
-        UntypedResultSet.Row result = QueryProcessor.resultify("SELECT * FROM system.schema_keyspaces", row).one();
-        try
-        {
-            return new KSMetaData(result.getString("name"),
-                                  AbstractReplicationStrategy.getClass(result.getString("strategy_class")),
-                                  fromJsonMap(result.getString("strategy_options")),
-                                  result.getBoolean("durable_writes"),
-                                  cfms);
-        }
-        catch (ConfigurationException e)
-        {
-            throw new RuntimeException(e);
-        }
-    }
-
-    /**
-     * Deserialize Keyspace with nested ColumnFamilies
-     *
-     * @param serializedKs Keyspace in serialized form
-     * @param serializedCFs Collection of the serialized ColumnFamilies
-     *
-     * @return deserialized keyspace with cf_defs
-     *
-     * @throws IOException if deserialization failed
-     */
-    public static KSMetaData fromSchema(Row serializedKs, Row serializedCFs) throws IOException
-    {
-        Map<String, CFMetaData> cfs = deserializeColumnFamilies(serializedCFs);
-        return fromSchema(serializedKs, cfs.values());
-    }
-
-    /**
-     * Deserialize ColumnFamilies from low-level schema representation, all of them belong to the same keyspace
-     *
-     * @param row
-     * @return map containing name of the ColumnFamily and it's metadata for faster lookup
-     */
-    public static Map<String, CFMetaData> deserializeColumnFamilies(Row row)
-    {
-        if (row.cf == null)
-            return Collections.emptyMap();
-
-        Map<String, CFMetaData> cfms = new HashMap<String, CFMetaData>();
-        UntypedResultSet results = QueryProcessor.resultify("SELECT * FROM system.schema_columnfamilies", row);
-        for (UntypedResultSet.Row result : results)
-        {
-            CFMetaData cfm = CFMetaData.fromSchema(result);
-            cfms.put(cfm.cfName, cfm);
-        }
-
-        for (CFMetaData cfm : cfms.values())
-        {
-            Row columnRow = ColumnDefinition.readSchema(cfm.ksName, cfm.cfName);
-            for (ColumnDefinition cd : ColumnDefinition.fromSchema(columnRow, cfm))
-                cfm.column_metadata.put(cd.name, cd);
-        }
-
-        return cfms;
     }
 }

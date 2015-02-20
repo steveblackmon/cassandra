@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.client;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Collection;
@@ -30,7 +29,7 @@ import org.apache.cassandra.thrift.ColumnParent;
 import org.apache.cassandra.thrift.ColumnPath;
 import org.apache.cassandra.thrift.ConsistencyLevel;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TFramedTransport;
@@ -46,7 +45,7 @@ public class TestRingCache
     private Cassandra.Client thriftClient;
     private Configuration conf;
 
-    public TestRingCache(String keyspace) throws IOException
+    public TestRingCache(String keyspace)
     {
         ConfigHelper.setOutputColumnFamily(conf, keyspace, "Standard1");
     	ringCache = new RingCache(conf);

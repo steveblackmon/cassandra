@@ -18,39 +18,42 @@
 */
 package org.apache.cassandra.db;
 
-import static org.junit.Assert.assertEquals;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.filter.IDiskAtomFilter;
 import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
 import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.filter.IFilter;
-import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.db.index.SecondaryIndex;
-import org.apache.cassandra.dht.BytesToken;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.SimpleStrategy;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.IndexExpression;
-import org.apache.cassandra.thrift.IndexOperator;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.NodeId;
-import org.junit.Test;
 
-public class CleanupTest extends SchemaLoader
+import static org.junit.Assert.assertEquals;
+
+public class CleanupTest
 {
     public static final int LOOPS = 200;
-    public static final String TABLE1 = "Keyspace1";
+    public static final String KEYSPACE1 = "CleanupTest1";
     public static final String CF1 = "Indexed1";
     public static final String CF2 = "Standard1";
     public static final ByteBuffer COLUMN = ByteBufferUtil.bytes("birthdate");
@@ -61,13 +64,24 @@ public class CleanupTest extends SchemaLoader
         VALUE.flip();
     }
 
-    @Test
-    public void testCleanup() throws IOException, ExecutionException, InterruptedException, ConfigurationException
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
     {
-        StorageService.instance.initServer(0);
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF2),
+                                    SchemaLoader.indexCFMD(KEYSPACE1, CF1, true));
+    }
 
-        Table table = Table.open(TABLE1);
-        ColumnFamilyStore cfs = table.getColumnFamilyStore(CF2);
+    @Test
+    public void testCleanup() throws ExecutionException, InterruptedException
+    {
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF2);
 
         List<Row> rows;
 
@@ -81,7 +95,7 @@ public class CleanupTest extends SchemaLoader
         assertEquals(LOOPS, rows.size());
 
         // with one token in the ring, owned by the local node, cleanup should be a no-op
-        CompactionManager.instance.performCleanup(cfs, new NodeId.OneShotRenewer());
+        CompactionManager.instance.performCleanup(cfs);
 
         // ensure max timestamp of the sstables are retained post-cleanup
         assert expectedMaxTimestamps.equals(getMaxTimestampList(cfs));
@@ -94,9 +108,8 @@ public class CleanupTest extends SchemaLoader
     @Test
     public void testCleanupWithIndexes() throws IOException, ExecutionException, InterruptedException
     {
-        Table table = Table.open(TABLE1);
-        ColumnFamilyStore cfs = table.getColumnFamilyStore(CF1);
-        assertEquals(cfs.indexManager.getIndexedColumns().iterator().next(), COLUMN);
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF1);
 
         List<Row> rows;
 
@@ -106,17 +119,16 @@ public class CleanupTest extends SchemaLoader
         assertEquals(LOOPS, rows.size());
 
         SecondaryIndex index = cfs.indexManager.getIndexForColumn(COLUMN);
-        long start = System.currentTimeMillis();
-        while (!index.isIndexBuilt(COLUMN) && System.currentTimeMillis() < start + 10000)
+        long start = System.nanoTime();
+        while (!index.isIndexBuilt(COLUMN) && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(10))
             Thread.sleep(10);
 
         // verify we get it back w/ index query too
-        IndexExpression expr = new IndexExpression(COLUMN, IndexOperator.EQ, VALUE);
+        IndexExpression expr = new IndexExpression(COLUMN, Operator.EQ, VALUE);
         List<IndexExpression> clause = Arrays.asList(expr);
-        IFilter filter = new IdentityQueryFilter();
-        IPartitioner p = StorageService.getPartitioner();
+        IDiskAtomFilter filter = new IdentityQueryFilter();
         Range<RowPosition> range = Util.range("", "");
-        rows = table.getColumnFamilyStore(CF1).search(clause, range, Integer.MAX_VALUE, filter);
+        rows = keyspace.getColumnFamilyStore(CF1).search(range, clause, filter, Integer.MAX_VALUE);
         assertEquals(LOOPS, rows.size());
 
         // we don't allow cleanup when the local host has no range to avoid wipping up all data when a node has not join the ring.
@@ -128,7 +140,7 @@ public class CleanupTest extends SchemaLoader
         tmd.updateNormalToken(new BytesToken(tk1), InetAddress.getByName("127.0.0.1"));
         tmd.updateNormalToken(new BytesToken(tk2), InetAddress.getByName("127.0.0.2"));
 
-        CompactionManager.instance.performCleanup(cfs, new NodeId.OneShotRenewer());
+        CompactionManager.instance.performCleanup(cfs);
 
         // row data should be gone
         rows = Util.getRangeSlice(cfs);
@@ -138,11 +150,40 @@ public class CleanupTest extends SchemaLoader
         assert cfs.getSSTables().isEmpty();
 
         // 2ary indexes should result in no results, too (although tombstones won't be gone until compacted)
-        rows = cfs.search(clause, range, Integer.MAX_VALUE, filter);
+        rows = cfs.search(range, clause, filter, Integer.MAX_VALUE);
         assertEquals(0, rows.size());
     }
 
-    protected void fillCF(ColumnFamilyStore cfs, int rowsPerSSTable) throws ExecutionException, InterruptedException, IOException
+    @Test
+    public void testCleanupWithNewToken() throws ExecutionException, InterruptedException, UnknownHostException
+    {
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF2);
+
+        List<Row> rows;
+
+        // insert data and verify we get it back w/ range query
+        fillCF(cfs, LOOPS);
+
+        rows = Util.getRangeSlice(cfs);
+
+        assertEquals(LOOPS, rows.size());
+        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+
+        byte[] tk1 = new byte[1], tk2 = new byte[1];
+        tk1[0] = 2;
+        tk2[0] = 1;
+        tmd.updateNormalToken(new BytesToken(tk1), InetAddress.getByName("127.0.0.1"));
+        tmd.updateNormalToken(new BytesToken(tk2), InetAddress.getByName("127.0.0.2"));
+        CompactionManager.instance.performCleanup(cfs);
+
+        rows = Util.getRangeSlice(cfs);
+        assertEquals(0, rows.size());
+    }
+
+    protected void fillCF(ColumnFamilyStore cfs, int rowsPerSSTable)
     {
         CompactionManager.instance.disableAutoCompaction();
 
@@ -150,9 +191,9 @@ public class CleanupTest extends SchemaLoader
         {
             String key = String.valueOf(i);
             // create a row and update the birthdate value, test that the index query fetches the new version
-            RowMutation rm;
-            rm = new RowMutation(TABLE1, ByteBufferUtil.bytes(key));
-            rm.add(new QueryPath(cfs.getColumnFamilyName(), null, COLUMN), VALUE, System.currentTimeMillis());
+            Mutation rm;
+            rm = new Mutation(KEYSPACE1, ByteBufferUtil.bytes(key));
+            rm.add(cfs.name, Util.cellname(COLUMN), VALUE, System.currentTimeMillis());
             rm.applyUnsafe();
         }
 

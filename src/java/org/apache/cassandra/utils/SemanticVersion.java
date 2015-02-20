@@ -21,7 +21,7 @@ import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 import java.util.Arrays;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import com.google.common.base.Objects;
 
 /**
@@ -66,9 +66,9 @@ public class SemanticVersion implements Comparable<SemanticVersion>
 
         try
         {
-            this.major = Integer.valueOf(matcher.group(1));
-            this.minor = Integer.valueOf(matcher.group(2));
-            this.patch = Integer.valueOf(matcher.group(3));
+            this.major = Integer.parseInt(matcher.group(1));
+            this.minor = Integer.parseInt(matcher.group(2));
+            this.patch = Integer.parseInt(matcher.group(3));
 
             String pr = matcher.group(4);
             String bld = matcher.group(5);
@@ -143,7 +143,7 @@ public class SemanticVersion implements Comparable<SemanticVersion>
 
     public boolean isSupportedBy(SemanticVersion version)
     {
-        return major == version.major && minor <= version.minor;
+        return major == version.major && this.compareTo(version) <= 0;
     }
 
     private static int compareIdentifiers(String[] ids1, String[] ids2, int defaultPred)

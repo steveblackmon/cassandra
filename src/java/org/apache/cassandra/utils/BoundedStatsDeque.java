@@ -18,22 +18,24 @@
 package org.apache.cassandra.utils;
 
 import java.util.Iterator;
-import java.util.NoSuchElementException;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * bounded threadsafe deque
  */
-public class BoundedStatsDeque implements Iterable<Double>
+public class BoundedStatsDeque implements Iterable<Long>
 {
-    protected final LinkedBlockingDeque<Double> deque;
+    private final LinkedBlockingDeque<Long> deque;
+    private final AtomicLong sum;
 
     public BoundedStatsDeque(int size)
     {
-        deque = new LinkedBlockingDeque<Double>(size);
+        deque = new LinkedBlockingDeque<>(size);
+        sum = new AtomicLong(0);
     }
 
-    public Iterator<Double> iterator()
+    public Iterator<Long> iterator()
     {
         return deque.iterator();
     }
@@ -43,39 +45,24 @@ public class BoundedStatsDeque implements Iterable<Double>
         return deque.size();
     }
 
-    public void clear()
-    {
-        deque.clear();
-    }
-
-    public void add(double i)
+    public void add(long i)
     {
         if (!deque.offer(i))
         {
-            try
-            {
-                deque.remove();
-            }
-            catch (NoSuchElementException e)
-            {
-                // oops, clear() beat us to it
-            }
+            Long removed = deque.remove();
+            sum.addAndGet(-removed);
             deque.offer(i);
         }
+        sum.addAndGet(i);
     }
 
-    public double sum()
+    public long sum()
     {
-        double sum = 0d;
-        for (Double interval : deque)
-        {
-            sum += interval;
-        }
-        return sum;
+        return sum.get();
     }
 
     public double mean()
     {
-        return size() > 0 ? sum() / size() : 0;
+        return size() > 0 ? ((double) sum()) / size() : 0;
     }
 }

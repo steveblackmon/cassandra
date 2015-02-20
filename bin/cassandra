@@ -67,11 +67,11 @@
 # If an include wasn't specified in the environment, then search for one...
 if [ "x$CASSANDRA_INCLUDE" = "x" ]; then
     # Locations (in order) to use when searching for an include file.
-    for include in /usr/share/cassandra/cassandra.in.sh \
-                   /usr/local/share/cassandra/cassandra.in.sh \
-                   /opt/cassandra/cassandra.in.sh \
+    for include in "`dirname "$0"`/cassandra.in.sh" \
                    "$HOME/.cassandra.in.sh" \
-                   "`dirname $0`/cassandra.in.sh"; do
+                   /usr/share/cassandra/cassandra.in.sh \
+                   /usr/local/share/cassandra/cassandra.in.sh \
+                   /opt/cassandra/cassandra.in.sh; do
         if [ -r "$include" ]; then
             . "$include"
             break
@@ -84,9 +84,23 @@ fi
 
 # Use JAVA_HOME if set, otherwise look for java in PATH
 if [ -n "$JAVA_HOME" ]; then
-    JAVA="$JAVA_HOME/bin/java"
+    # Why we can't have nice things: Solaris combines x86 and x86_64
+    # installations in the same tree, using an unconventional path for the
+    # 64bit JVM.  Since we prefer 64bit, search the alternate path first,
+    # (see https://issues.apache.org/jira/browse/CASSANDRA-4638).
+    for java in "$JAVA_HOME"/bin/amd64/java "$JAVA_HOME"/bin/java; do
+        if [ -x "$java" ]; then
+            JAVA="$java"
+            break
+        fi
+    done
 else
     JAVA=java
+fi
+
+if [ -z $JAVA ] ; then
+    echo Unable to find java executable. Check JAVA_HOME and PATH environment variables. > /dev/stderr
+    exit 1;
 fi
 
 # If numactl is available, use it. For Cassandra, the priority is to
@@ -120,16 +134,18 @@ esac
 
 launch_service()
 {
-    pidpath=$1
-    foreground=$2
-    props=$3
-    class=$4
-    cassandra_parms="-Dlog4j.configuration=log4j-server.properties -Dlog4j.defaultInitOverride=true"
+    pidpath="$1"
+    foreground="$2"
+    props="$3"
+    class="$4"
+    cassandra_parms="-Dlogback.configurationFile=logback.xml"
+    cassandra_parms="$cassandra_parms -Dcassandra.logdir=$CASSANDRA_HOME/logs"
+    cassandra_parms="$cassandra_parms -Dcassandra.storagedir=$cassandra_storagedir"
 
     if [ "x$pidpath" != "x" ]; then
         cassandra_parms="$cassandra_parms -Dcassandra-pidfile=$pidpath"
     fi
-    
+
     # The cassandra-foreground option will tell CassandraDaemon not
     # to close stdout/stderr, but it's up to us not to background.
     if [ "x$foreground" != "x" ]; then
@@ -139,16 +155,17 @@ launch_service()
     else
         exec $NUMACTL "$JAVA" $JVM_OPTS $cassandra_parms -cp "$CLASSPATH" $props "$class" <&- &
         [ ! -z "$pidpath" ] && printf "%d" $! > "$pidpath"
+        true
     fi
 
     return $?
 }
 
 # Parse any command line options.
-args=`getopt vfhp:bD: "$@"`
+args=`getopt vfhp:bD:H:E: "$@"`
 eval set -- "$args"
 
-classname="org.apache.cassandra.thrift.CassandraDaemon"
+classname="org.apache.cassandra.service.CassandraDaemon"
 
 while true; do
     case "$1" in
@@ -161,7 +178,7 @@ while true; do
             shift
         ;;
         -h)
-            echo "Usage: $0 [-f] [-h] [-p pidfile]"
+            echo "Usage: $0 [-f] [-h] [-p pidfile] [-H dumpfile] [-E errorfile]"
             exit 0
         ;;
         -v)
@@ -170,6 +187,14 @@ while true; do
         ;;
         -D)
             properties="$properties -D$2"
+            shift 2
+        ;;
+        -H)
+            properties="$properties -XX:HeapDumpPath=$2"
+            shift 2
+        ;;
+        -E)
+            properties="$properties -XX:ErrorFile=$2"
             shift 2
         ;;
         --)
@@ -182,6 +207,13 @@ while true; do
         ;;
     esac
 done
+
+# see CASSANDRA-7254
+"$JAVA" -cp $CLASSPATH $JVM_OPTS 2>&1 | grep -q 'Error: Exception thrown by the agent : java.lang.NullPointerException'
+if [ $? -ne "1" ]; then 
+    echo Unable to bind JMX, is Cassandra already running?
+    exit 1;
+fi
 
 # Start up the service
 launch_service "$pidfile" "$foreground" "$properties" "$classname"

@@ -17,22 +17,23 @@
  */
 package org.apache.cassandra.service;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.util.Collection;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.DefsTable;
-import org.apache.cassandra.db.RowMutation;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.schema.LegacySchemaTables;
 import org.apache.cassandra.gms.FailureDetector;
-import org.apache.cassandra.net.IAsyncResult;
+import org.apache.cassandra.net.IAsyncCallback;
+import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.WrappedRunnable;
+
 
 class MigrationTask extends WrappedRunnable
 {
@@ -47,28 +48,47 @@ class MigrationTask extends WrappedRunnable
 
     public void runMayThrow() throws Exception
     {
-        MessageOut message = new MessageOut(MessagingService.Verb.MIGRATION_REQUEST, null, MigrationManager.MigrationsSerializer.instance);
-
-        int retries = 0;
-        while (retries < MigrationManager.MIGRATION_REQUEST_RETRIES)
+        // There is a chance that quite some time could have passed between now and the MM#maybeScheduleSchemaPull(),
+        // potentially enough for the endpoint node to restart - which is an issue if it does restart upgraded, with
+        // a higher major.
+        if (!MigrationManager.shouldPullSchemaFrom(endpoint))
         {
-            if (!FailureDetector.instance.isAlive(endpoint))
+            logger.info("Skipped sending a migration request: node {} has a higher major version now.", endpoint);
+            return;
+        }
+
+        if (!FailureDetector.instance.isAlive(endpoint))
+        {
+            logger.error("Can't send migration request: node {} is down.", endpoint);
+            return;
+        }
+
+        MessageOut message = new MessageOut<>(MessagingService.Verb.MIGRATION_REQUEST, null, MigrationManager.MigrationsSerializer.instance);
+
+        IAsyncCallback<Collection<Mutation>> cb = new IAsyncCallback<Collection<Mutation>>()
+        {
+            @Override
+            public void response(MessageIn<Collection<Mutation>> message)
             {
-                logger.error("Can't send migration request: node {} is down.", endpoint);
-                return;
+                try
+                {
+                    LegacySchemaTables.mergeSchema(message.payload);
+                }
+                catch (IOException e)
+                {
+                    logger.error("IOException merging remote schema", e);
+                }
+                catch (ConfigurationException e)
+                {
+                    logger.error("Configuration exception merging remote schema", e);
+                }
             }
 
-            IAsyncResult<Collection<RowMutation>> iar = MessagingService.instance().sendRR(message, endpoint);
-            try
+            public boolean isLatencyForSnitch()
             {
-                Collection<RowMutation> schema = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
-                DefsTable.mergeSchema(schema);
-                return;
+                return false;
             }
-            catch(TimeoutException e)
-            {
-                retries++;
-            }
-        }
+        };
+        MessagingService.instance().sendRR(message, endpoint, cb);
     }
 }

@@ -24,26 +24,30 @@ import java.util.*;
 
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.CachedHashDecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.Pair;
 
-public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
+public class OrderPreservingPartitioner implements IPartitioner
 {
     public static final StringToken MINIMUM = new StringToken("");
 
     public static final BigInteger CHAR_MASK = new BigInteger("65535");
 
+    private static final long EMPTY_SIZE = ObjectSizes.measure(MINIMUM);
+
+    public static final OrderPreservingPartitioner instance = new OrderPreservingPartitioner();
+
     public DecoratedKey decorateKey(ByteBuffer key)
     {
-        return new DecoratedKey(getToken(key), key);
-    }
-
-    public DecoratedKey convertFromDiskFormat(ByteBuffer key)
-    {
-        return new DecoratedKey(getToken(key), key);
+        return new CachedHashDecoratedKey(getToken(key), key);
     }
 
     public StringToken midpoint(Token ltoken, Token rtoken)
@@ -111,14 +115,15 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
         return new StringToken(buffer.toString());
     }
 
-    private final Token.TokenFactory<String> tokenFactory = new Token.TokenFactory<String>()
+    private final Token.TokenFactory tokenFactory = new Token.TokenFactory()
     {
-        public ByteBuffer toByteArray(Token<String> stringToken)
+        public ByteBuffer toByteArray(Token token)
         {
+            StringToken stringToken = (StringToken) token;
             return ByteBufferUtil.bytes(stringToken.token);
         }
 
-        public Token<String> fromByteArray(ByteBuffer bytes)
+        public Token fromByteArray(ByteBuffer bytes)
         {
             try
             {
@@ -130,8 +135,9 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
             }
         }
 
-        public String toString(Token<String> stringToken)
+        public String toString(Token token)
         {
+            StringToken stringToken = (StringToken) token;
             return stringToken.token;
         }
 
@@ -141,13 +147,13 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
                 throw new ConfigurationException("Tokens may not contain the character " + VersionedValue.DELIMITER_STR);
         }
 
-        public Token<String> fromString(String string)
+        public Token fromString(String string)
         {
             return new StringToken(string);
         }
     };
 
-    public Token.TokenFactory<String> getTokenFactory()
+    public Token.TokenFactory getTokenFactory()
     {
         return tokenFactory;
     }
@@ -155,6 +161,28 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
     public boolean preservesOrder()
     {
         return true;
+    }
+
+    public static class StringToken extends ComparableObjectToken<String>
+    {
+        static final long serialVersionUID = 5464084395277974963L;
+
+        public StringToken(String token)
+        {
+            super(token);
+        }
+
+        @Override
+        public IPartitioner getPartitioner()
+        {
+            return instance;
+        }
+
+        @Override
+        public long getHeapSize()
+        {
+            return EMPTY_SIZE + ObjectSizes.sizeOf(token);
+        }
     }
 
     public StringToken getToken(ByteBuffer key)
@@ -166,7 +194,7 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
         }
         catch (CharacterCodingException e)
         {
-            throw new RuntimeException("The provided key was not UTF8 encoded.", e);
+            skey = ByteBufferUtil.bytesToHex(key);
         }
         return new StringToken(skey);
     }
@@ -186,14 +214,14 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
             lastToken = node;
         }
 
-        for (String ks : Schema.instance.getTables())
+        for (String ks : Schema.instance.getKeyspaces())
         {
             for (CFMetaData cfmd : Schema.instance.getKSMetaData(ks).cfMetaData().values())
             {
                 for (Range<Token> r : sortedRanges)
                 {
                     // Looping over every KS:CF:Range, get the splits size and add it to the count
-                    allTokens.put(r.right, allTokens.get(r.right) + StorageService.instance.getSplits(ks, cfmd.cfName, r, DatabaseDescriptor.getIndexInterval()).size());
+                    allTokens.put(r.right, allTokens.get(r.right) + StorageService.instance.getSplits(ks, cfmd.cfName, r, cfmd.getMinIndexInterval()).size());
                 }
             }
         }
@@ -206,5 +234,10 @@ public class OrderPreservingPartitioner extends AbstractPartitioner<StringToken>
             allTokens.put(row.getKey(), row.getValue() / total);
 
         return allTokens;
+    }
+
+    public AbstractType<?> getTokenValidator()
+    {
+        return UTF8Type.instance;
     }
 }

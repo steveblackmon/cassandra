@@ -17,35 +17,30 @@
  */
 package org.apache.cassandra.service;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.db.SnapshotCommand;
-import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 public class SnapshotVerbHandler implements IVerbHandler<SnapshotCommand>
 {
     private static final Logger logger = LoggerFactory.getLogger(SnapshotVerbHandler.class);
-    public void doVerb(MessageIn<SnapshotCommand> message, String id)
+
+    public void doVerb(MessageIn<SnapshotCommand> message, int id)
     {
-        try
+        SnapshotCommand command = message.payload;
+        if (command.clear_snapshot)
         {
-            SnapshotCommand command = message.payload;
-            if (command.clear_snapshot)
-                Table.open(command.keyspace).clearSnapshot(command.snapshot_name);
-            else
-                Table.open(command.keyspace).getColumnFamilyStore(command.column_family).snapshot(command.snapshot_name);
-            if (logger.isDebugEnabled())
-                logger.debug("Sending response to snapshot request {} to {} ", command.snapshot_name, message.from);
-            MessagingService.instance().sendReply(new MessageOut(MessagingService.Verb.REQUEST_RESPONSE), id, message.from);
+            Keyspace.clearSnapshot(command.snapshot_name, command.keyspace);
         }
-        catch (Exception ex)
-        {
-            throw new RuntimeException(ex);
-        }
+        else
+            Keyspace.open(command.keyspace).getColumnFamilyStore(command.column_family).snapshot(command.snapshot_name);
+        logger.debug("Enqueuing response to snapshot request {} to {}", command.snapshot_name, message.from);
+        MessagingService.instance().sendReply(new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE), id, message.from);
     }
 }

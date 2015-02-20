@@ -18,12 +18,13 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.File;
-import java.io.IOException;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
 
 /**
  * A SSTable writer that assumes rows are in (partitioner) sorted order.
@@ -54,40 +55,39 @@ public class SSTableSimpleWriter extends AbstractSSTableSimpleWriter
                                String keyspace,
                                String columnFamily,
                                AbstractType<?> comparator,
-                               AbstractType<?> subComparator) throws IOException
+                               AbstractType<?> subComparator)
     {
-        this(directory,
-             new CFMetaData(keyspace, columnFamily, subComparator == null ? ColumnFamilyType.Standard : ColumnFamilyType.Super, comparator, subComparator), partitioner);
+        this(directory, CFMetaData.denseCFMetaData(keyspace, columnFamily, comparator, subComparator), partitioner);
     }
 
-    public SSTableSimpleWriter(File directory, CFMetaData metadata, IPartitioner partitioner) throws IOException
+    public SSTableSimpleWriter(File directory, CFMetaData metadata, IPartitioner partitioner)
     {
         super(directory, metadata, partitioner);
         writer = getWriter();
     }
 
-    public void close() throws IOException
+    public void close()
     {
         try
         {
             if (currentKey != null)
                 writeRow(currentKey, columnFamily);
-            writer.closeAndOpenReader();
+            writer.close();
         }
-        catch (IOException e)
+        catch (FSError e)
         {
             writer.abort();
             throw e;
         }
     }
 
-    protected void writeRow(DecoratedKey key, ColumnFamily columnFamily) throws IOException
+    protected void writeRow(DecoratedKey key, ColumnFamily columnFamily)
     {
         writer.append(key, columnFamily);
     }
 
     protected ColumnFamily getColumnFamily()
     {
-        return ColumnFamily.create(metadata, TreeMapBackedSortedColumns.factory());
+        return ArrayBackedSortedColumns.factory.create(metadata);
     }
 }

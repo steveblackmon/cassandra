@@ -23,63 +23,75 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
 import java.io.IOException;
-import java.util.concurrent.ExecutionException;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
  * Test for the truncate operation.
  */
-public class RecoveryManagerTruncateTest extends SchemaLoader
+public class RecoveryManagerTruncateTest
 {
-	@Test
-	public void testTruncate() throws IOException, ExecutionException, InterruptedException
-	{
-		Table table = Table.open("Keyspace1");
-		ColumnFamilyStore cfs = table.getColumnFamilyStore("Standard1");
+    private static final String KEYSPACE1 = "RecoveryManagerTruncateTest";
+    private static final String CF_STANDARD1 = "Standard1";
 
-		RowMutation rm;
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
+    {
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
+    }
+
+	@Test
+	public void testTruncate() throws IOException
+	{
+		Keyspace keyspace = Keyspace.open(KEYSPACE1);
+		ColumnFamilyStore cfs = keyspace.getColumnFamilyStore("Standard1");
+
+		Mutation rm;
 		ColumnFamily cf;
 
 		// add a single cell
-		rm = new RowMutation("Keyspace1", ByteBufferUtil.bytes("keymulti"));
-		cf = ColumnFamily.create("Keyspace1", "Standard1");
+        cf = ArrayBackedSortedColumns.factory.create(KEYSPACE1, "Standard1");
 		cf.addColumn(column("col1", "val1", 1L));
-		rm.add(cf);
-		rm.apply();
+        rm = new Mutation(KEYSPACE1, ByteBufferUtil.bytes("keymulti"), cf);
+		rm.applyUnsafe();
 
 		// Make sure data was written
-		assertNotNull(getFromTable(table, "Standard1", "keymulti", "col1"));
+		assertNotNull(getFromTable(keyspace, "Standard1", "keymulti", "col1"));
 
 		// and now truncate it
-		cfs.truncate().get();
-        CommitLog.instance.resetUnsafe();
+		cfs.truncateBlocking();
+        CommitLog.instance.resetUnsafe(false);
 		CommitLog.instance.recover();
 
 		// and validate truncation.
-		assertNull(getFromTable(table, "Standard1", "keymulti", "col1"));
+		assertNull(getFromTable(keyspace, "Standard1", "keymulti", "col1"));
 	}
 
-	private IColumn getFromTable(Table table, String cfName, String keyName, String columnName)
+	private Cell getFromTable(Keyspace keyspace, String cfName, String keyName, String columnName)
 	{
 		ColumnFamily cf;
-		ColumnFamilyStore cfStore = table.getColumnFamilyStore(cfName);
+		ColumnFamilyStore cfStore = keyspace.getColumnFamilyStore(cfName);
 		if (cfStore == null)
 		{
 			return null;
 		}
-		cf = cfStore.getColumnFamily(QueryFilter.getNamesFilter(
-		        Util.dk(keyName), new QueryPath(cfName), ByteBufferUtil.bytes(columnName)));
+		cf = cfStore.getColumnFamily(Util.namesQueryFilter(cfStore, Util.dk(keyName), columnName));
 		if (cf == null)
 		{
 			return null;
 		}
-		return cf.getColumn(ByteBufferUtil.bytes(columnName));
+		return cf.getColumn(Util.cellname(columnName));
 	}
 }

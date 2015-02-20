@@ -23,16 +23,17 @@ import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
-import com.google.common.base.Charsets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.ConfigurationException;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -45,6 +46,7 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
     protected static final String ZONE_NAME_QUERY_URL = "http://169.254.169.254/latest/meta-data/placement/availability-zone";
     private static final String DEFAULT_DC = "UNKNOWN-DC";
     private static final String DEFAULT_RACK = "UNKNOWN-RACK";
+    private Map<InetAddress, Map<String, String>> savedEndpoints;
     protected String ec2zone;
     protected String ec2region;
 
@@ -59,14 +61,17 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
         ec2region = az.substring(0, az.length() - 1);
         if (ec2region.endsWith("1"))
             ec2region = az.substring(0, az.length() - 3);
-        
-        logger.info("EC2Snitch using region: " + ec2region + ", zone: " + ec2zone + ".");
+
+        String datacenterSuffix = (new SnitchProperties()).get("dc_suffix", "");
+        ec2region = ec2region.concat(datacenterSuffix);
+        logger.info("EC2Snitch using region: {}, zone: {}.", ec2region, ec2zone);
     }
 
     String awsApiCall(String url) throws IOException, ConfigurationException
     {
         // Populate the region and zone by introspection, fail if 404 on metadata
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        DataInputStream d = null;
         try
         {
             conn.setRequestMethod("GET");
@@ -76,12 +81,13 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
             // Read the information. I wish I could say (String) conn.getContent() here...
             int cl = conn.getContentLength();
             byte[] b = new byte[cl];
-            DataInputStream d = new DataInputStream((FilterInputStream) conn.getContent());
+            d = new DataInputStream((FilterInputStream) conn.getContent());
             d.readFully(b);
-            return new String(b, Charsets.UTF_8);
+            return new String(b, StandardCharsets.UTF_8);
         }
         finally
         {
+            FileUtils.close(d);
             conn.disconnect();
         }
     }
@@ -91,8 +97,14 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
         if (endpoint.equals(FBUtilities.getBroadcastAddress()))
             return ec2zone;
         EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (null == state || null == state.getApplicationState(ApplicationState.RACK))
+        if (state == null || state.getApplicationState(ApplicationState.RACK) == null)
+        {
+            if (savedEndpoints == null)
+                savedEndpoints = SystemKeyspace.loadDcRackInfo();
+            if (savedEndpoints.containsKey(endpoint))
+                return savedEndpoints.get(endpoint).get("rack");
             return DEFAULT_RACK;
+        }
         return state.getApplicationState(ApplicationState.RACK).value;
     }
 
@@ -101,17 +113,14 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
         if (endpoint.equals(FBUtilities.getBroadcastAddress()))
             return ec2region;
         EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (null == state || null == state.getApplicationState(ApplicationState.DC))
+        if (state == null || state.getApplicationState(ApplicationState.DC) == null)
+        {
+            if (savedEndpoints == null)
+                savedEndpoints = SystemKeyspace.loadDcRackInfo();
+            if (savedEndpoints.containsKey(endpoint))
+                return savedEndpoints.get(endpoint).get("data_center");
             return DEFAULT_DC;
+        }
         return state.getApplicationState(ApplicationState.DC).value;
-    }
-
-    @Override
-    public void gossiperStarting()
-    {
-        // Share EC2 info via gossip.  We have to wait until Gossiper is initialized though.
-        logger.info("Ec2Snitch adding ApplicationState ec2region=" + ec2region + " ec2zone=" + ec2zone);
-        Gossiper.instance.addLocalApplicationState(ApplicationState.DC, StorageService.instance.valueFactory.datacenter(ec2region));
-        Gossiper.instance.addLocalApplicationState(ApplicationState.RACK, StorageService.instance.valueFactory.rack(ec2zone));
     }
 }

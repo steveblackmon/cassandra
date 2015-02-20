@@ -17,55 +17,24 @@
  */
 package org.apache.cassandra.service;
 
-import java.util.List;
-import java.util.concurrent.ExecutionException;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.RangeSliceCommand;
+import org.apache.cassandra.db.AbstractRangeCommand;
 import org.apache.cassandra.db.RangeSliceReply;
-import org.apache.cassandra.db.Row;
-import org.apache.cassandra.db.Table;
-import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.IFilter;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.tracing.Tracing;
 
-public class RangeSliceVerbHandler implements IVerbHandler<RangeSliceCommand>
+public class RangeSliceVerbHandler implements IVerbHandler<AbstractRangeCommand>
 {
-    private static final Logger logger = LoggerFactory.getLogger(RangeSliceVerbHandler.class);
-
-    static List<Row> executeLocally(RangeSliceCommand command) throws ExecutionException, InterruptedException
+    public void doVerb(MessageIn<AbstractRangeCommand> message, int id)
     {
-        ColumnFamilyStore cfs = Table.open(command.keyspace).getColumnFamilyStore(command.column_family);
-        IFilter columnFilter = QueryFilter.getFilter(command.predicate, cfs.getComparator());
-
-        if (cfs.indexManager.hasIndexFor(command.row_filter))
-            return cfs.search(command.row_filter, command.range, command.maxResults, columnFilter, command.maxIsColumns);
-        else
-            return cfs.getRangeSlice(command.super_column, command.range, command.maxResults, columnFilter, command.row_filter, command.maxIsColumns, command.isPaging);
-    }
-
-    public void doVerb(MessageIn<RangeSliceCommand> message, String id)
-    {
-        try
+        if (StorageService.instance.isBootstrapMode())
         {
-            if (StorageService.instance.isBootstrapMode())
-            {
-                /* Don't service reads! */
-                throw new RuntimeException("Cannot service reads while bootstrapping!");
-            }
-            RangeSliceReply reply = new RangeSliceReply(executeLocally(message.payload));
-            if (logger.isDebugEnabled())
-                logger.debug("Sending " + reply+ " to " + id + "@" + message.from);
-            MessagingService.instance().sendReply(reply.createMessage(), id, message.from);
+            /* Don't service reads! */
+            throw new RuntimeException("Cannot service reads while bootstrapping!");
         }
-        catch (Exception ex)
-        {
-            throw new RuntimeException(ex);
-        }
+        RangeSliceReply reply = new RangeSliceReply(message.payload.executeLocally());
+        Tracing.trace("Enqueuing response to {}", message.from);
+        MessagingService.instance().sendReply(reply.createMessage(), id, message.from);
     }
 }

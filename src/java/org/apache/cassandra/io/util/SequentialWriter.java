@@ -18,28 +18,40 @@
 package org.apache.cassandra.io.util;
 
 import java.io.*;
+import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.nio.channels.WritableByteChannel;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.compress.CompressedSequentialWriter;
+import org.apache.cassandra.io.compress.CompressionParameters;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CLibrary;
 
-public class SequentialWriter extends OutputStream
+/**
+ * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
+ * fsync incrementally if Config.trickle_fsync is enabled.
+ */
+public class SequentialWriter extends OutputStream implements WritableByteChannel
 {
+    private static final Logger logger = LoggerFactory.getLogger(SequentialWriter.class);
+
     // isDirty - true if this.buffer contains any un-synced bytes
     protected boolean isDirty = false, syncNeeded = false;
 
     // absolute path to the given file
     private final String filePath;
 
-    // so we can use the write(int) path w/o tons of new byte[] allocations
-    private final byte[] singleByteBuffer = new byte[1];
-
     protected byte[] buffer;
-    private final boolean skipIOCache;
     private final int fd;
-    private final int directoryFD;
+    private int directoryFD;
     // directory should be synced only after first file sync, in other words, only once per file
     private boolean directorySynced = false;
 
@@ -48,60 +60,92 @@ public class SequentialWriter extends OutputStream
 
     protected final RandomAccessFile out;
 
-    // used if skip I/O cache was enabled
-    private long ioCacheStartOffset = 0, bytesSinceCacheFlush = 0;
-
     // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
     // latency spikes
     private boolean trickleFsync;
     private int trickleFsyncByteInterval;
     private int bytesSinceTrickleFsync = 0;
 
-    public final DataOutputStream stream;
-    private MessageDigest digest;
+    public final DataOutputPlus stream;
+    protected long lastFlushOffset;
 
-    public SequentialWriter(File file, int bufferSize, boolean skipIOCache) throws IOException
+    protected Runnable runPostFlush;
+
+    public SequentialWriter(File file, int bufferSize)
     {
-        out = new RandomAccessFile(file, "rw");
+        try
+        {
+            out = new RandomAccessFile(file, "rw");
+        }
+        catch (FileNotFoundException e)
+        {
+            throw new RuntimeException(e);
+        }
 
         filePath = file.getAbsolutePath();
 
         buffer = new byte[bufferSize];
-        this.skipIOCache = skipIOCache;
         this.trickleFsync = DatabaseDescriptor.getTrickleFsync();
         this.trickleFsyncByteInterval = DatabaseDescriptor.getTrickleFsyncIntervalInKb() * 1024;
-        fd = CLibrary.getfd(out.getFD());
+
+        try
+        {
+            fd = CLibrary.getfd(out.getFD());
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e); // shouldn't happen
+        }
+
         directoryFD = CLibrary.tryOpenDirectory(file.getParent());
-        stream = new DataOutputStream(this);
+        stream = new DataOutputStreamAndChannel(this, this);
     }
 
-    public static SequentialWriter open(File file) throws IOException
+    public static SequentialWriter open(File file)
     {
-        return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, false);
+        return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE);
     }
 
-    public static SequentialWriter open(File file, boolean skipIOCache) throws IOException
+    public static SequentialWriter open(File file, int bufferSize)
     {
-        return open(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, skipIOCache);
+        return new SequentialWriter(file, bufferSize);
     }
 
-    public static SequentialWriter open(File file, int bufferSize, boolean skipIOCache) throws IOException
+    public static ChecksummedSequentialWriter open(File file, File crcPath)
     {
-        return new SequentialWriter(file, bufferSize, skipIOCache);
+        return new ChecksummedSequentialWriter(file, RandomAccessReader.DEFAULT_BUFFER_SIZE, crcPath);
     }
 
-    public void write(int value) throws IOException
+    public static CompressedSequentialWriter open(String dataFilePath,
+                                                  String offsetsPath,
+                                                  CompressionParameters parameters,
+                                                  MetadataCollector sstableMetadataCollector)
     {
-        singleByteBuffer[0] = (byte) value;
-        write(singleByteBuffer, 0, 1);
+        return new CompressedSequentialWriter(new File(dataFilePath), offsetsPath, parameters, sstableMetadataCollector);
     }
 
-    public void write(byte[] buffer) throws IOException
+    public void write(int value) throws ClosedChannelException
+    {
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+
+        assert current < bufferOffset + buffer.length
+                : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+
+        buffer[bufferCursor()] = (byte) value;
+
+        validBufferBytes += 1;
+        current += 1;
+        isDirty = true;
+        syncNeeded = true;
+    }
+
+    public void write(byte[] buffer) throws ClosedChannelException
     {
         write(buffer, 0, buffer.length);
     }
 
-    public void write(byte[] data, int offset, int length) throws IOException
+    public void write(byte[] data, int offset, int length) throws ClosedChannelException
     {
         if (buffer == null)
             throw new ClosedChannelException();
@@ -116,12 +160,59 @@ public class SequentialWriter extends OutputStream
         }
     }
 
+    public int write(ByteBuffer src) throws IOException
+    {
+        if (buffer == null)
+            throw new ClosedChannelException();
+
+        int length = src.remaining();
+        int offset = src.position();
+        while (length > 0)
+        {
+            int n = writeAtMost(src, offset, length);
+            offset += n;
+            length -= n;
+            isDirty = true;
+            syncNeeded = true;
+        }
+        src.position(offset);
+        return length;
+    }
+
     /*
-     * Write at most "length" bytes from "b" starting at position "offset", and
+     * Write at most "length" bytes from "data" starting at position "offset", and
      * return the number of bytes written. caller is responsible for setting
      * isDirty.
      */
-    private int writeAtMost(byte[] data, int offset, int length) throws IOException
+    private int writeAtMost(ByteBuffer data, int offset, int length)
+    {
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+
+        assert current < bufferOffset + buffer.length
+        : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+
+
+        int toCopy = Math.min(length, buffer.length - bufferCursor());
+
+        // copy bytes from external buffer
+        ByteBufferUtil.arrayCopy(data, offset, buffer, bufferCursor(), toCopy);
+
+        assert current <= bufferOffset + buffer.length
+        : String.format("File (%s) offset %d, buffer offset %d.", getPath(), current, bufferOffset);
+
+        validBufferBytes = Math.max(validBufferBytes, bufferCursor() + toCopy);
+        current += toCopy;
+
+        return toCopy;
+    }
+
+    /*
+     * Write at most "length" bytes from "data" starting at position "offset", and
+     * return the number of bytes written. caller is responsible for setting
+     * isDirty.
+     */
+    private int writeAtMost(byte[] data, int offset, int length)
     {
         if (current >= bufferOffset + buffer.length)
             reBuffer();
@@ -146,19 +237,25 @@ public class SequentialWriter extends OutputStream
 
     /**
      * Synchronize file contents with disk.
-     * @throws java.io.IOException on any I/O error.
      */
-    public void sync() throws IOException
+    public void sync()
     {
         syncInternal();
     }
 
-    protected void syncDataOnlyInternal() throws IOException
+    protected void syncDataOnlyInternal()
     {
-        out.getFD().sync();
+        try
+        {
+            out.getFD().sync();
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
     }
 
-    protected void syncInternal() throws IOException
+    protected void syncInternal()
     {
         if (syncNeeded)
         {
@@ -179,16 +276,14 @@ public class SequentialWriter extends OutputStream
      * If buffer is dirty, flush it's contents to the operating system. Does not imply fsync().
      *
      * Currently, for implementation reasons, this also invalidates the buffer.
-     *
-     * @throws java.io.IOException on any I/O error.
      */
     @Override
-    public void flush() throws IOException
+    public void flush()
     {
         flushInternal();
     }
 
-    protected void flushInternal() throws IOException
+    protected void flushInternal()
     {
         if (isDirty)
         {
@@ -204,23 +299,6 @@ public class SequentialWriter extends OutputStream
                 }
             }
 
-            if (skipIOCache)
-            {
-                // we don't know when the data reaches disk since we aren't
-                // calling flush
-                // so we continue to clear pages we don't need from the first
-                // offset we see
-                // periodically we update this starting offset
-                bytesSinceCacheFlush += validBufferBytes;
-
-                if (bytesSinceCacheFlush >= RandomAccessReader.CACHE_FLUSH_INTERVAL_IN_BYTES)
-                {
-                    CLibrary.trySkipCache(this.fd, ioCacheStartOffset, 0);
-                    ioCacheStartOffset = bufferOffset;
-                    bytesSinceCacheFlush = 0;
-                }
-            }
-
             // Remember that we wrote, so we don't write it again on next flush().
             resetBuffer();
 
@@ -228,15 +306,29 @@ public class SequentialWriter extends OutputStream
         }
     }
 
+    public void setPostFlushListener(Runnable runPostFlush)
+    {
+        assert this.runPostFlush == null;
+        this.runPostFlush = runPostFlush;
+    }
+
     /**
      * Override this method instead of overriding flush()
-     * @throws IOException on any I/O error.
+     * @throws FSWriteError on any I/O error.
      */
-    protected void flushData() throws IOException
+    protected void flushData()
     {
-        out.write(buffer, 0, validBufferBytes);
-        if (digest != null)
-            digest.update(buffer, 0, validBufferBytes);
+        try
+        {
+            out.write(buffer, 0, validBufferBytes);
+            lastFlushOffset += validBufferBytes;
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
+        if (runPostFlush != null)
+            runPostFlush.run();
     }
 
     public long getFilePointer()
@@ -244,9 +336,30 @@ public class SequentialWriter extends OutputStream
         return current;
     }
 
-    public long length() throws IOException
+    /**
+     * Returns the current file pointer of the underlying on-disk file.
+     * Note that since write works by buffering data, the value of this will increase by buffer
+     * size and not every write to the writer will modify this value.
+     * Furthermore, for compressed files, this value refers to compressed data, while the
+     * writer getFilePointer() refers to uncompressedFile
+     * 
+     * @return the current file pointer
+     */
+    public long getOnDiskFilePointer()
     {
-        return Math.max(Math.max(current, out.length()), bufferOffset + validBufferBytes);
+        return getFilePointer();
+    }
+
+    public long length()
+    {
+        try
+        {
+            return Math.max(Math.max(current, out.length()), bufferOffset + validBufferBytes);
+        }
+        catch (IOException e)
+        {
+            throw new FSReadError(e, getPath());
+        }
     }
 
     public String getPath()
@@ -254,7 +367,7 @@ public class SequentialWriter extends OutputStream
         return filePath;
     }
 
-    protected void reBuffer() throws IOException
+    protected void reBuffer()
     {
         flushInternal();
         resetBuffer();
@@ -276,7 +389,7 @@ public class SequentialWriter extends OutputStream
         return new BufferedFileWriterMark(current);
     }
 
-    public void resetAndTruncate(FileMark mark) throws IOException
+    public void resetAndTruncate(FileMark mark)
     {
         assert mark instanceof BufferedFileWriterMark;
 
@@ -297,18 +410,42 @@ public class SequentialWriter extends OutputStream
         truncate(current);
 
         // reset channel position
-        out.seek(current);
+        try
+        {
+            out.seek(current);
+        }
+        catch (IOException e)
+        {
+            throw new FSReadError(e, getPath());
+        }
 
         resetBuffer();
     }
 
-    public void truncate(long toSize) throws IOException
+    public long getLastFlushOffset()
     {
-        out.getChannel().truncate(toSize);
+        return lastFlushOffset;
+    }
+
+    public void truncate(long toSize)
+    {
+        try
+        {
+            out.getChannel().truncate(toSize);
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
+    }
+
+    public boolean isOpen()
+    {
+        return out.getChannel().isOpen();
     }
 
     @Override
-    public void close() throws IOException
+    public void close()
     {
         if (buffer == null)
             return; // already closed
@@ -317,46 +454,39 @@ public class SequentialWriter extends OutputStream
 
         buffer = null;
 
-        if (skipIOCache && bytesSinceCacheFlush > 0)
-            CLibrary.trySkipCache(fd, 0, 0);
-
-        out.close();
-        CLibrary.tryCloseFD(directoryFD);
+        cleanup(true);
     }
 
-    /**
-     * Turn on digest computation on this writer.
-     * This can only be called before any data is written to this write,
-     * otherwise an IllegalStateException is thrown.
-     */
-    public void setComputeDigest()
+    public void abort()
     {
-        if (current != 0)
-            throw new IllegalStateException();
-
-        try
-        {
-            digest = MessageDigest.getInstance("SHA-1");
-        }
-        catch (NoSuchAlgorithmException e)
-        {
-            // SHA-1 is standard in java 6
-            throw new RuntimeException(e);
-        }
+        cleanup(false);
     }
 
-    /**
-     * Return the digest associated to this file or null if no digest was
-     * created.
-     * This can only be called once the file is fully created, i.e. after
-     * close() has been called. Otherwise an IllegalStateException is thrown.
-     */
-    public byte[] digest()
+    private void cleanup(boolean throwExceptions)
     {
-        if (buffer != null)
-            throw new IllegalStateException();
+        if (directoryFD >= 0)
+        {
+            try { CLibrary.tryCloseFD(directoryFD); }
+            catch (Throwable t) { handle(t, throwExceptions); }
+            directoryFD = -1;
+        }
 
-        return digest == null ? null : digest.digest();
+        // close is idempotent
+        try { out.close(); }
+        catch (Throwable t) { handle(t, throwExceptions); }
+    }
+
+    private void handle(Throwable t, boolean throwExceptions)
+    {
+        if (!throwExceptions)
+            logger.warn("Suppressing exception thrown while aborting writer", t);
+        else
+            throw new FSWriteError(t, getPath());
+    }
+
+    // hack to make life easier for subclasses
+    public void writeFullChecksum(Descriptor descriptor)
+    {
     }
 
     /**

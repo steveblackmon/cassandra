@@ -18,55 +18,43 @@
 package org.apache.cassandra.utils;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.utils.obs.IBitSet;
+import org.apache.cassandra.utils.obs.OffHeapBitSet;
 import org.apache.cassandra.utils.obs.OpenBitSet;
 
-abstract class BloomFilterSerializer implements ISerializer<BloomFilter>
+class BloomFilterSerializer implements ISerializer<BloomFilter>
 {
-    public void serialize(BloomFilter bf, DataOutput dos) throws IOException
+    public void serialize(BloomFilter bf, DataOutputPlus out) throws IOException
     {
-        int bitLength = bf.bitset.getNumWords();
-        int pageSize = bf.bitset.getPageSize();
-        int pageCount = bf.bitset.getPageCount();
-
-        dos.writeInt(bf.getHashCount());
-        dos.writeInt(bitLength);
-
-        for (int p = 0; p < pageCount; p++)
-        {
-            long[] bits = bf.bitset.getPage(p);
-            for (int i = 0; i < pageSize && bitLength-- > 0; i++)
-                dos.writeLong(bits[i]);
-        }
+        out.writeInt(bf.hashCount);
+        bf.bitset.serialize(out);
     }
 
-    public BloomFilter deserialize(DataInput dis) throws IOException
+    public BloomFilter deserialize(DataInput in) throws IOException
     {
-        int hashes = dis.readInt();
-        long bitLength = dis.readInt();
-        OpenBitSet bs = new OpenBitSet(bitLength << 6);
-        int pageSize = bs.getPageSize();
-        int pageCount = bs.getPageCount();
+        return deserialize(in, false);
+    }
 
-        for (int p = 0; p < pageCount; p++)
-        {
-            long[] bits = bs.getPage(p);
-            for (int i = 0; i < pageSize && bitLength-- > 0; i++)
-                bits[i] = dis.readLong();
-        }
-
+    public BloomFilter deserialize(DataInput in, boolean offheap) throws IOException
+    {
+        int hashes = in.readInt();
+        IBitSet bs = offheap ? OffHeapBitSet.deserialize(in) : OpenBitSet.deserialize(in);
         return createFilter(hashes, bs);
     }
 
-    protected abstract BloomFilter createFilter(int hashes, OpenBitSet bs);
+    BloomFilter createFilter(int hashes, IBitSet bs)
+    {
+        return new BloomFilter(hashes, bs);
+    }
 
     /**
      * Calculates a serialized size of the given Bloom Filter
-     * @see BloomFilterSerializer#serialize(BloomFilter, DataOutput)
+     * @see org.apache.cassandra.io.ISerializer#serialize(Object, org.apache.cassandra.io.util.DataOutputPlus)
      *
      * @param bf Bloom filter to calculate serialized size
      *
@@ -74,20 +62,8 @@ abstract class BloomFilterSerializer implements ISerializer<BloomFilter>
      */
     public long serializedSize(BloomFilter bf, TypeSizes typeSizes)
     {
-        int bitLength = bf.bitset.getNumWords();
-        int pageSize = bf.bitset.getPageSize();
-        int pageCount = bf.bitset.getPageCount();
-
-        int size = 0;
-        size += typeSizes.sizeof(bf.getHashCount()); // hash count
-        size += typeSizes.sizeof(bitLength); // length
-
-        for (int p = 0; p < pageCount; p++)
-        {
-            long[] bits = bf.bitset.getPage(p);
-            for (int i = 0; i < pageSize && bitLength-- > 0; i++)
-                size += typeSizes.sizeof(bits[i]); // bucket
-        }
+        int size = typeSizes.sizeof(bf.hashCount); // hash count
+        size += bf.bitset.serializedSize(typeSizes);
         return size;
     }
 }

@@ -25,26 +25,35 @@ import static org.junit.Assert.*;
 
 import org.junit.Test;
 
+import java.lang.RuntimeException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+
 public class ArrivalWindowTest
 {
-
     @Test
-    public void test()
+    public void testWithNanoTime()
     {
-        ArrivalWindow window = new ArrivalWindow(4);
-        //base readings
-        window.add(111);
-        window.add(222);
-        window.add(333);
-        window.add(444);
-        window.add(555);
+        final ArrivalWindow windowWithNano = new ArrivalWindow(4);
+        final long toNano = 1000000L;
+        InetAddress ep;
+        try
+        {
+            ep = InetAddress.getLocalHost();
+        }
+        catch (UnknownHostException e)
+        {
+            throw new RuntimeException(e);
+        }
+        windowWithNano.add(111 * toNano, ep);
+        windowWithNano.add(222 * toNano, ep);
+        windowWithNano.add(333 * toNano, ep);
+        windowWithNano.add(444 * toNano, ep);
+        windowWithNano.add(555 * toNano, ep);
 
         //all good
-        assertEquals(0.4342, window.phi(666), 0.01);
-
+        assertEquals(1.0, windowWithNano.phi(666 * toNano), 0.01);
         //oh noes, a much higher timestamp, something went wrong!
-        assertEquals(9.566, window.phi(3000), 0.01);
+        assertEquals(22.03, windowWithNano.phi(3000 * toNano), 0.01);
     }
-
-
 }

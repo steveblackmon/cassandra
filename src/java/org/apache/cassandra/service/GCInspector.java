@@ -17,132 +17,156 @@
  */
 package org.apache.cassandra.service;
 
-import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryMXBean;
 import java.lang.management.MemoryUsage;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.management.MBeanServer;
+import javax.management.Notification;
+import javax.management.NotificationListener;
 import javax.management.ObjectName;
+import javax.management.openmbean.CompositeData;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
+import com.sun.management.GarbageCollectionNotificationInfo;
 import org.apache.cassandra.io.sstable.SSTableDeletingTask;
 import org.apache.cassandra.utils.StatusLogger;
 
-public class GCInspector
+public class GCInspector implements NotificationListener, GCInspectorMXBean
 {
+    public static final String MBEAN_NAME = "org.apache.cassandra.service:type=GCInspector";
     private static final Logger logger = LoggerFactory.getLogger(GCInspector.class);
-    final static long INTERVAL_IN_MS = 1000;
-    final static long MIN_DURATION = 200;
-    final static long MIN_DURATION_TPSTATS = 1000;
+    final static long MIN_LOG_DURATION = 200;
+    final static long MIN_LOG_DURATION_TPSTATS = 1000;
 
-    public static final GCInspector instance = new GCInspector();
+    static final class State
+    {
+        final double maxRealTimeElapsed;
+        final double totalRealTimeElapsed;
+        final double sumSquaresRealTimeElapsed;
+        final double totalBytesReclaimed;
+        final double count;
+        final long startNanos;
 
-    private final HashMap<String, Long> gctimes = new HashMap<String, Long>();
-    private final HashMap<String, Long> gccounts = new HashMap<String, Long>();
+        State(double extraElapsed, double extraBytes, State prev)
+        {
+            this.totalRealTimeElapsed = prev.totalRealTimeElapsed + extraElapsed;
+            this.totalBytesReclaimed = prev.totalBytesReclaimed + extraBytes;
+            this.sumSquaresRealTimeElapsed = prev.sumSquaresRealTimeElapsed + (extraElapsed * extraElapsed);
+            this.startNanos = prev.startNanos;
+            this.count = prev.count + 1;
+            this.maxRealTimeElapsed = Math.max(prev.maxRealTimeElapsed, extraElapsed);
+        }
 
-    final List<GarbageCollectorMXBean> beans = new ArrayList<GarbageCollectorMXBean>();
-    final MemoryMXBean membean = ManagementFactory.getMemoryMXBean();
+        State()
+        {
+            count = maxRealTimeElapsed = sumSquaresRealTimeElapsed = totalRealTimeElapsed = totalBytesReclaimed = 0;
+            startNanos = System.nanoTime();
+        }
+    }
 
-    private volatile boolean cacheSizesReduced;
+    final AtomicReference<State> state = new AtomicReference<>(new State());
 
     public GCInspector()
     {
-        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+
         try
         {
-            ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
-            for (ObjectName name : server.queryNames(gcName, null))
-            {
-                GarbageCollectorMXBean gc = ManagementFactory.newPlatformMXBeanProxy(server, name.getCanonicalName(), GarbageCollectorMXBean.class);
-                beans.add(gc);
-            }
+            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
         }
         catch (Exception e)
         {
             throw new RuntimeException(e);
         }
+
     }
 
-    public void start()
+    public static void register() throws Exception
     {
-        // don't bother starting a thread that will do nothing.
-        if (beans.size() == 0)
-            return;
-        Runnable t = new Runnable()
+        GCInspector inspector = new GCInspector();
+        MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+        ObjectName gcName = new ObjectName(ManagementFactory.GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + ",*");
+        for (ObjectName name : server.queryNames(gcName, null))
         {
-            public void run()
+            server.addNotificationListener(name, inspector, null, null);
+        }
+    }
+
+    public void handleNotification(Notification notification, Object handback)
+    {
+        String type = notification.getType();
+        if (type.equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION))
+        {
+            // retrieve the garbage collection notification information
+            CompositeData cd = (CompositeData) notification.getUserData();
+            GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(cd);
+
+            long duration = info.getGcInfo().getDuration();
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(info.getGcName()).append(" GC in ").append(duration).append("ms.  ");
+
+            long bytes = 0;
+            List<String> keys = new ArrayList<>(info.getGcInfo().getMemoryUsageBeforeGc().keySet());
+            Collections.sort(keys);
+            for (String key : keys)
             {
-                logGCResults();
+                MemoryUsage before = info.getGcInfo().getMemoryUsageBeforeGc().get(key);
+                MemoryUsage after = info.getGcInfo().getMemoryUsageAfterGc().get(key);
+                if (after != null && after.getUsed() != before.getUsed())
+                {
+                    sb.append(key).append(": ").append(before.getUsed());
+                    sb.append(" -> ");
+                    sb.append(after.getUsed());
+                    if (!key.equals(keys.get(keys.size() - 1)))
+                        sb.append("; ");
+                    bytes += before.getUsed() - after.getUsed();
+                }
             }
-        };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(t, INTERVAL_IN_MS, INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-    }
 
-    private void logGCResults()
-    {
-        for (GarbageCollectorMXBean gc : beans)
-        {
-            Long previousTotal = gctimes.get(gc.getName());
-            Long total = gc.getCollectionTime();
-            if (previousTotal == null)
-                previousTotal = 0L;
-            if (previousTotal.equals(total))
-                continue;
-            gctimes.put(gc.getName(), total);
-            Long duration = total - previousTotal; // may be zero for a really fast collection
+            while (true)
+            {
+                State prev = state.get();
+                if (state.compareAndSet(prev, new State(duration, bytes, prev)))
+                    break;
+            }
 
-            Long previousCount = gccounts.get(gc.getName());
-            Long count = gc.getCollectionCount();
-
-            if (previousCount == null)
-                previousCount = 0L;
-            if (count.equals(previousCount))
-                continue;
-
-            gccounts.put(gc.getName(), count);
-
-            MemoryUsage mu = membean.getHeapMemoryUsage();
-            long memoryUsed = mu.getUsed();
-            long memoryMax = mu.getMax();
-
-            String st = String.format("GC for %s: %s ms for %s collections, %s used; max is %s",
-                                      gc.getName(), duration, count - previousCount, memoryUsed, memoryMax);
-            long durationPerCollection = duration / (count - previousCount);
-            if (durationPerCollection > MIN_DURATION)
+            String st = sb.toString();
+            if (duration > MIN_LOG_DURATION)
                 logger.info(st);
             else if (logger.isDebugEnabled())
                 logger.debug(st);
 
-            if (durationPerCollection > MIN_DURATION_TPSTATS)
+            if (duration > MIN_LOG_DURATION_TPSTATS)
                 StatusLogger.log();
 
             // if we just finished a full collection and we're still using a lot of memory, try to reduce the pressure
-            if (gc.getName().equals("ConcurrentMarkSweep"))
-            {
+            if (info.getGcName().equals("ConcurrentMarkSweep"))
                 SSTableDeletingTask.rescheduleFailedTasks();
-
-                double usage = (double) memoryUsed / memoryMax;
-
-                if (memoryUsed > DatabaseDescriptor.getReduceCacheSizesAt() * memoryMax && !cacheSizesReduced)
-                {
-                    cacheSizesReduced = true;
-                    logger.warn("Heap is " + usage + " full.  You may need to reduce memtable and/or cache sizes.  Cassandra is now reducing cache sizes to free up memory.  Adjust reduce_cache_sizes_at threshold in cassandra.yaml if you don't want Cassandra to do this automatically");
-                    CacheService.instance.reduceCacheSizes();
-                }
-
-                if (memoryUsed > DatabaseDescriptor.getFlushLargestMemtablesAt() * memoryMax)
-                {
-                    logger.warn("Heap is " + usage + " full.  You may need to reduce memtable and/or cache sizes.  Cassandra will now flush up to the two largest memtables to free up memory.  Adjust flush_largest_memtables_at threshold in cassandra.yaml if you don't want Cassandra to do this automatically");
-                    StorageService.instance.flushLargestMemtables();
-                }
-            }
         }
+    }
+
+    public State getTotalSinceLastCheck()
+    {
+        return state.getAndSet(new State());
+    }
+
+    public double[] getAndResetStats()
+    {
+        State state = getTotalSinceLastCheck();
+        double[] r = new double[6];
+        r[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startNanos);
+        r[1] = state.maxRealTimeElapsed;
+        r[2] = state.totalRealTimeElapsed;
+        r[3] = state.sumSquaresRealTimeElapsed;
+        r[4] = state.totalBytesReclaimed;
+        r[5] = state.count;
+        return r;
     }
 }

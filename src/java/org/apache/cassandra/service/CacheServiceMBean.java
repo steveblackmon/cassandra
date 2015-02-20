@@ -21,20 +21,23 @@ import java.util.concurrent.ExecutionException;
 
 public interface CacheServiceMBean
 {
-    public long getKeyCacheHits();
-    public long getRowCacheHits();
-
-    public long getKeyCacheRequests();
-    public long getRowCacheRequests();
-
-    public double getKeyCacheRecentHitRate();
-    public double getRowCacheRecentHitRate();
-
     public int getRowCacheSavePeriodInSeconds();
     public void setRowCacheSavePeriodInSeconds(int rcspis);
 
     public int getKeyCacheSavePeriodInSeconds();
     public void setKeyCacheSavePeriodInSeconds(int kcspis);
+
+    public int getCounterCacheSavePeriodInSeconds();
+    public void setCounterCacheSavePeriodInSeconds(int ccspis);
+
+    public int getRowCacheKeysToSave();
+    public void setRowCacheKeysToSave(int rckts);
+
+    public int getKeyCacheKeysToSave();
+    public void setKeyCacheKeysToSave(int kckts);
+
+    public int getCounterCacheKeysToSave();
+    public void setCounterCacheKeysToSave(int cckts);
 
     /**
      * invalidate the key cache; for use after invalidating row cache
@@ -46,22 +49,13 @@ public interface CacheServiceMBean
      */
     public void invalidateRowCache();
 
-    public int getRowCacheCapacityInMB();
-    public int getRowCacheCapacityInBytes();
-    public void setRowCacheCapacityInMB(int capacity);
+    public void invalidateCounterCache();
 
-    public int getKeyCacheCapacityInMB();
-    public int getKeyCacheCapacityInBytes();
-    public void setKeyCacheCapacityInMB(int capacity);
+    public void setRowCacheCapacityInMB(long capacity);
 
-    public int getRowCacheSize();
+    public void setKeyCacheCapacityInMB(long capacity);
 
-    public int getKeyCacheSize();
-
-    /**
-     * sets each cache's maximum capacity to "reduce_cache_capacity_to" of its current size
-     */
-    public void reduceCacheSizes();
+    public void setCounterCacheCapacityInMB(long capacity);
 
     /**
      * save row and key caches

@@ -23,13 +23,11 @@ import org.apache.cassandra.net.MessageIn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.InetAddress;
-
 public class GossipShutdownVerbHandler implements IVerbHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(GossipShutdownVerbHandler.class);
 
-    public void doVerb(MessageIn message, String id)
+    public void doVerb(MessageIn message, int id)
     {
         if (!Gossiper.instance.isEnabled())
         {
@@ -38,5 +36,5 @@ public class GossipShutdownVerbHandler implements IVerbHandler
         }
         FailureDetector.instance.forceConviction(message.from);
     }
-    
+
 }

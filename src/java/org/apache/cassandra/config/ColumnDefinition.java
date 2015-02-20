@@ -18,77 +18,165 @@
 package org.apache.cassandra.config;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
 import java.util.*;
 
-import com.google.common.collect.Maps;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.Objects;
+import com.google.common.collect.Lists;
 
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.marshal.*;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.ColumnDef;
-import org.apache.cassandra.thrift.IndexType;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.exceptions.*;
 
-import static org.apache.cassandra.utils.FBUtilities.json;
-
-public class ColumnDefinition
+public class ColumnDefinition extends ColumnSpecification
 {
-    public final ByteBuffer name;
-    private AbstractType<?> validator;
-    private IndexType index_type;
-    private Map<String,String> index_options;
-    private String index_name;
+    /*
+     * The type of CQL3 column this definition represents.
+     * There is 3 main type of CQL3 columns: those parts of the partition key,
+     * those parts of the clustering key and the other, regular ones.
+     * But when COMPACT STORAGE is used, there is by design only one regular
+     * column, whose name is not stored in the data contrarily to the column of
+     * type REGULAR. Hence the COMPACT_VALUE type to distinguish it below.
+     *
+     * Note that thrift only knows about definitions of type REGULAR (and
+     * the ones whose componentIndex == null).
+     */
+    public enum Kind
+    {
+        PARTITION_KEY,
+        CLUSTERING_COLUMN,
+        REGULAR,
+        STATIC,
+        COMPACT_VALUE
+    }
+
+    public final Kind kind;
+
+    private String indexName;
+    private IndexType indexType;
+    private Map<String,String> indexOptions;
 
     /*
      * If the column comparator is a composite type, indicates to which
      * component this definition refers to. If null, the definition refers to
      * the full column name.
      */
-    public final Integer componentIndex;
+    private final Integer componentIndex;
 
-    public ColumnDefinition(ByteBuffer name, AbstractType<?> validator, IndexType index_type, Map<String, String> index_options, String index_name, Integer componentIndex)
+    public static ColumnDefinition partitionKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
     {
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.PARTITION_KEY);
+    }
+
+    public static ColumnDefinition partitionKeyDef(String ksName, String cfName, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    {
+        return new ColumnDefinition(ksName, cfName, new ColumnIdentifier(name, UTF8Type.instance), validator, null, null, null, componentIndex, Kind.PARTITION_KEY);
+    }
+
+    public static ColumnDefinition clusteringKeyDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    {
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.CLUSTERING_COLUMN);
+    }
+
+    public static ColumnDefinition regularDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    {
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.REGULAR);
+    }
+
+    public static ColumnDefinition staticDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex)
+    {
+        return new ColumnDefinition(cfm, name, validator, componentIndex, Kind.STATIC);
+    }
+
+    public static ColumnDefinition compactValueDef(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator)
+    {
+        return new ColumnDefinition(cfm, name, validator, null, Kind.COMPACT_VALUE);
+    }
+
+    public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> validator, Integer componentIndex, Kind kind)
+    {
+        this(cfm.ksName,
+             cfm.cfName,
+             new ColumnIdentifier(name, cfm.getComponentComparator(componentIndex, kind)),
+             validator,
+             null,
+             null,
+             null,
+             componentIndex,
+             kind);
+    }
+
+    @VisibleForTesting
+    public ColumnDefinition(String ksName,
+                            String cfName,
+                            ColumnIdentifier name,
+                            AbstractType<?> validator,
+                            IndexType indexType,
+                            Map<String, String> indexOptions,
+                            String indexName,
+                            Integer componentIndex,
+                            Kind kind)
+    {
+        super(ksName, cfName, name, validator);
         assert name != null && validator != null;
-        this.name = name;
-        this.index_name = index_name;
-        this.validator = validator;
+        this.kind = kind;
+        this.indexName = indexName;
         this.componentIndex = componentIndex;
-        this.setIndexType(index_type, index_options);
+        this.setIndexType(indexType, indexOptions);
     }
 
-    public static ColumnDefinition ascii(String name, Integer cidx)
+    public ColumnDefinition copy()
     {
-        return new ColumnDefinition(ByteBufferUtil.bytes(name), AsciiType.instance, null, null, null, cidx);
+        return new ColumnDefinition(ksName, cfName, name, type, indexType, indexOptions, indexName, componentIndex, kind);
     }
 
-    public static ColumnDefinition bool(String name, Integer cidx)
+    public ColumnDefinition withNewName(ColumnIdentifier newName)
     {
-        return new ColumnDefinition(ByteBufferUtil.bytes(name), BooleanType.instance, null, null, null, cidx);
+        return new ColumnDefinition(ksName, cfName, newName, type, indexType, indexOptions, indexName, componentIndex, kind);
     }
 
-    public static ColumnDefinition utf8(String name, Integer cidx)
+    public ColumnDefinition withNewType(AbstractType<?> newType)
     {
-        return new ColumnDefinition(ByteBufferUtil.bytes(name), UTF8Type.instance, null, null, null, cidx);
+        return new ColumnDefinition(ksName, cfName, name, newType, indexType, indexOptions, indexName, componentIndex, kind);
     }
 
-    public static ColumnDefinition int32(String name, Integer cidx)
+    public boolean isOnAllComponents()
     {
-        return new ColumnDefinition(ByteBufferUtil.bytes(name), Int32Type.instance, null, null, null, cidx);
+        return componentIndex == null;
     }
 
-    public static ColumnDefinition double_(String name, Integer cidx)
+    public boolean isPartitionKey()
     {
-        return new ColumnDefinition(ByteBufferUtil.bytes(name), DoubleType.instance, null, null, null, cidx);
+        return kind == Kind.PARTITION_KEY;
     }
 
-    public ColumnDefinition clone()
+    public boolean isClusteringColumn()
     {
-        return new ColumnDefinition(name, validator, index_type, index_options, index_name, componentIndex);
+        return kind == Kind.CLUSTERING_COLUMN;
+    }
+
+    public boolean isStatic()
+    {
+        return kind == Kind.STATIC;
+    }
+
+    public boolean isRegular()
+    {
+        return kind == Kind.REGULAR;
+    }
+
+    public boolean isCompactValue()
+    {
+        return kind == Kind.COMPACT_VALUE;
+    }
+
+    // The componentIndex. This never return null however for convenience sake:
+    // if componentIndex == null, this return 0. So caller should first check
+    // isOnAllComponents() to distinguish if that's a possibility.
+    public int position()
+    {
+        return componentIndex == null ? 0 : componentIndex;
     }
 
     @Override
@@ -96,247 +184,153 @@ public class ColumnDefinition
     {
         if (this == o)
             return true;
-        if (o == null || getClass() != o.getClass())
+
+        if (!(o instanceof ColumnDefinition))
             return false;
 
-        ColumnDefinition that = (ColumnDefinition) o;
-        if (index_name != null ? !index_name.equals(that.index_name) : that.index_name != null)
-            return false;
-        if (index_type != that.index_type)
-            return false;
-        if (index_options != null ? !index_options.equals(that.index_options) : that.index_options != null)
-            return false;
-        if (!name.equals(that.name))
-            return false;
-        if (componentIndex != null ? !componentIndex.equals(that.componentIndex) : that.componentIndex != null)
-            return false;
-        return !(validator != null ? !validator.equals(that.validator) : that.validator != null);
+        ColumnDefinition cd = (ColumnDefinition) o;
+
+        return Objects.equal(ksName, cd.ksName)
+            && Objects.equal(cfName, cd.cfName)
+            && Objects.equal(name, cd.name)
+            && Objects.equal(type, cd.type)
+            && Objects.equal(kind, cd.kind)
+            && Objects.equal(componentIndex, cd.componentIndex)
+            && Objects.equal(indexName, cd.indexName)
+            && Objects.equal(indexType, cd.indexType)
+            && Objects.equal(indexOptions, cd.indexOptions);
     }
 
     @Override
     public int hashCode()
     {
-        int result = name != null ? name.hashCode() : 0;
-        result = 31 * result + (validator != null ? validator.hashCode() : 0);
-        result = 31 * result + (index_type != null ? index_type.hashCode() : 0);
-        result = 31 * result + (index_options != null ? index_options.hashCode() : 0);
-        result = 31 * result + (index_name != null ? index_name.hashCode() : 0);
-        result = 31 * result + (componentIndex != null ? componentIndex.hashCode() : 0);
-        return result;
+        return Objects.hashCode(ksName, cfName, name, type, kind, componentIndex, indexName, indexType, indexOptions);
     }
 
-    public ColumnDef toThrift()
+    @Override
+    public String toString()
     {
-        ColumnDef cd = new ColumnDef();
-
-        cd.setName(ByteBufferUtil.clone(name));
-        cd.setValidation_class(validator.toString());
-
-        cd.setIndex_type(index_type == null
-                            ? null
-                            : IndexType.valueOf(index_type.name()));
-        cd.setIndex_name(index_name == null ? null : index_name);
-        cd.setIndex_options(index_options == null ? null : Maps.newHashMap(index_options));
-
-        return cd;
+        return Objects.toStringHelper(this)
+                      .add("name", name)
+                      .add("type", type)
+                      .add("kind", kind)
+                      .add("componentIndex", componentIndex)
+                      .add("indexName", indexName)
+                      .add("indexType", indexType)
+                      .toString();
     }
 
-    public static ColumnDefinition fromThrift(ColumnDef thriftColumnDef) throws ConfigurationException
+    public boolean isThriftCompatible()
     {
-        return new ColumnDefinition(ByteBufferUtil.clone(thriftColumnDef.name),
-                                    TypeParser.parse(thriftColumnDef.validation_class),
-                                    thriftColumnDef.index_type,
-                                    thriftColumnDef.index_options,
-                                    thriftColumnDef.index_name,
-                                    null);
+        return kind == ColumnDefinition.Kind.REGULAR && componentIndex == null;
     }
 
-    public static Map<ByteBuffer, ColumnDefinition> fromThrift(List<ColumnDef> thriftDefs) throws ConfigurationException
+    public boolean isPrimaryKeyColumn()
     {
-        if (thriftDefs == null)
-            return new HashMap<ByteBuffer,ColumnDefinition>();
-
-        Map<ByteBuffer, ColumnDefinition> cds = new TreeMap<ByteBuffer, ColumnDefinition>();
-        for (ColumnDef thriftColumnDef : thriftDefs)
-            cds.put(ByteBufferUtil.clone(thriftColumnDef.name), fromThrift(thriftColumnDef));
-
-        return cds;
+        return kind == Kind.PARTITION_KEY || kind == Kind.CLUSTERING_COLUMN;
     }
 
     /**
-     * Drop specified column from the schema using given row.
-     *
-     * @param rm         The schema row mutation
-     * @param cfName     The name of the parent ColumnFamily
-     * @param timestamp  The timestamp to use for column modification
+     * Whether the name of this definition is serialized in the cell nane, i.e. whether
+     * it's not just a non-stored CQL metadata.
      */
-    public void deleteFromSchema(RowMutation rm, String cfName, AbstractType<?> comparator, long timestamp)
+    public boolean isPartOfCellName()
     {
-        ColumnFamily cf = rm.addOrGet(SystemTable.SCHEMA_COLUMNS_CF);
-        int ldt = (int) (System.currentTimeMillis() / 1000);
-
-        cf.addColumn(DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "validator"));
-        cf.addColumn(DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_type"));
-        cf.addColumn(DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_options"));
-        cf.addColumn(DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_name"));
+        return kind == Kind.REGULAR || kind == Kind.STATIC;
     }
 
-    public void toSchema(RowMutation rm, String cfName, AbstractType<?> comparator, long timestamp)
+    public ColumnDefinition apply(ColumnDefinition def)  throws ConfigurationException
     {
-        ColumnFamily cf = rm.addOrGet(SystemTable.SCHEMA_COLUMNS_CF);
-        int ldt = (int) (System.currentTimeMillis() / 1000);
+        assert kind == def.kind && Objects.equal(componentIndex, def.componentIndex);
 
-        cf.addColumn(Column.create(validator.toString(), timestamp, cfName, comparator.getString(name), "validator"));
-        cf.addColumn(index_type == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_type")
-                                        : Column.create(index_type.toString(), timestamp, cfName, comparator.getString(name), "index_type"));
-        cf.addColumn(index_options == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_options")
-                                           : Column.create(json(index_options), timestamp, cfName, comparator.getString(name), "index_options"));
-        cf.addColumn(index_name == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "index_name")
-                                        : Column.create(index_name, timestamp, cfName, comparator.getString(name), "index_name"));
-        cf.addColumn(componentIndex == null ? DeletedColumn.create(ldt, timestamp, cfName, comparator.getString(name), "component_index")
-                                            : Column.create(componentIndex, timestamp, cfName, comparator.getString(name), "component_index"));
-    }
-
-    public void apply(ColumnDefinition def, AbstractType<?> comparator)  throws ConfigurationException
-    {
         if (getIndexType() != null && def.getIndexType() != null)
         {
             // If an index is set (and not drop by this update), the validator shouldn't be change to a non-compatible one
-            if (!def.getValidator().isCompatibleWith(getValidator()))
-                throw new ConfigurationException(String.format("Cannot modify validator to a non-compatible one for column %s since an index is set", comparator.getString(name)));
+            // (and we want true comparator compatibility, not just value one, since the validator is used by LocalPartitioner to order index rows)
+            if (!def.type.isCompatibleWith(type))
+                throw new ConfigurationException(String.format("Cannot modify validator to a non-order-compatible one for column %s since an index is set", name));
 
             assert getIndexName() != null;
             if (!getIndexName().equals(def.getIndexName()))
                 throw new ConfigurationException("Cannot modify index name");
         }
 
-        if ((componentIndex != null && !componentIndex.equals(def.componentIndex))
-         || (componentIndex == null && def.componentIndex != null))
-            throw new ConfigurationException(String.format("Cannot modify component index for column %s", comparator.getString(name)));
-
-        setValidator(def.getValidator());
-        setIndexType(def.getIndexType(), def.getIndexOptions());
-        setIndexName(def.getIndexName());
-    }
-
-    /**
-     * Deserialize columns from low-level representation
-     *
-     * @return Thrift-based deserialized representation of the column
-     * @param row
-     */
-    public static List<ColumnDefinition> fromSchema(Row row, CFMetaData cfm)
-    {
-        if (row.cf == null)
-            return Collections.emptyList();
-
-        List<ColumnDefinition> cds = new ArrayList<ColumnDefinition>();
-        for (UntypedResultSet.Row result : QueryProcessor.resultify("SELECT * FROM system.schema_columns", row))
-        {
-            try
-            {
-                IndexType index_type = null;
-                Map<String,String> index_options = null;
-                String index_name = null;
-                Integer componentIndex = null;
-
-                if (result.has("index_type"))
-                    index_type = IndexType.valueOf(result.getString("index_type"));
-                if (result.has("index_options"))
-                    index_options = FBUtilities.fromJsonMap(result.getString("index_options"));
-                if (result.has("index_name"))
-                    index_name = result.getString("index_name");
-                if (result.has("component_index"))
-                    componentIndex = result.getInt("component_index");
-
-                cds.add(new ColumnDefinition(cfm.getColumnDefinitionComparator(componentIndex).fromString(result.getString("column")),
-                                             TypeParser.parse(result.getString("validator")),
-                                             index_type,
-                                             index_options,
-                                             index_name,
-                                             componentIndex));
-            }
-            catch (ConfigurationException e)
-            {
-                throw new RuntimeException(e);
-            }
-        }
-
-        return cds;
-    }
-
-    public static Row readSchema(String ksName, String cfName)
-    {
-        DecoratedKey key = StorageService.getPartitioner().decorateKey(SystemTable.getSchemaKSKey(ksName));
-        ColumnFamilyStore columnsStore = SystemTable.schemaCFS(SystemTable.SCHEMA_COLUMNS_CF);
-        ColumnFamily cf = columnsStore.getColumnFamily(key,
-                                                       new QueryPath(SystemTable.SCHEMA_COLUMNS_CF),
-                                                       DefsTable.searchComposite(cfName, true),
-                                                       DefsTable.searchComposite(cfName, false),
-                                                       false,
-                                                       Integer.MAX_VALUE);
-        return new Row(key, cf);
-    }
-
-    @Override
-    public String toString()
-    {
-        return "ColumnDefinition{" +
-               "name=" + ByteBufferUtil.bytesToHex(name) +
-               ", validator=" + validator +
-               ", index_type=" + index_type +
-               ", index_name='" + index_name + '\'' +
-               (componentIndex != null ? ", component_index=" + componentIndex : "") +
-               '}';
+        return new ColumnDefinition(ksName,
+                                    cfName,
+                                    name,
+                                    def.type,
+                                    def.getIndexType(),
+                                    def.getIndexOptions(),
+                                    def.getIndexName(),
+                                    componentIndex,
+                                    kind);
     }
 
     public String getIndexName()
     {
-        return index_name;
+        return indexName;
     }
 
-    public void setIndexName(String s)
+    public ColumnDefinition setIndexName(String indexName)
     {
-        index_name = s;
+        this.indexName = indexName;
+        return this;
     }
 
-    public void setIndexType(IndexType index_type, Map<String,String> index_options)
+    public ColumnDefinition setIndexType(IndexType indexType, Map<String,String> indexOptions)
     {
-        this.index_type = index_type;
-        this.index_options = index_options;
+        this.indexType = indexType;
+        this.indexOptions = indexOptions;
+        return this;
+    }
+
+    public ColumnDefinition setIndex(String indexName, IndexType indexType, Map<String,String> indexOptions)
+    {
+        return setIndexName(indexName).setIndexType(indexType, indexOptions);
+    }
+
+    public boolean isIndexed()
+    {
+        return indexType != null;
     }
 
     public IndexType getIndexType()
     {
-        return index_type;
+        return indexType;
     }
 
     public Map<String,String> getIndexOptions()
     {
-        return index_options;
+        return indexOptions;
     }
 
-    public AbstractType<?> getValidator()
+    /**
+     * Checks if the index option with the specified name has been specified.
+     *
+     * @param name index option name
+     * @return <code>true</code> if the index option with the specified name has been specified, <code>false</code>
+     * otherwise.
+     */
+    public boolean hasIndexOption(String name)
     {
-        return validator;
+        return indexOptions.containsKey(name);
     }
 
-    public void setValidator(AbstractType<?> validator)
+    /**
+     * Converts the specified column definitions into column identifiers.
+     *
+     * @param definitions the column definitions to convert.
+     * @return the column identifiers corresponding to the specified definitions
+     */
+    public static List<ColumnIdentifier> toIdentifiers(List<ColumnDefinition> definitions)
     {
-        this.validator = validator;
-    }
-
-    public static Map<String,String> getStringMap(Map<CharSequence, CharSequence> charMap)
-    {
-        if (charMap == null)
-            return null;
-
-        Map<String,String> stringMap = new HashMap<String, String>();
-
-        for (Map.Entry<CharSequence, CharSequence> entry : charMap.entrySet())
-            stringMap.put(entry.getKey().toString(), entry.getValue().toString());
-
-
-        return stringMap;
+        return Lists.transform(definitions, new Function<ColumnDefinition, ColumnIdentifier>()
+        {
+            @Override
+            public ColumnIdentifier apply(ColumnDefinition columnDef)
+            {
+                return columnDef.name;
+            }
+        });
     }
 }

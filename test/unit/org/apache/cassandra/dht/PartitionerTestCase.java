@@ -19,14 +19,18 @@
 package org.apache.cassandra.dht;
 
 import java.nio.ByteBuffer;
-import java.util.Random;
+import java.util.*;
 
+import org.apache.cassandra.service.StorageService;
 import org.junit.Before;
 import org.junit.Test;
 
-public abstract class PartitionerTestCase<T extends Token>
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
+
+public abstract class PartitionerTestCase
 {
-    protected IPartitioner<T> partitioner;
+    protected IPartitioner partitioner;
 
     public abstract void initPartitioner();
 
@@ -36,12 +40,12 @@ public abstract class PartitionerTestCase<T extends Token>
         initPartitioner();
     }
 
-    public T tok(byte[] key)
+    public Token tok(byte[] key)
     {
         return partitioner.getToken(ByteBuffer.wrap(key));
     }
 
-    public T tok(String key)
+    public Token tok(String key)
     {
         return tok(key.getBytes());
     }
@@ -49,7 +53,7 @@ public abstract class PartitionerTestCase<T extends Token>
     /**
      * Recurses randomly to the given depth a few times.
      */
-    public void assertMidpoint(T left, T right, int depth)
+    public void assertMidpoint(Token left, Token right, int depth)
     {
         Random rand = new Random();
         for (int i = 0; i < 1000; i++)
@@ -82,7 +86,12 @@ public abstract class PartitionerTestCase<T extends Token>
     @Test
     public void testMidpointMinimum()
     {
-        T mintoken = partitioner.getMinimumToken();
+        midpointMinimumTestCase();
+    }
+
+    protected void midpointMinimumTestCase()
+    {
+        Token mintoken = partitioner.getMinimumToken();
         assert mintoken.compareTo(partitioner.midpoint(mintoken, mintoken)) != 0;
         assertMidpoint(mintoken, tok("a"), 16);
         assertMidpoint(mintoken, tok("aaa"), 16);
@@ -109,5 +118,44 @@ public abstract class PartitionerTestCase<T extends Token>
     {
         Token.TokenFactory factory = partitioner.getTokenFactory();
         assert tok("a").compareTo(factory.fromString(factory.toString(tok("a")))) == 0;
+    }
+
+    @Test
+    public void testDescribeOwnership()
+    {
+        // This call initializes StorageService, needed to populate the keyspaces.
+        // TODO: This points to potential problems in the initialization sequence. Should be solved by CASSANDRA-7837.
+        StorageService.getPartitioner();
+
+        try
+        {
+            testDescribeOwnershipWith(0);
+            fail();
+        }
+        catch (RuntimeException e)
+        {
+            // success
+        }
+        testDescribeOwnershipWith(1);
+        testDescribeOwnershipWith(2);
+        testDescribeOwnershipWith(256);
+    }
+
+    private void testDescribeOwnershipWith(int numTokens)
+    {
+        List<Token> tokens = new ArrayList<Token>();
+        while (tokens.size() < numTokens)
+        {
+            Token randomToken = partitioner.getRandomToken();
+            if (!tokens.contains(randomToken))
+                tokens.add(randomToken);
+        }
+        Collections.sort(tokens);
+        Map<Token, Float> owns = partitioner.describeOwnership(tokens);
+
+        float totalOwnership = 0;
+        for (float ownership : owns.values())
+            totalOwnership += ownership;
+        assertEquals(1.0, totalOwnership, 0.001);
     }
 }

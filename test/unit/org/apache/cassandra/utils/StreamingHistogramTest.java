@@ -17,16 +17,15 @@
  */
 package org.apache.cassandra.utils;
 
-import com.google.common.io.ByteArrayDataOutput;
 import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.util.*;
 
-import static junit.framework.Assert.assertEquals;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+
+import static org.junit.Assert.assertEquals;
 
 public class StreamingHistogramTest
 {
@@ -98,8 +97,8 @@ public class StreamingHistogramTest
             hist.update(samples[i]);
         }
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        StreamingHistogram.serializer.serialize(hist, new DataOutputStream(out));
+        DataOutputBuffer out = new DataOutputBuffer();
+        StreamingHistogram.serializer.serialize(hist, out);
         byte[] bytes = out.toByteArray();
 
         StreamingHistogram deserialized = StreamingHistogram.serializer.deserialize(new DataInputStream(new ByteArrayInputStream(bytes)));

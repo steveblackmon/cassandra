@@ -17,22 +17,21 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.io.DataOutput;
+import java.io.Closeable;
 import java.io.IOException;
-import java.util.List;
 import java.security.MessageDigest;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.io.sstable.ColumnStats;
-import org.apache.cassandra.db.DeletionInfo;
-import org.apache.cassandra.db.ColumnIndex;
+import org.apache.cassandra.io.util.SequentialWriter;
 
 /**
  * a CompactedRow is an object that takes a bunch of rows (keys + columnfamilies)
  * and can write a compacted version of those rows to an output stream.  It does
  * NOT necessarily require creating a merged CF object in memory.
  */
-public abstract class AbstractCompactedRow
+public abstract class AbstractCompactedRow implements Closeable
 {
     public final DecoratedKey key;
 
@@ -43,12 +42,12 @@ public abstract class AbstractCompactedRow
 
     /**
      * write the row (size + column index + filter + column data, but NOT row key) to @param out.
-     * It is an error to call this if isEmpty is false.  (Because the key is appended first,
-     * so we'd have an incomplete row written.)
      *
      * write() may change internal state; it is NOT valid to call write() or update() a second time.
+     *
+     * @return index information for the written row, or null if the compaction resulted in only expired tombstones.
      */
-    public abstract long write(DataOutput out) throws IOException;
+    public abstract RowIndexEntry write(long currentPosition, SequentialWriter out) throws IOException;
 
     /**
      * update @param digest with the data bytes of the row (not including row key or row size).
@@ -59,23 +58,8 @@ public abstract class AbstractCompactedRow
     public abstract void update(MessageDigest digest);
 
     /**
-     * @return true if there are no columns in the row AND there are no row-level tombstones to be preserved
-     */
-    public abstract boolean isEmpty();
-
-    /**
      * @return aggregate information about the columns in this row.  Some fields may
      * contain default values if computing them value would require extra effort we're not willing to make.
      */
     public abstract ColumnStats columnStats();
-
-    /**
-     * @return the compacted row deletion infos.
-     */
-    public abstract DeletionInfo deletionInfo();
-
-    /**
-     * @return the column index for this row.
-     */
-    public abstract ColumnIndex index();
 }

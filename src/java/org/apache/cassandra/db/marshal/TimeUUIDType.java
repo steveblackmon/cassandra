@@ -18,17 +18,14 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.text.ParseException;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
-import org.apache.cassandra.cql.jdbc.JdbcTimeUUID;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TimeUUIDSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
-import org.apache.commons.lang.time.DateUtils;
-
-import static org.apache.cassandra.cql.jdbc.JdbcDate.iso8601Patterns;
 
 public class TimeUUIDType extends AbstractType<UUID>
 {
@@ -36,28 +33,15 @@ public class TimeUUIDType extends AbstractType<UUID>
 
     static final Pattern regexPattern = Pattern.compile("[A-Fa-f0-9]{8}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{4}\\-[A-Fa-f0-9]{12}");
 
-    TimeUUIDType() {} // singleton
-
-    public UUID compose(ByteBuffer bytes)
+    TimeUUIDType()
     {
-        return JdbcTimeUUID.instance.compose(bytes);
-    }
-
-    public ByteBuffer decompose(UUID value)
-    {
-        return JdbcTimeUUID.instance.decompose(value);
-    }
+    } // singleton
 
     public int compare(ByteBuffer o1, ByteBuffer o2)
     {
-        if (o1.remaining() == 0)
-        {
-            return o2.remaining() == 0 ? 0 : -1;
-        }
-        if (o2.remaining() == 0)
-        {
-            return 1;
-        }
+        if (!o1.hasRemaining() || !o2.hasRemaining())
+            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
+
         int res = compareTimestampBytes(o1, o2);
         if (res != 0)
             return res;
@@ -69,40 +53,28 @@ public class TimeUUIDType extends AbstractType<UUID>
         int o1Pos = o1.position();
         int o2Pos = o2.position();
 
-        int d = (o1.get(o1Pos+6) & 0xF) - (o2.get(o2Pos+6) & 0xF);
+        int d = (o1.get(o1Pos + 6) & 0xF) - (o2.get(o2Pos + 6) & 0xF);
         if (d != 0) return d;
 
-        d = (o1.get(o1Pos+7) & 0xFF) - (o2.get(o2Pos+7) & 0xFF);
+        d = (o1.get(o1Pos + 7) & 0xFF) - (o2.get(o2Pos + 7) & 0xFF);
         if (d != 0) return d;
 
-        d = (o1.get(o1Pos+4) & 0xFF) - (o2.get(o2Pos+4) & 0xFF);
+        d = (o1.get(o1Pos + 4) & 0xFF) - (o2.get(o2Pos + 4) & 0xFF);
         if (d != 0) return d;
 
-        d = (o1.get(o1Pos+5) & 0xFF) - (o2.get(o2Pos+5) & 0xFF);
+        d = (o1.get(o1Pos + 5) & 0xFF) - (o2.get(o2Pos + 5) & 0xFF);
         if (d != 0) return d;
 
         d = (o1.get(o1Pos) & 0xFF) - (o2.get(o2Pos) & 0xFF);
         if (d != 0) return d;
 
-        d = (o1.get(o1Pos+1) & 0xFF) - (o2.get(o2Pos+1) & 0xFF);
+        d = (o1.get(o1Pos + 1) & 0xFF) - (o2.get(o2Pos + 1) & 0xFF);
         if (d != 0) return d;
 
-        d = (o1.get(o1Pos+2) & 0xFF) - (o2.get(o2Pos+2) & 0xFF);
+        d = (o1.get(o1Pos + 2) & 0xFF) - (o2.get(o2Pos + 2) & 0xFF);
         if (d != 0) return d;
 
-        return (o1.get(o1Pos+3) & 0xFF) - (o2.get(o2Pos+3) & 0xFF);
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        try
-        {
-            return JdbcTimeUUID.instance.getString(bytes);
-        }
-        catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-        {
-            throw new MarshalException(e.getMessage());
-        }
+        return (o1.get(o1Pos + 3) & 0xFF) - (o2.get(o2Pos + 3) & 0xFF);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -124,31 +96,25 @@ public class TimeUUIDType extends AbstractType<UUID>
             }
             catch (IllegalArgumentException e)
             {
-                throw new MarshalException(String.format("unable to make UUID from '%s'", source), e);
+                throw new MarshalException(String.format("Unable to make UUID from '%s'", source), e);
             }
 
             if (uuid.version() != 1)
                 throw new MarshalException("TimeUUID supports only version 1 UUIDs");
-        }
-        else
+        } else
         {
-            idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(DateType.dateStringToTimestamp(source)));
+            throw new MarshalException(String.format("Unknown timeuuid representation: %s", source));
         }
-
         return idBytes;
     }
 
-    public void validate(ByteBuffer bytes) throws MarshalException
+    public CQL3Type asCQL3Type()
     {
-        if (bytes.remaining() != 16 && bytes.remaining() != 0)
-            throw new MarshalException(String.format("TimeUUID should be 16 or 0 bytes (%d)", bytes.remaining()));
-        ByteBuffer slice = bytes.slice();
-        // version is bits 4-7 of byte 6.
-        if (bytes.remaining() > 0)
-        {
-            slice.position(6);
-            if ((slice.get() & 0xf0) != 0x10)
-                throw new MarshalException("Invalid version for TimeUUID type.");
-        }
+        return CQL3Type.Native.TIMEUUID;
+    }
+
+    public TypeSerializer<UUID> getSerializer()
+    {
+        return TimeUUIDSerializer.instance;
     }
 }

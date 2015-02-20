@@ -17,18 +17,15 @@
  */
 package org.apache.cassandra.db.marshal;
 
-
 import java.nio.ByteBuffer;
-import java.text.ParseException;
 import java.util.UUID;
 
-import org.apache.cassandra.cql.jdbc.JdbcUUID;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.UUIDSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
-import org.apache.commons.lang.time.DateUtils;
-
-import static org.apache.cassandra.cql.jdbc.JdbcDate.iso8601Patterns;
 
 /**
  * Compares UUIDs using the following criteria:<br>
@@ -156,37 +153,6 @@ public class UUIDType extends AbstractType<UUID>
         return (o1.get(o1Pos + 3) & 0xFF) - (o2.get(o2Pos + 3) & 0xFF);
     }
 
-    public UUID compose(ByteBuffer bytes)
-    {
-
-        return JdbcUUID.instance.compose(bytes);
-    }
-
-    public void validate(ByteBuffer bytes)
-    {
-        if ((bytes.remaining() != 0) && (bytes.remaining() != 16))
-        {
-            throw new MarshalException("UUIDs must be exactly 16 bytes");
-        }
-    }
-
-    public String getString(ByteBuffer bytes)
-    {
-        try
-        {
-            return JdbcUUID.instance.getString(bytes);
-        }
-        catch (org.apache.cassandra.cql.jdbc.MarshalException e)
-        {
-            throw new MarshalException(e.getMessage());
-        }
-    }
-
-    public ByteBuffer decompose(UUID value)
-    {
-        return JdbcUUID.instance.decompose(value);
-    }
-
     @Override
     public ByteBuffer fromString(String source) throws MarshalException
     {
@@ -194,52 +160,36 @@ public class UUIDType extends AbstractType<UUID>
         if (source.isEmpty())
             return ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
-        ByteBuffer idBytes = null;
-
         // ffffffff-ffff-ffff-ffff-ffffffffff
         if (TimeUUIDType.regexPattern.matcher(source).matches())
         {
-            UUID uuid;
             try
             {
-                uuid = UUID.fromString(source);
-                idBytes = ByteBuffer.wrap(UUIDGen.decompose(uuid));
+                return ByteBuffer.wrap(UUIDGen.decompose(UUID.fromString(source)));
             }
             catch (IllegalArgumentException e)
             {
                 throw new MarshalException(String.format("unable to make UUID from '%s'", source), e);
             }
         }
-        else if (source.toLowerCase().equals("now"))
-        {
-            idBytes = ByteBuffer.wrap(UUIDGen.decompose(UUIDGen.makeType1UUIDFromHost(FBUtilities.getBroadcastAddress())));
-        }
-        // Milliseconds since epoch?
-        else if (source.matches("^\\d+$"))
-        {
-            try
-            {
-                idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(Long.parseLong(source)));
-            }
-            catch (NumberFormatException e)
-            {
-                throw new MarshalException(String.format("unable to make version 1 UUID from '%s'", source), e);
-            }
-        }
-        // Last chance, attempt to parse as date-time string
-        else
-        {
-            try
-            {
-                long timestamp = DateUtils.parseDate(source, iso8601Patterns).getTime();
-                idBytes = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes(timestamp));
-            }
-            catch (ParseException e1)
-            {
-                throw new MarshalException(String.format("unable to coerce '%s' to version 1 UUID", source), e1);
-            }
-        }
 
-        return idBytes;
+        throw new MarshalException(String.format("unable to coerce '%s' to version 1 UUID", source));
     }
+
+    @Override
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return this == otherType || otherType == TimeUUIDType.instance;
+    }
+
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.UUID;
+    }
+
+    public TypeSerializer<UUID> getSerializer()
+    {
+        return UUIDSerializer.instance;
+    }
+
 }

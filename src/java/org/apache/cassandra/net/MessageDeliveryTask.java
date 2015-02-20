@@ -17,31 +17,35 @@
  */
 package org.apache.cassandra.net;
 
+import java.util.EnumSet;
+
+import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.gms.Gossiper;
 
 public class MessageDeliveryTask implements Runnable
 {
     private static final Logger logger = LoggerFactory.getLogger(MessageDeliveryTask.class);
 
     private final MessageIn message;
-    private final long constructionTime = System.currentTimeMillis();
-    private final String id;
+    private final long constructionTime;
+    private final int id;
 
-    public MessageDeliveryTask(MessageIn message, String id)
+    public MessageDeliveryTask(MessageIn message, int id, long timestamp)
     {
         assert message != null;
         this.message = message;
         this.id = id;
+        constructionTime = timestamp;
     }
 
     public void run()
     {
         MessagingService.Verb verb = message.verb;
         if (MessagingService.DROPPABLE_VERBS.contains(verb)
-            && System.currentTimeMillis() > constructionTime + DatabaseDescriptor.getRpcTimeout())
+            && System.currentTimeMillis() > constructionTime + message.getTimeout())
         {
             MessagingService.instance().incrementDroppedMessages(verb);
             return;
@@ -54,6 +58,29 @@ public class MessageDeliveryTask implements Runnable
             return;
         }
 
-        verbHandler.doVerb(message, id);
+        try
+        {
+            verbHandler.doVerb(message, id);
+        }
+        catch (Throwable t)
+        {
+            if (message.doCallbackOnFailure())
+            {
+                MessageOut response = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE)
+                                                    .withParameter(MessagingService.FAILURE_RESPONSE_PARAM, MessagingService.ONE_BYTE);
+                MessagingService.instance().sendReply(response, id, message.from);
+            }
+
+            if (t instanceof TombstoneOverwhelmingException)
+                logger.error(t.getMessage());
+            else
+                throw t;
+        }
+        if (GOSSIP_VERBS.contains(message.verb))
+            Gossiper.instance.setLastProcessedMessageAt(constructionTime);
     }
+
+    EnumSet<MessagingService.Verb> GOSSIP_VERBS = EnumSet.of(MessagingService.Verb.GOSSIP_DIGEST_ACK,
+                                                             MessagingService.Verb.GOSSIP_DIGEST_ACK2,
+                                                             MessagingService.Verb.GOSSIP_DIGEST_SYN);
 }

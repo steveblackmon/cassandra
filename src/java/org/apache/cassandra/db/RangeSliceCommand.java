@@ -15,267 +15,225 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.google.common.base.Objects;
+
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.filter.ExtendedFilter;
+import org.apache.cassandra.db.filter.IDiskAtomFilter;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.service.IReadCommand;
-import org.apache.cassandra.thrift.ColumnParent;
-import org.apache.cassandra.thrift.IndexExpression;
-import org.apache.cassandra.thrift.SlicePredicate;
-import org.apache.cassandra.thrift.TBinaryProtocol;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
-import org.apache.thrift.TDeserializer;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
+import org.apache.cassandra.service.pager.Pageable;
 
-public class RangeSliceCommand implements IReadCommand
+public class RangeSliceCommand extends AbstractRangeCommand implements Pageable
 {
     public static final RangeSliceCommandSerializer serializer = new RangeSliceCommandSerializer();
 
-    public final String keyspace;
-
-    public final String column_family;
-    public final ByteBuffer super_column;
-
-    public final SlicePredicate predicate;
-    public final List<IndexExpression> row_filter;
-
-    public final AbstractBounds<RowPosition> range;
     public final int maxResults;
-    public final boolean maxIsColumns;
+    public final boolean countCQL3Rows;
     public final boolean isPaging;
 
-    public RangeSliceCommand(String keyspace, String column_family, ByteBuffer super_column, SlicePredicate predicate, AbstractBounds<RowPosition> range, int maxResults)
+    public RangeSliceCommand(String keyspace,
+                             String columnFamily,
+                             long timestamp,
+                             IDiskAtomFilter predicate,
+                             AbstractBounds<RowPosition> range,
+                             int maxResults)
     {
-        this(keyspace, column_family, super_column, predicate, range, null, maxResults, false, false);
+        this(keyspace, columnFamily, timestamp, predicate, range, null, maxResults, false, false);
     }
 
-    public RangeSliceCommand(String keyspace, String column_family, ByteBuffer super_column, SlicePredicate predicate, AbstractBounds<RowPosition> range, int maxResults, boolean maxIsColumns, boolean isPaging)
+    public RangeSliceCommand(String keyspace,
+                             String columnFamily,
+                             long timestamp,
+                             IDiskAtomFilter predicate,
+                             AbstractBounds<RowPosition> range,
+                             List<IndexExpression> row_filter,
+                             int maxResults)
     {
-        this(keyspace, column_family, super_column, predicate, range, null, maxResults, maxIsColumns, false);
+        this(keyspace, columnFamily, timestamp, predicate, range, row_filter, maxResults, false, false);
     }
 
-    public RangeSliceCommand(String keyspace, ColumnParent column_parent, SlicePredicate predicate, AbstractBounds<RowPosition> range, List<IndexExpression> row_filter, int maxResults)
+    public RangeSliceCommand(String keyspace,
+                             String columnFamily,
+                             long timestamp,
+                             IDiskAtomFilter predicate,
+                             AbstractBounds<RowPosition> range,
+                             List<IndexExpression> rowFilter,
+                             int maxResults,
+                             boolean countCQL3Rows,
+                             boolean isPaging)
     {
-        this(keyspace, column_parent.getColumn_family(), column_parent.super_column, predicate, range, row_filter, maxResults, false, false);
-    }
-
-    public RangeSliceCommand(String keyspace, ColumnParent column_parent, SlicePredicate predicate, AbstractBounds<RowPosition> range, List<IndexExpression> row_filter, int maxResults, boolean maxIsColumns, boolean isPaging)
-    {
-        this(keyspace, column_parent.getColumn_family(), column_parent.super_column, predicate, range, row_filter, maxResults, maxIsColumns, isPaging);
-    }
-
-    public RangeSliceCommand(String keyspace, String column_family, ByteBuffer super_column, SlicePredicate predicate, AbstractBounds<RowPosition> range, List<IndexExpression> row_filter, int maxResults)
-    {
-        this(keyspace, column_family, super_column, predicate, range, row_filter, maxResults, false, false);
-    }
-
-    public RangeSliceCommand(String keyspace, String column_family, ByteBuffer super_column, SlicePredicate predicate, AbstractBounds<RowPosition> range, List<IndexExpression> row_filter, int maxResults, boolean maxIsColumns, boolean isPaging)
-    {
-        this.keyspace = keyspace;
-        this.column_family = column_family;
-        this.super_column = super_column;
-        this.predicate = predicate;
-        this.range = range;
-        this.row_filter = row_filter;
+        super(keyspace, columnFamily, timestamp, range, predicate, rowFilter);
         this.maxResults = maxResults;
-        this.maxIsColumns = maxIsColumns;
+        this.countCQL3Rows = countCQL3Rows;
         this.isPaging = isPaging;
     }
 
     public MessageOut<RangeSliceCommand> createMessage()
     {
-        return new MessageOut<RangeSliceCommand>(MessagingService.Verb.RANGE_SLICE, this, serializer);
+        return new MessageOut<>(MessagingService.Verb.RANGE_SLICE, this, serializer);
+    }
+
+    public AbstractRangeCommand forSubRange(AbstractBounds<RowPosition> subRange)
+    {
+        return new RangeSliceCommand(keyspace,
+                                     columnFamily,
+                                     timestamp,
+                                     predicate,
+                                     subRange,
+                                     rowFilter,
+                                     maxResults,
+                                     countCQL3Rows,
+                                     isPaging);
+    }
+
+    public AbstractRangeCommand withUpdatedLimit(int newLimit)
+    {
+        return new RangeSliceCommand(keyspace,
+                                     columnFamily,
+                                     timestamp,
+                                     predicate,
+                                     keyRange,
+                                     rowFilter,
+                                     newLimit,
+                                     countCQL3Rows,
+                                     isPaging);
+    }
+
+    public int limit()
+    {
+        return maxResults;
+    }
+
+    public boolean countCQL3Rows()
+    {
+        return countCQL3Rows;
+    }
+
+    public List<Row> executeLocally()
+    {
+        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(columnFamily);
+
+        ExtendedFilter exFilter = cfs.makeExtendedFilter(keyRange, predicate, rowFilter, maxResults, countCQL3Rows, isPaging, timestamp);
+        if (cfs.indexManager.hasIndexFor(rowFilter))
+            return cfs.search(exFilter);
+        else
+            return cfs.getRangeSlice(exFilter);
     }
 
     @Override
     public String toString()
     {
-        return "RangeSliceCommand{" +
-               "keyspace='" + keyspace + '\'' +
-               ", column_family='" + column_family + '\'' +
-               ", super_column=" + super_column +
-               ", predicate=" + predicate +
-               ", range=" + range +
-               ", row_filter =" + row_filter +
-               ", maxResults=" + maxResults +
-               ", maxIsColumns=" + maxIsColumns +
-               '}';
-    }
-
-    public String getKeyspace()
-    {
-        return keyspace;
+        return Objects.toStringHelper(this)
+                      .add("keyspace", keyspace)
+                      .add("columnFamily", columnFamily)
+                      .add("predicate", predicate)
+                      .add("keyRange", keyRange)
+                      .add("rowFilter", rowFilter)
+                      .add("maxResults", maxResults)
+                      .add("counterCQL3Rows", countCQL3Rows)
+                      .add("timestamp", timestamp)
+                      .toString();
     }
 }
 
 class RangeSliceCommandSerializer implements IVersionedSerializer<RangeSliceCommand>
 {
-    public void serialize(RangeSliceCommand sliceCommand, DataOutput dos, int version) throws IOException
+    public void serialize(RangeSliceCommand sliceCommand, DataOutputPlus out, int version) throws IOException
     {
-        dos.writeUTF(sliceCommand.keyspace);
-        dos.writeUTF(sliceCommand.column_family);
-        ByteBuffer sc = sliceCommand.super_column;
-        dos.writeInt(sc == null ? 0 : sc.remaining());
-        if (sc != null)
-            ByteBufferUtil.write(sc, dos);
+        out.writeUTF(sliceCommand.keyspace);
+        out.writeUTF(sliceCommand.columnFamily);
+        out.writeLong(sliceCommand.timestamp);
 
-        TSerializer ser = new TSerializer(new TBinaryProtocol.Factory());
-        FBUtilities.serialize(ser, sliceCommand.predicate, dos);
+        CFMetaData metadata = Schema.instance.getCFMetaData(sliceCommand.keyspace, sliceCommand.columnFamily);
 
-        if (version >= MessagingService.VERSION_11)
+        metadata.comparator.diskAtomFilterSerializer().serialize(sliceCommand.predicate, out, version);
+
+        if (sliceCommand.rowFilter == null)
         {
-            if (sliceCommand.row_filter == null)
+            out.writeInt(0);
+        }
+        else
+        {
+            out.writeInt(sliceCommand.rowFilter.size());
+            for (IndexExpression expr : sliceCommand.rowFilter)
             {
-                dos.writeInt(0);
-            }
-            else
-            {
-                dos.writeInt(sliceCommand.row_filter.size());
-                for (IndexExpression expr : sliceCommand.row_filter)
-                    FBUtilities.serialize(ser, expr, dos);
+                expr.writeTo(out);
             }
         }
-        AbstractBounds.serializer.serialize(sliceCommand.range, dos, version);
-        dos.writeInt(sliceCommand.maxResults);
-        if (version >= MessagingService.VERSION_11)
-        {
-            dos.writeBoolean(sliceCommand.maxIsColumns);
-            dos.writeBoolean(sliceCommand.isPaging);
-        }
+        MessagingService.validatePartitioner(sliceCommand.keyRange);
+        AbstractBounds.serializer.serialize(sliceCommand.keyRange, out, version);
+        out.writeInt(sliceCommand.maxResults);
+        out.writeBoolean(sliceCommand.countCQL3Rows);
+        out.writeBoolean(sliceCommand.isPaging);
     }
 
-    public RangeSliceCommand deserialize(DataInput dis, int version) throws IOException
+    public RangeSliceCommand deserialize(DataInput in, int version) throws IOException
     {
-        String keyspace = dis.readUTF();
-        String columnFamily = dis.readUTF();
+        String keyspace = in.readUTF();
+        String columnFamily = in.readUTF();
+        long timestamp = in.readLong();
 
-        int scLength = dis.readInt();
-        ByteBuffer superColumn = null;
-        if (scLength > 0)
+        CFMetaData metadata = Schema.instance.getCFMetaData(keyspace, columnFamily);
+
+        IDiskAtomFilter predicate = metadata.comparator.diskAtomFilterSerializer().deserialize(in, version);
+
+        List<IndexExpression> rowFilter;
+        int filterCount = in.readInt();
+        rowFilter = new ArrayList<>(filterCount);
+        for (int i = 0; i < filterCount; i++)
         {
-            byte[] buf = new byte[scLength];
-            dis.readFully(buf);
-            superColumn = ByteBuffer.wrap(buf);
+            rowFilter.add(IndexExpression.readFrom(in));
         }
+        AbstractBounds<RowPosition> range = AbstractBounds.serializer.deserialize(in, MessagingService.globalPartitioner(), version).toRowBounds();
 
-        TDeserializer dser = new TDeserializer(new TBinaryProtocol.Factory());
-        SlicePredicate pred = new SlicePredicate();
-        FBUtilities.deserialize(dser, pred, dis);
-
-        List<IndexExpression> rowFilter = null;
-        if (version >= MessagingService.VERSION_11)
-        {
-            int filterCount = dis.readInt();
-            rowFilter = new ArrayList<IndexExpression>(filterCount);
-            for (int i = 0; i < filterCount; i++)
-            {
-                IndexExpression expr = new IndexExpression();
-                FBUtilities.deserialize(dser, expr, dis);
-                rowFilter.add(expr);
-            }
-        }
-        AbstractBounds<RowPosition> range = AbstractBounds.serializer.deserialize(dis, version).toRowBounds();
-
-        int maxResults = dis.readInt();
-        boolean maxIsColumns = false;
-        boolean isPaging = false;
-        if (version >= MessagingService.VERSION_11)
-        {
-            maxIsColumns = dis.readBoolean();
-            isPaging = dis.readBoolean();
-        }
-        return new RangeSliceCommand(keyspace, columnFamily, superColumn, pred, range, rowFilter, maxResults, maxIsColumns, isPaging);
+        int maxResults = in.readInt();
+        boolean countCQL3Rows = in.readBoolean();
+        boolean isPaging = in.readBoolean();
+        return new RangeSliceCommand(keyspace, columnFamily, timestamp, predicate, range, rowFilter, maxResults, countCQL3Rows, isPaging);
     }
 
     public long serializedSize(RangeSliceCommand rsc, int version)
     {
         long size = TypeSizes.NATIVE.sizeof(rsc.keyspace);
-        size += TypeSizes.NATIVE.sizeof(rsc.column_family);
+        size += TypeSizes.NATIVE.sizeof(rsc.columnFamily);
+        size += TypeSizes.NATIVE.sizeof(rsc.timestamp);
 
-        ByteBuffer sc = rsc.super_column;
-        if (sc != null)
-        {
-            size += TypeSizes.NATIVE.sizeof(sc.remaining());
-            size += sc.remaining();
-        }
-        else
+        CFMetaData metadata = Schema.instance.getCFMetaData(rsc.keyspace, rsc.columnFamily);
+
+        IDiskAtomFilter filter = rsc.predicate;
+
+        size += metadata.comparator.diskAtomFilterSerializer().serializedSize(filter, version);
+
+        if (rsc.rowFilter == null)
         {
             size += TypeSizes.NATIVE.sizeof(0);
         }
-
-        TSerializer ser = new TSerializer(new TBinaryProtocol.Factory());
-        try
+        else
         {
-            int predicateLength = ser.serialize(rsc.predicate).length;
-            size += TypeSizes.NATIVE.sizeof(predicateLength);
-            size += predicateLength;
-        }
-        catch (TException e)
-        {
-            throw new RuntimeException(e);
-        }
-
-        if (version >= MessagingService.VERSION_11)
-        {
-            if (rsc.row_filter == null)
+            size += TypeSizes.NATIVE.sizeof(rsc.rowFilter.size());
+            for (IndexExpression expr : rsc.rowFilter)
             {
-                size += TypeSizes.NATIVE.sizeof(0);
-            }
-            else
-            {
-                size += TypeSizes.NATIVE.sizeof(rsc.row_filter.size());
-                for (IndexExpression expr : rsc.row_filter)
-                {
-                    try
-                    {
-                        int filterLength = ser.serialize(expr).length;
-                        size += TypeSizes.NATIVE.sizeof(filterLength);
-                        size += filterLength;
-                    }
-                    catch (TException e)
-                    {
-                        throw new RuntimeException(e);
-                    }
-                }
+                size += TypeSizes.NATIVE.sizeofWithShortLength(expr.column);
+                size += TypeSizes.NATIVE.sizeof(expr.operator.ordinal());
+                size += TypeSizes.NATIVE.sizeofWithShortLength(expr.value);
             }
         }
-        size += AbstractBounds.serializer.serializedSize(rsc.range, version);
+        size += AbstractBounds.serializer.serializedSize(rsc.keyRange, version);
         size += TypeSizes.NATIVE.sizeof(rsc.maxResults);
-        if (version >= MessagingService.VERSION_11)
-        {
-            size += TypeSizes.NATIVE.sizeof(rsc.maxIsColumns);
-            size += TypeSizes.NATIVE.sizeof(rsc.isPaging);
-        }
+        size += TypeSizes.NATIVE.sizeof(rsc.countCQL3Rows);
+        size += TypeSizes.NATIVE.sizeof(rsc.isPaging);
         return size;
     }
 }

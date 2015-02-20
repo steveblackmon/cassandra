@@ -38,18 +38,12 @@ public interface IFailureDetector
     public boolean isAlive(InetAddress ep);
 
     /**
-     * Clear any existing interval timings for this endpoint
-     * @param ep
-     */
-    public void clear(InetAddress ep);
-
-    /**
      * This method is invoked by any entity wanting to interrogate the status of an endpoint.
      * In our case it would be the Gossiper. The Failure Detector will then calculate Phi and
      * deem an endpoint as suspicious or alive as explained in the Hayashibara paper.
      *
      * param ep endpoint for which we interpret the inter arrival times.
-    */
+     */
     public void interpret(InetAddress ep);
 
     /**
@@ -58,7 +52,7 @@ public interface IFailureDetector
      * FailureDetector will then sample the arrival time as explained in the paper.
      *
      * param ep endpoint being reported.
-    */
+     */
     public void report(InetAddress ep);
 
     /**
@@ -73,12 +67,14 @@ public interface IFailureDetector
 
     /**
      * Register interest for Failure Detector events.
+     *
      * @param listener implementation of an application provided IFailureDetectionEventListener
      */
     public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener);
 
     /**
      * Un-register interest for Failure Detector events.
+     *
      * @param listener implementation of an application provided IFailureDetectionEventListener
      */
     public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener);

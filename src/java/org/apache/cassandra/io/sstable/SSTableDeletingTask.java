@@ -18,22 +18,22 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.File;
-import java.io.IOException;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Sets;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.db.DataTracker;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.WrappedRunnable;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.utils.FBUtilities;
 
-public class SSTableDeletingTask extends WrappedRunnable
+public class SSTableDeletingTask implements Runnable
 {
     private static final Logger logger = LoggerFactory.getLogger(SSTableDeletingTask.class);
 
@@ -41,37 +41,61 @@ public class SSTableDeletingTask extends WrappedRunnable
     // and delete will fail (on Windows) until it is (we only force the unmapping on SUN VMs).
     // Additionally, we need to make sure to delete the data file first, so on restart the others
     // will be recognized as GCable.
-    private static final Set<SSTableDeletingTask> failedTasks = new CopyOnWriteArraySet<SSTableDeletingTask>();
+    private static final Set<SSTableDeletingTask> failedTasks = new CopyOnWriteArraySet<>();
 
-    public final Descriptor desc;
-    public final Set<Component> components;
+    private final SSTableReader referent;
+    private final Descriptor desc;
+    private final Set<Component> components;
     private DataTracker tracker;
-    private final long size;
 
-    public SSTableDeletingTask(SSTableReader referent)
+    /**
+     * realDescriptor is the actual descriptor for the sstable, the descriptor inside
+     * referent can be 'faked' as FINAL for early opened files. We need the real one
+     * to be able to remove the files.
+     */
+    public SSTableDeletingTask(Descriptor realDescriptor, SSTableReader referent)
     {
-        this.desc = referent.descriptor;
-        this.components = referent.components;
-        this.size = referent.bytesOnDisk();
+        this.referent = referent;
+        this.desc = realDescriptor;
+        switch (desc.type)
+        {
+            case FINAL:
+                this.components = referent.components;
+                break;
+            case TEMPLINK:
+                this.components = Sets.newHashSet(Component.DATA, Component.PRIMARY_INDEX);
+                break;
+            default:
+                throw new IllegalStateException();
+        }
     }
 
     public void setTracker(DataTracker tracker)
     {
-        this.tracker = tracker;
+        // the tracker is used only to notify listeners of deletion of the sstable;
+        // since deletion of a non-final file is not really deletion of the sstable,
+        // we don't want to notify the listeners in this event
+        if (desc.type == Descriptor.Type.FINAL)
+            this.tracker = tracker;
     }
 
     public void schedule()
     {
-        StorageService.tasks.submit(this);
+        ScheduledExecutors.nonPeriodicTasks.submit(this);
     }
 
-    protected void runMayThrow() throws IOException
+    public void run()
     {
+        long size = referent.bytesOnDisk();
+
+        if (tracker != null)
+            tracker.notifyDeleting(referent);
+
         // If we can't successfully delete the DATA component, set the task to be retried later: see above
         File datafile = new File(desc.filenameFor(Component.DATA));
         if (!datafile.delete())
         {
-            logger.error("Unable to delete " + datafile + " (it will be removed on server restart; we'll also retry after GC)");
+            logger.error("Unable to delete {} (it will be removed on server restart; we'll also retry after GC)", datafile);
             failedTasks.add(this);
             return;
         }
@@ -103,18 +127,8 @@ public class SSTableDeletingTask extends WrappedRunnable
             {
             }
         };
-        try
-        {
-            StorageService.tasks.schedule(runnable, 0, TimeUnit.MILLISECONDS).get();
-        }
-        catch (InterruptedException e)
-        {
-            throw new AssertionError(e);
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+
+        FBUtilities.waitOnFuture(ScheduledExecutors.nonPeriodicTasks.schedule(runnable, 0, TimeUnit.MILLISECONDS));
     }
 }
 

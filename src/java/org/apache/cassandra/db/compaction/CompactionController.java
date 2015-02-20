@@ -17,89 +17,171 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.util.Collection;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataTracker;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
-import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.IntervalTree.Interval;
-import org.apache.cassandra.utils.IntervalTree.IntervalTree;
-import org.apache.cassandra.utils.Throttle;
+import org.apache.cassandra.utils.AlwaysPresentFilter;
+
+import org.apache.cassandra.utils.concurrent.Refs;
 
 /**
  * Manage compaction options.
  */
-public class CompactionController
+public class CompactionController implements AutoCloseable
 {
     private static final Logger logger = LoggerFactory.getLogger(CompactionController.class);
 
-    private final ColumnFamilyStore cfs;
-    private final IntervalTree<SSTableReader> overlappingTree;
+    public final ColumnFamilyStore cfs;
+    private DataTracker.SSTableIntervalTree overlappingTree;
+    private Refs<SSTableReader> overlappingSSTables;
+    private final Iterable<SSTableReader> compacting;
 
     public final int gcBefore;
-    public final int mergeShardBefore;
-    private final Throttle throttle = new Throttle("Cassandra_Throttle", new Throttle.ThroughputFunction()
-    {
-        /** @return Instantaneous throughput target in bytes per millisecond. */
-        public int targetThroughput()
-        {
-            if (DatabaseDescriptor.getCompactionThroughputMbPerSec() < 1 || StorageService.instance.isBootstrapMode())
-                // throttling disabled
-                return 0;
-            // total throughput
-            int totalBytesPerMS = DatabaseDescriptor.getCompactionThroughputMbPerSec() * 1024 * 1024 / 1000;
-            // per stream throughput (target bytes per MS)
-            return totalBytesPerMS / Math.max(1, CompactionManager.instance.getActiveCompactions());
-        }
-    });
 
-    public CompactionController(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore, boolean forceDeserialize)
+    protected CompactionController(ColumnFamilyStore cfs, int maxValue)
+    {
+        this(cfs, null, maxValue);
+    }
+
+    public CompactionController(ColumnFamilyStore cfs, Set<SSTableReader> compacting,  int gcBefore)
     {
         assert cfs != null;
         this.cfs = cfs;
         this.gcBefore = gcBefore;
-        // If we merge an old NodeId id, we must make sure that no further increment for that id are in an active memtable.
-        // For that, we must make sure that this id was renewed before the creation of the oldest unflushed memtable. We
-        // add 5 minutes to be sure we're on the safe side in terms of thread safety (though we should be fine in our
-        // current 'stop all write during memtable switch' situation).
-        this.mergeShardBefore = (int) ((cfs.oldestUnflushedMemtable() + 5 * 3600) / 1000);
-        Set<SSTableReader> overlappingSSTables = cfs.getOverlappingSSTables(sstables);
-        overlappingTree = DataTracker.buildIntervalTree(overlappingSSTables);
+        this.compacting = compacting;
+        refreshOverlaps();
+    }
+
+    void maybeRefreshOverlaps()
+    {
+        for (SSTableReader reader : overlappingSSTables)
+        {
+            if (reader.isMarkedCompacted())
+            {
+                refreshOverlaps();
+                return;
+            }
+        }
+    }
+
+    private void refreshOverlaps()
+    {
+        if (this.overlappingSSTables != null)
+            overlappingSSTables.release();
+
+        if (compacting == null)
+            overlappingSSTables = Refs.tryRef(Collections.<SSTableReader>emptyList());
+        else
+            overlappingSSTables = cfs.getAndReferenceOverlappingSSTables(compacting);
+        this.overlappingTree = DataTracker.buildIntervalTree(overlappingSSTables);
+    }
+
+    public Set<SSTableReader> getFullyExpiredSSTables()
+    {
+        return getFullyExpiredSSTables(cfs, compacting, overlappingSSTables, gcBefore);
+    }
+
+    /**
+     * Finds expired sstables
+     *
+     * works something like this;
+     * 1. find "global" minTimestamp of overlapping sstables and compacting sstables containing any non-expired data
+     * 2. build a list of fully expired candidates
+     * 3. check if the candidates to be dropped actually can be dropped (maxTimestamp < global minTimestamp)
+     *    - if not droppable, remove from candidates
+     * 4. return candidates.
+     *
+     * @param cfStore
+     * @param compacting we take the drop-candidates from this set, it is usually the sstables included in the compaction
+     * @param overlapping the sstables that overlap the ones in compacting.
+     * @param gcBefore
+     * @return
+     */
+    public static Set<SSTableReader> getFullyExpiredSSTables(ColumnFamilyStore cfStore, Iterable<SSTableReader> compacting, Iterable<SSTableReader> overlapping, int gcBefore)
+    {
+        logger.debug("Checking droppable sstables in {}", cfStore);
+
+        if (compacting == null)
+            return Collections.<SSTableReader>emptySet();
+
+        List<SSTableReader> candidates = new ArrayList<>();
+
+        long minTimestamp = Long.MAX_VALUE;
+
+        for (SSTableReader sstable : overlapping)
+            minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());
+
+        for (SSTableReader candidate : compacting)
+        {
+            if (candidate.getSSTableMetadata().maxLocalDeletionTime < gcBefore)
+                candidates.add(candidate);
+            else
+                minTimestamp = Math.min(minTimestamp, candidate.getMinTimestamp());
+        }
+
+        // At this point, minTimestamp denotes the lowest timestamp of any relevant
+        // SSTable that contains a constructive value. candidates contains all the
+        // candidates with no constructive values. The ones out of these that have
+        // (getMaxTimestamp() < minTimestamp) serve no purpose anymore.
+
+        Iterator<SSTableReader> iterator = candidates.iterator();
+        while (iterator.hasNext())
+        {
+            SSTableReader candidate = iterator.next();
+            if (candidate.getMaxTimestamp() >= minTimestamp)
+            {
+                iterator.remove();
+            }
+            else
+            {
+               logger.debug("Dropping expired SSTable {} (maxLocalDeletionTime={}, gcBefore={})",
+                        candidate, candidate.getSSTableMetadata().maxLocalDeletionTime, gcBefore);
+            }
+        }
+        return new HashSet<>(candidates);
     }
 
     public String getKeyspace()
     {
-        return cfs.table.name;
+        return cfs.keyspace.getName();
     }
 
     public String getColumnFamily()
     {
-        return cfs.columnFamily;
+        return cfs.name;
     }
 
     /**
-     * @return true if it's okay to drop tombstones for the given row, i.e., if we know all the verisons of the row
-     * are included in the compaction set
+     * @return the largest timestamp before which it's okay to drop tombstones for the given partition;
+     * i.e., after the maxPurgeableTimestamp there may exist newer data that still needs to be suppressed
+     * in other sstables.  This returns the minimum timestamp for any SSTable that contains this partition and is not
+     * participating in this compaction, or LONG.MAX_VALUE if no such SSTable exists.
      */
-    public boolean shouldPurge(DecoratedKey key)
+    public long maxPurgeableTimestamp(DecoratedKey key)
     {
-        List<SSTableReader> filteredSSTables = overlappingTree.search(new Interval(key, key));
+        List<SSTableReader> filteredSSTables = overlappingTree.search(key);
+        long min = Long.MAX_VALUE;
         for (SSTableReader sstable : filteredSSTables)
         {
-            if (sstable.getBloomFilter().isPresent(key.key))
-                return false;
+            // if we don't have bloom filter(bf_fp_chance=1.0 or filter file is missing),
+            // we check index file instead.
+            if (sstable.getBloomFilter() instanceof AlwaysPresentFilter && sstable.getPosition(key, SSTableReader.Operator.EQ, false) != null)
+                min = Math.min(min, sstable.getMinTimestamp());
+            else if (sstable.getBloomFilter().isPresent(key))
+                min = Math.min(min, sstable.getMinTimestamp());
         }
-        return true;
+        return min;
     }
 
     public void invalidateCachedRow(DecoratedKey key)
@@ -107,37 +189,8 @@ public class CompactionController
         cfs.invalidateCachedRow(key);
     }
 
-    /**
-     * @return an AbstractCompactedRow implementation to write the merged rows in question.
-     *
-     * If there is a single source row, the data is from a current-version sstable, we don't
-     * need to purge and we aren't forcing deserialization for scrub, write it unchanged.
-     * Otherwise, we deserialize, purge tombstones, and reserialize in the latest version.
-     */
-    public AbstractCompactedRow getCompactedRow(List<SSTableIdentityIterator> rows)
+    public void close()
     {
-        long rowSize = 0;
-        for (SSTableIdentityIterator row : rows)
-            rowSize += row.dataSize;
-
-        if (rowSize > DatabaseDescriptor.getInMemoryCompactionLimit())
-        {
-            String keyString = cfs.metadata.getKeyValidator().getString(rows.get(0).getKey().key);
-            logger.info(String.format("Compacting large row %s/%s:%s (%d bytes) incrementally",
-                                      cfs.table.name, cfs.columnFamily, keyString, rowSize));
-            return new LazilyCompactedRow(this, rows);
-        }
-        return new PrecompactedRow(this, rows);
-    }
-
-    /** convenience method for single-sstable compactions */
-    public AbstractCompactedRow getCompactedRow(SSTableIdentityIterator row)
-    {
-        return getCompactedRow(Collections.singletonList(row));
-    }
-    
-    public void mayThrottle(long currentBytes)
-    {
-        throttle.throttle(currentBytes);
+        overlappingSSTables.release();
     }
 }

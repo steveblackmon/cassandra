@@ -20,59 +20,37 @@ package org.apache.cassandra.dht;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
 import java.util.*;
 
-import org.apache.cassandra.config.ConfigurationException;
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.db.CachedHashDecoratedKey;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.GuidGenerator;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.Pair;
 
 /**
  * This class generates a BigIntegerToken using MD5 hash.
  */
-public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
+public class RandomPartitioner implements IPartitioner
 {
     public static final BigInteger ZERO = new BigInteger("0");
     public static final BigIntegerToken MINIMUM = new BigIntegerToken("-1");
     public static final BigInteger MAXIMUM = new BigInteger("2").pow(127);
 
-    private static final byte DELIMITER_BYTE = ":".getBytes()[0];
+    private static final int HEAP_SIZE = (int) ObjectSizes.measureDeep(new BigIntegerToken(FBUtilities.hashToBigInteger(ByteBuffer.allocate(1))));
+
+    public static final RandomPartitioner instance = new RandomPartitioner();
 
     public DecoratedKey decorateKey(ByteBuffer key)
     {
-        return new DecoratedKey(getToken(key), key);
-    }
-
-    public DecoratedKey convertFromDiskFormat(ByteBuffer fromdisk)
-    {
-        // find the delimiter position
-        int splitPoint = -1;
-        for (int i = fromdisk.position(); i < fromdisk.limit(); i++)
-        {
-            if (fromdisk.get(i) == DELIMITER_BYTE)
-            {
-                splitPoint = i;
-                break;
-            }
-        }
-        assert splitPoint != -1;
-
-        // and decode the token and key
-        String token = null;
-        try
-        {
-            token = ByteBufferUtil.string(fromdisk, fromdisk.position(), splitPoint - fromdisk.position());
-        }
-        catch (CharacterCodingException e)
-        {
-            throw new RuntimeException(e);
-        }
-        ByteBuffer key = fromdisk.duplicate();
-        key.position(splitPoint + 1);
-        return new DecoratedKey(new BigIntegerToken(token), key);
+        return new CachedHashDecoratedKey(getToken(key), key);
     }
 
     public Token midpoint(Token ltoken, Token rtoken)
@@ -98,19 +76,21 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
         return new BigIntegerToken(token);
     }
 
-    private final Token.TokenFactory<BigInteger> tokenFactory = new Token.TokenFactory<BigInteger>() {
-        public ByteBuffer toByteArray(Token<BigInteger> bigIntegerToken)
+    private final Token.TokenFactory tokenFactory = new Token.TokenFactory() {
+        public ByteBuffer toByteArray(Token token)
         {
+            BigIntegerToken bigIntegerToken = (BigIntegerToken) token;
             return ByteBuffer.wrap(bigIntegerToken.token.toByteArray());
         }
 
-        public Token<BigInteger> fromByteArray(ByteBuffer bytes)
+        public Token fromByteArray(ByteBuffer bytes)
         {
             return new BigIntegerToken(new BigInteger(ByteBufferUtil.getArray(bytes)));
         }
 
-        public String toString(Token<BigInteger> bigIntegerToken)
+        public String toString(Token token)
         {
+            BigIntegerToken bigIntegerToken = (BigIntegerToken) token;
             return bigIntegerToken.token.toString();
         }
 
@@ -130,13 +110,13 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
             }
         }
 
-        public Token<BigInteger> fromString(String string)
+        public Token fromString(String string)
         {
             return new BigIntegerToken(new BigInteger(string));
         }
     };
 
-    public Token.TokenFactory<BigInteger> getTokenFactory()
+    public Token.TokenFactory getTokenFactory()
     {
         return tokenFactory;
     }
@@ -144,6 +124,34 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
     public boolean preservesOrder()
     {
         return false;
+    }
+
+    public static class BigIntegerToken extends ComparableObjectToken<BigInteger>
+    {
+        static final long serialVersionUID = -5833589141319293006L;
+
+        public BigIntegerToken(BigInteger token)
+        {
+            super(token);
+        }
+
+        // convenience method for testing
+        @VisibleForTesting
+        public BigIntegerToken(String token) {
+            this(new BigInteger(token));
+        }
+
+        @Override
+        public IPartitioner getPartitioner()
+        {
+            return instance;
+        }
+
+        @Override
+        public long getHeapSize()
+        {
+            return HEAP_SIZE;
+        }
     }
 
     public BigIntegerToken getToken(ByteBuffer key)
@@ -156,23 +164,23 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
     public Map<Token, Float> describeOwnership(List<Token> sortedTokens)
     {
         Map<Token, Float> ownerships = new HashMap<Token, Float>();
-        Iterator i = sortedTokens.iterator();
+        Iterator<Token> i = sortedTokens.iterator();
 
         // 0-case
-        if (!i.hasNext()) { throw new RuntimeException("No nodes present in the cluster. How did you call this?"); }
+        if (!i.hasNext()) { throw new RuntimeException("No nodes present in the cluster. Has this node finished starting up?"); }
         // 1-case
         if (sortedTokens.size() == 1) {
-            ownerships.put((Token)i.next(), new Float(1.0));
+            ownerships.put(i.next(), new Float(1.0));
         }
         // n-case
         else {
             // NOTE: All divisions must take place in BigDecimals, and all modulo operators must take place in BigIntegers.
             final BigInteger ri = MAXIMUM;                                                  //  (used for addition later)
             final BigDecimal r  = new BigDecimal(ri);                                       // The entire range, 2**127
-            Token start = (Token)i.next(); BigInteger ti = ((BigIntegerToken)start).token;  // The first token and its value
+            Token start = i.next(); BigInteger ti = ((BigIntegerToken)start).token;  // The first token and its value
             Token t; BigInteger tim1 = ti;                                                  // The last token and its value (after loop)
             while (i.hasNext()) {
-                t = (Token)i.next(); ti = ((BigIntegerToken)t).token;                               // The next token and its value
+                t = i.next(); ti = ((BigIntegerToken)t).token;                                      // The next token and its value
                 float x = new BigDecimal(ti.subtract(tim1).add(ri).mod(ri)).divide(r).floatValue(); // %age = ((T(i) - T(i-1) + R) % R) / R
                 ownerships.put(t, x);                                                               // save (T(i) -> %age)
                 tim1 = ti;                                                                          // -> advance loop
@@ -182,5 +190,10 @@ public class RandomPartitioner extends AbstractPartitioner<BigIntegerToken>
             ownerships.put(start, x);
         }
         return ownerships;
+    }
+
+    public AbstractType<?> getTokenValidator()
+    {
+        return IntegerType.instance;
     }
 }

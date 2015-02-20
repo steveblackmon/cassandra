@@ -20,142 +20,334 @@ package org.apache.cassandra.db.compaction;
 import java.util.*;
 import java.util.Map.Entry;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import com.google.common.primitives.Longs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.statements.CFPropDefs;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.sstable.SSTable;
-import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.ColumnNameHelper;
 import org.apache.cassandra.utils.Pair;
 
 public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 {
     private static final Logger logger = LoggerFactory.getLogger(SizeTieredCompactionStrategy.class);
-    protected static final long DEFAULT_MIN_SSTABLE_SIZE = 50L * 1024L * 1024L;
-    protected static final float DEFAULT_TOMBSTONE_THRESHOLD = 0.2f;
-    protected static final String MIN_SSTABLE_SIZE_KEY = "min_sstable_size";
-    protected static final String TOMBSTONE_THRESHOLD_KEY = "tombstone_threshold";
-    protected long minSSTableSize;
+
+    private static final Comparator<Pair<List<SSTableReader>,Double>> bucketsByHotnessComparator = new Comparator<Pair<List<SSTableReader>, Double>>()
+    {
+        public int compare(Pair<List<SSTableReader>, Double> o1, Pair<List<SSTableReader>, Double> o2)
+        {
+            int comparison = Double.compare(o1.right, o2.right);
+            if (comparison != 0)
+                return comparison;
+
+            // break ties by compacting the smallest sstables first (this will probably only happen for
+            // system tables and new/unread sstables)
+            return Long.compare(avgSize(o1.left), avgSize(o2.left));
+        }
+
+        private long avgSize(List<SSTableReader> sstables)
+        {
+            long n = 0;
+            for (SSTableReader sstable : sstables)
+                n += sstable.bytesOnDisk();
+            return n / sstables.size();
+        }
+    };
+
+    protected SizeTieredCompactionStrategyOptions options;
     protected volatile int estimatedRemainingTasks;
-    protected float tombstoneThreshold;
+    private final Set<SSTableReader> sstables = new HashSet<>();
 
     public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
         this.estimatedRemainingTasks = 0;
-        String optionValue = options.get(MIN_SSTABLE_SIZE_KEY);
-        minSSTableSize = (null != optionValue) ? Long.parseLong(optionValue) : DEFAULT_MIN_SSTABLE_SIZE;
-        cfs.setMaximumCompactionThreshold(cfs.metadata.getMaxCompactionThreshold());
-        cfs.setMinimumCompactionThreshold(cfs.metadata.getMinCompactionThreshold());
-        optionValue = options.get(TOMBSTONE_THRESHOLD_KEY);
-        tombstoneThreshold = (null != optionValue) ? Float.parseFloat(optionValue) : DEFAULT_TOMBSTONE_THRESHOLD;
+        this.options = new SizeTieredCompactionStrategyOptions(options);
     }
 
-    public AbstractCompactionTask getNextBackgroundTask(final int gcBefore)
+    private List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
     {
-        if (cfs.isCompactionDisabled())
-        {
-            logger.debug("Compaction is currently disabled.");
-            return null;
-        }
+        if (!isEnabled())
+            return Collections.emptyList();
 
-        Set<SSTableReader> candidates = cfs.getUncompactingSSTables();
-        List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(filterSuspectSSTables(candidates)), minSSTableSize);
+        // make local copies so they can't be changed out from under us mid-method
+        int minThreshold = cfs.getMinimumCompactionThreshold();
+        int maxThreshold = cfs.getMaximumCompactionThreshold();
+
+        Iterable<SSTableReader> candidates = filterSuspectSSTables(Sets.intersection(cfs.getUncompactingSSTables(), sstables));
+        candidates = filterColdSSTables(Lists.newArrayList(candidates), options.coldReadsToOmit, cfs.getMinimumCompactionThreshold());
+
+        List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(candidates), options.bucketHigh, options.bucketLow, options.minSSTableSize);
+        logger.debug("Compaction buckets are {}", buckets);
         updateEstimatedCompactionsByTasks(buckets);
+        List<SSTableReader> mostInteresting = mostInterestingBucket(buckets, minThreshold, maxThreshold);
+        if (!mostInteresting.isEmpty())
+            return mostInteresting;
 
-        List<List<SSTableReader>> prunedBuckets = new ArrayList<List<SSTableReader>>();
-        for (List<SSTableReader> bucket : buckets)
+        // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
+        // ratio is greater than threshold.
+        List<SSTableReader> sstablesWithTombstones = new ArrayList<>();
+        for (SSTableReader sstable : candidates)
         {
-            if (bucket.size() < cfs.getMinimumCompactionThreshold())
-                continue;
-
-            Collections.sort(bucket, new Comparator<SSTableReader>()
-            {
-                public int compare(SSTableReader o1, SSTableReader o2)
-                {
-                    return o1.descriptor.generation - o2.descriptor.generation;
-                }
-            });
-            prunedBuckets.add(bucket.subList(0, Math.min(bucket.size(), cfs.getMaximumCompactionThreshold())));
+            if (worthDroppingTombstones(sstable, gcBefore))
+                sstablesWithTombstones.add(sstable);
         }
+        if (sstablesWithTombstones.isEmpty())
+            return Collections.emptyList();
 
-        if (prunedBuckets.isEmpty())
+        Collections.sort(sstablesWithTombstones, new SSTableReader.SizeComparator());
+        return Collections.singletonList(sstablesWithTombstones.get(0));
+    }
+
+    /**
+     * Removes as many cold sstables as possible while retaining at least 1-coldReadsToOmit of the total reads/sec
+     * across all sstables
+     * @param sstables all sstables to consider
+     * @param coldReadsToOmit the proportion of total reads/sec that will be omitted (0=omit nothing, 1=omit everything)
+     * @param minThreshold min compaction threshold
+     * @return a list of sstables with the coldest sstables excluded until the reads they represent reaches coldReadsToOmit
+     */
+    @VisibleForTesting
+    static List<SSTableReader> filterColdSSTables(List<SSTableReader> sstables, double coldReadsToOmit, int minThreshold)
+    {
+        if (coldReadsToOmit == 0.0)
+            return sstables;
+
+        // Sort the sstables by hotness (coldest-first). We first build a map because the hotness may change during the sort.
+        final Map<SSTableReader, Double> hotnessSnapshot = getHotnessMap(sstables);
+        Collections.sort(sstables, new Comparator<SSTableReader>()
         {
-            // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
-            // ratio is greater than threshold.
-            for (List<SSTableReader> bucket : buckets)
+            public int compare(SSTableReader o1, SSTableReader o2)
             {
-                for (SSTableReader table : bucket)
-                {
-                    double droppableRatio = table.getEstimatedDroppableTombstoneRatio(gcBefore);
-                    if (droppableRatio <= tombstoneThreshold)
-                        continue;
+                int comparison = Double.compare(hotnessSnapshot.get(o1), hotnessSnapshot.get(o2));
+                if (comparison != 0)
+                    return comparison;
 
-                    Set<SSTableReader> overlaps = cfs.getOverlappingSSTables(Collections.singleton(table));
-                    if (overlaps.isEmpty())
-                    {
-                        // there is no overlap, tombstones are safely droppable
-                        prunedBuckets.add(Collections.singletonList(table));
-                    }
-                    else
-                    {
-                        // what percentage of columns do we expect to compact outside of overlap?
-                        // first, calculate estimated keys that do not overlap
-                        long keys = table.estimatedKeys();
-                        Set<Range<Token>> ranges = new HashSet<Range<Token>>();
-                        for (SSTableReader overlap : overlaps)
-                            ranges.add(new Range<Token>(overlap.first.token, overlap.last.token));
-                        long remainingKeys = keys - table.estimatedKeysForRanges(ranges);
-                        // next, calculate what percentage of columns we have within those keys
-                        double remainingKeysRatio = ((double) remainingKeys) / keys;
-                        long columns = table.getEstimatedColumnCount().percentile(remainingKeysRatio) * remainingKeys;
-                        double remainingColumnsRatio = ((double) columns) / (table.getEstimatedColumnCount().count() * table.getEstimatedColumnCount().mean());
+                // break ties with size on disk (mainly for system tables and cold tables)
+                comparison = Long.compare(o1.bytesOnDisk(), o2.bytesOnDisk());
+                if (comparison != 0)
+                    return comparison;
 
-                        // if we still expect to have droppable tombstones in rest of columns, then try compacting it
-                        if (remainingColumnsRatio * droppableRatio > tombstoneThreshold)
-                            prunedBuckets.add(Collections.singletonList(table));
-                    }
-                }
-            }
-
-            if (prunedBuckets.isEmpty())
-                return null;
-        }
-
-        List<SSTableReader> smallestBucket = Collections.min(prunedBuckets, new Comparator<List<SSTableReader>>()
-        {
-            public int compare(List<SSTableReader> o1, List<SSTableReader> o2)
-            {
-                long n = avgSize(o1) - avgSize(o2);
-                if (n < 0)
-                    return -1;
-                if (n > 0)
-                    return 1;
-                return 0;
-            }
-
-            private long avgSize(List<SSTableReader> sstables)
-            {
-                long n = 0;
-                for (SSTableReader sstable : sstables)
-                    n += sstable.bytesOnDisk();
-                return n / sstables.size();
+                // if there's still a tie, use generation, which is guaranteed to be unique.  this ensures that
+                // our filtering is deterministic, which can be useful when debugging.
+                return o1.descriptor.generation - o2.descriptor.generation;
             }
         });
-        // when bucket only contains just one sstable, set userDefined to true to force single sstable compaction
-        return new CompactionTask(cfs, smallestBucket, gcBefore).isUserDefined(smallestBucket.size() == 1);
+
+        // calculate the total reads/sec across all sstables
+        double totalReads = 0.0;
+        for (SSTableReader sstr : sstables)
+            if (sstr.getReadMeter() != null)
+                totalReads += sstr.getReadMeter().twoHourRate();
+
+        // if this is a system table with no read meters or we don't have any read rates yet, just return them all
+        if (totalReads == 0.0)
+            return sstables;
+
+        // iteratively ignore the coldest sstables until ignoring one more would put us over the coldReadsToOmit threshold
+        double maxColdReads = coldReadsToOmit * totalReads;
+
+        double totalColdReads = 0.0;
+        int cutoffIndex = 0;
+        while (cutoffIndex < sstables.size())
+        {
+            SSTableReader sstable = sstables.get(cutoffIndex);
+            if (sstable.getReadMeter() == null)
+            {
+                throw new AssertionError("If you're seeing this exception, please attach your logs to CASSANDRA-8238 to help us debug. "+sstable);
+            }
+            double reads = sstable.getReadMeter().twoHourRate();
+            if (totalColdReads + reads > maxColdReads)
+                break;
+
+            totalColdReads += reads;
+            cutoffIndex++;
+        }
+        List<SSTableReader> hotSSTables = new ArrayList<>(sstables.subList(cutoffIndex, sstables.size()));
+        List<SSTableReader> coldSSTables = sstables.subList(0, cutoffIndex);
+        logger.debug("hotSSTables={}, coldSSTables={}", hotSSTables.size(), coldSSTables.size());
+        if (hotSSTables.size() >= minThreshold)
+            return hotSSTables;
+        if (coldSSTables.size() < minThreshold)
+            return Collections.emptyList();
+
+        Map<SSTableReader, Set<SSTableReader>> overlapMap = new HashMap<>();
+        for (int i = 0; i < coldSSTables.size(); i++)
+        {
+            SSTableReader sstable = coldSSTables.get(i);
+            Set<SSTableReader> overlaps = new HashSet<>();
+            for (int j = 0; j < coldSSTables.size(); j++)
+            {
+                SSTableReader innerSSTable = coldSSTables.get(j);
+                if (ColumnNameHelper.overlaps(sstable.getSSTableMetadata().minColumnNames,
+                                              sstable.getSSTableMetadata().maxColumnNames,
+                                              innerSSTable.getSSTableMetadata().minColumnNames,
+                                              innerSSTable.getSSTableMetadata().maxColumnNames,
+                                              sstable.metadata.comparator))
+                {
+                    overlaps.add(innerSSTable);
+                }
+            }
+            overlapMap.put(sstable, overlaps);
+        }
+        List<Set<SSTableReader>> overlapChains = new ArrayList<>();
+        for (SSTableReader sstable : overlapMap.keySet())
+            overlapChains.add(createOverlapChain(sstable, overlapMap));
+
+        Collections.sort(overlapChains, new Comparator<Set<SSTableReader>>()
+        {
+            @Override
+            public int compare(Set<SSTableReader> o1, Set<SSTableReader> o2)
+            {
+                return Longs.compare(SSTableReader.getTotalBytes(o2), SSTableReader.getTotalBytes(o1));
+            }
+        });
+        for (Set<SSTableReader> overlapping : overlapChains)
+        {
+            // if we are expecting to only keep 70% of the keys after a compaction, run a compaction on these cold sstables:
+            if (SSTableReader.estimateCompactionGain(overlapping) < 0.7)
+                return new ArrayList<>(overlapping);
+        }
+        return Collections.emptyList();
     }
 
-    public AbstractCompactionTask getMaximalTask(final int gcBefore)
+    /**
+     * returns a set with all overlapping sstables starting with s.
+     * if we have 3 sstables, a, b, c where a overlaps with b, but not c and b overlaps with c, all sstables would be returned.
+     *
+     * m contains an sstable -> all overlapping mapping
+     */
+    private static Set<SSTableReader> createOverlapChain(SSTableReader s, Map<SSTableReader, Set<SSTableReader>> m)
     {
-        return cfs.getSSTables().isEmpty() ? null : new CompactionTask(cfs, filterSuspectSSTables(cfs.getSSTables()), gcBefore);
+        Deque<SSTableReader> sstables = new ArrayDeque<>();
+        Set<SSTableReader> overlapChain = new HashSet<>();
+        sstables.push(s);
+        while (!sstables.isEmpty())
+        {
+            SSTableReader sstable = sstables.pop();
+            if (overlapChain.add(sstable))
+            {
+                if (m.containsKey(sstable))
+                    sstables.addAll(m.get(sstable));
+            }
+        }
+        return overlapChain;
+    }
+
+
+    /**
+     * @param buckets list of buckets from which to return the most interesting, where "interesting" is the total hotness for reads
+     * @param minThreshold minimum number of sstables in a bucket to qualify as interesting
+     * @param maxThreshold maximum number of sstables to compact at once (the returned bucket will be trimmed down to this)
+     * @return a bucket (list) of sstables to compact
+     */
+    public static List<SSTableReader> mostInterestingBucket(List<List<SSTableReader>> buckets, int minThreshold, int maxThreshold)
+    {
+        // skip buckets containing less than minThreshold sstables, and limit other buckets to maxThreshold sstables
+        final List<Pair<List<SSTableReader>, Double>> prunedBucketsAndHotness = new ArrayList<>(buckets.size());
+        for (List<SSTableReader> bucket : buckets)
+        {
+            Pair<List<SSTableReader>, Double> bucketAndHotness = trimToThresholdWithHotness(bucket, maxThreshold);
+            if (bucketAndHotness != null && bucketAndHotness.left.size() >= minThreshold)
+                prunedBucketsAndHotness.add(bucketAndHotness);
+        }
+        if (prunedBucketsAndHotness.isEmpty())
+            return Collections.emptyList();
+
+        Pair<List<SSTableReader>, Double> hottest = Collections.max(prunedBucketsAndHotness, bucketsByHotnessComparator);
+        return hottest.left;
+    }
+
+    /**
+     * Returns a (bucket, hotness) pair or null if there were not enough sstables in the bucket to meet minThreshold.
+     * If there are more than maxThreshold sstables, the coldest sstables will be trimmed to meet the threshold.
+     **/
+    @VisibleForTesting
+    static Pair<List<SSTableReader>, Double> trimToThresholdWithHotness(List<SSTableReader> bucket, int maxThreshold)
+    {
+        // Sort by sstable hotness (descending). We first build a map because the hotness may change during the sort.
+        final Map<SSTableReader, Double> hotnessSnapshot = getHotnessMap(bucket);
+        Collections.sort(bucket, new Comparator<SSTableReader>()
+        {
+            public int compare(SSTableReader o1, SSTableReader o2)
+            {
+                return -1 * Double.compare(hotnessSnapshot.get(o1), hotnessSnapshot.get(o2));
+            }
+        });
+
+        // and then trim the coldest sstables off the end to meet the maxThreshold
+        List<SSTableReader> prunedBucket = bucket.subList(0, Math.min(bucket.size(), maxThreshold));
+
+        // bucket hotness is the sum of the hotness of all sstable members
+        double bucketHotness = 0.0;
+        for (SSTableReader sstr : prunedBucket)
+            bucketHotness += hotness(sstr);
+
+        return Pair.create(prunedBucket, bucketHotness);
+    }
+
+    private static Map<SSTableReader, Double> getHotnessMap(Collection<SSTableReader> sstables)
+    {
+        Map<SSTableReader, Double> hotness = new HashMap<>(sstables.size());
+        for (SSTableReader sstable : sstables)
+            hotness.put(sstable, hotness(sstable));
+        return hotness;
+    }
+
+    /**
+     * Returns the reads per second per key for this sstable, or 0.0 if the sstable has no read meter
+     */
+    private static double hotness(SSTableReader sstr)
+    {
+        // system tables don't have read meters, just use 0.0 for the hotness
+        return sstr.getReadMeter() == null ? 0.0 : sstr.getReadMeter().twoHourRate() / sstr.estimatedKeys();
+    }
+
+    public synchronized AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    {
+        if (!isEnabled())
+            return null;
+
+        while (true)
+        {
+            List<SSTableReader> hottestBucket = getNextBackgroundSSTables(gcBefore);
+
+            if (hottestBucket.isEmpty())
+                return null;
+
+            if (cfs.getDataTracker().markCompacting(hottestBucket))
+                return new CompactionTask(cfs, hottestBucket, gcBefore, false);
+        }
+    }
+
+    public Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore)
+    {
+        Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
+        if (Iterables.isEmpty(sstables))
+            return null;
+        if (!cfs.getDataTracker().markCompacting(filteredSSTables))
+            return null;
+        return Arrays.<AbstractCompactionTask>asList(new CompactionTask(cfs, filteredSSTables, gcBefore, false));
     }
 
     public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore)
     {
-        return new CompactionTask(cfs, sstables, gcBefore).isUserDefined(true);
+        assert !sstables.isEmpty(); // checked for by CM.submitUserDefined
+
+        if (!cfs.getDataTracker().markCompacting(sstables))
+        {
+            logger.debug("Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem", sstables);
+            return null;
+        }
+
+        return new CompactionTask(cfs, sstables, gcBefore, false).setUserDefined(true);
     }
 
     public int getEstimatedRemainingTasks()
@@ -163,18 +355,18 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         return estimatedRemainingTasks;
     }
 
-    private static List<Pair<SSTableReader, Long>> createSSTableAndLengthPairs(Collection<SSTableReader> collection)
+    public static List<Pair<SSTableReader, Long>> createSSTableAndLengthPairs(Iterable<SSTableReader> sstables)
     {
-        List<Pair<SSTableReader, Long>> tableLengthPairs = new ArrayList<Pair<SSTableReader, Long>>(collection.size());
-        for(SSTableReader table: collection)
-            tableLengthPairs.add(new Pair<SSTableReader, Long>(table, table.onDiskLength()));
-        return tableLengthPairs;
+        List<Pair<SSTableReader, Long>> sstableLengthPairs = new ArrayList<>(Iterables.size(sstables));
+        for(SSTableReader sstable : sstables)
+            sstableLengthPairs.add(Pair.create(sstable, sstable.onDiskLength()));
+        return sstableLengthPairs;
     }
 
     /*
      * Group files of similar size into buckets.
      */
-    static <T> List<List<T>> getBuckets(Collection<Pair<T, Long>> files, long minSSTableSize)
+    public static <T> List<List<T>> getBuckets(Collection<Pair<T, Long>> files, double bucketHigh, double bucketLow, long minSSTableSize)
     {
         // Sort the list in order to get deterministic results during the grouping below
         List<Pair<T, Long>> sortedFiles = new ArrayList<Pair<T, Long>>(files);
@@ -186,42 +378,40 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
             }
         });
 
-        Map<List<T>, Long> buckets = new HashMap<List<T>, Long>();
+        Map<Long, List<T>> buckets = new HashMap<Long, List<T>>();
 
+        outer:
         for (Pair<T, Long> pair: sortedFiles)
         {
             long size = pair.right;
 
-            boolean bFound = false;
             // look for a bucket containing similar-sized files:
             // group in the same bucket if it's w/in 50% of the average for this bucket,
             // or this file and the bucket are all considered "small" (less than `minSSTableSize`)
-            for (Entry<List<T>, Long> entry : buckets.entrySet())
+            for (Entry<Long, List<T>> entry : buckets.entrySet())
             {
-                List<T> bucket = entry.getKey();
-                long averageSize = entry.getValue();
-                if ((size > (averageSize / 2) && size < (3 * averageSize) / 2)
-                    || (size < minSSTableSize && averageSize < minSSTableSize))
+                List<T> bucket = entry.getValue();
+                long oldAverageSize = entry.getKey();
+                if ((size > (oldAverageSize * bucketLow) && size < (oldAverageSize * bucketHigh))
+                    || (size < minSSTableSize && oldAverageSize < minSSTableSize))
                 {
-                    // remove and re-add because adding changes the hash
-                    buckets.remove(bucket);
-                    long totalSize = bucket.size() * averageSize;
-                    averageSize = (totalSize + size) / (bucket.size() + 1);
+                    // remove and re-add under new new average size
+                    buckets.remove(oldAverageSize);
+                    long totalSize = bucket.size() * oldAverageSize;
+                    long newAverageSize = (totalSize + size) / (bucket.size() + 1);
                     bucket.add(pair.left);
-                    buckets.put(bucket, averageSize);
-                    bFound = true;
-                    break;
+                    buckets.put(newAverageSize, bucket);
+                    continue outer;
                 }
             }
+
             // no similar bucket found; put it in a new one
-            if (!bFound)
-            {
-                ArrayList<T> bucket = new ArrayList<T>();
-                bucket.add(pair.left);
-                buckets.put(bucket, size);
-            }
+            ArrayList<T> bucket = new ArrayList<T>();
+            bucket.add(pair.left);
+            buckets.put(size, bucket);
         }
-        return new LinkedList<List<T>>(buckets.keySet());
+
+        return new ArrayList<List<T>>(buckets.values());
     }
 
     private void updateEstimatedCompactionsByTasks(List<List<SSTableReader>> tasks)
@@ -235,19 +425,38 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         estimatedRemainingTasks = n;
     }
 
-    public long getMinSSTableSize()
-    {
-        return minSSTableSize;
-    }
-
-    public long getMaxSSTableSize()
+    public long getMaxSSTableBytes()
     {
         return Long.MAX_VALUE;
     }
 
-    public boolean isKeyExistenceExpensive(Set<? extends SSTable> sstablesToIgnore)
+    public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
     {
-        return cfs.getSSTables().size() - sstablesToIgnore.size() > 20;
+        Map<String, String> uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);
+        uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
+
+        uncheckedOptions.remove(CFPropDefs.KW_MINCOMPACTIONTHRESHOLD);
+        uncheckedOptions.remove(CFPropDefs.KW_MAXCOMPACTIONTHRESHOLD);
+
+        return uncheckedOptions;
+    }
+
+    @Override
+    public boolean shouldDefragment()
+    {
+        return true;
+    }
+
+    @Override
+    public void addSSTable(SSTableReader added)
+    {
+        sstables.add(added);
+    }
+
+    @Override
+    public void removeSSTable(SSTableReader sstable)
+    {
+        sstables.remove(sstable);
     }
 
     public String toString()

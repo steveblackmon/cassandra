@@ -17,9 +17,6 @@
  */
 package org.apache.cassandra.service;
 
-import java.io.IOException;
-
-import org.apache.cassandra.db.ReadResponse;
 import org.apache.cassandra.net.MessageIn;
 
 public interface IResponseResolver<TMessage, TResolved> {
@@ -32,17 +29,15 @@ public interface IResponseResolver<TMessage, TResolved> {
      * repairs . Hence you need to derive a response resolver based on your
      * needs from this interface.
      */
-    public TResolved resolve() throws DigestMismatchException, IOException;
+    public TResolved resolve() throws DigestMismatchException;
 
     public boolean isDataPresent();
 
     /**
      * returns the data response without comparing with any digests
      */
-    public TResolved getData() throws IOException;
+    public TResolved getData();
 
     public void preprocess(MessageIn<TMessage> message);
     public Iterable<MessageIn<TMessage>> getMessages();
-
-    public int getMaxLiveColumns();
 }

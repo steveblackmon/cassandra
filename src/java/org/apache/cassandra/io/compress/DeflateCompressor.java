@@ -17,8 +17,13 @@
  */
 package org.apache.cassandra.io.compress;
 
+import org.apache.cassandra.utils.ByteBufferUtil;
+
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
@@ -56,12 +61,17 @@ public class DeflateCompressor implements ICompressor
         };
     }
 
+    public Set<String> supportedOptions()
+    {
+        return Collections.emptySet();
+    }
+
     public int initialCompressedBufferLength(int chunkLength)
     {
         return chunkLength;
     }
 
-    public int compress(byte[] input, int inputOffset, int inputLength, ICompressor.WrappedArray output, int outputOffset) throws IOException
+    public int compress(byte[] input, int inputOffset, int inputLength, ICompressor.WrappedArray output, int outputOffset)
     {
         Deflater def = deflater.get();
         def.reset();
@@ -105,5 +115,19 @@ public class DeflateCompressor implements ICompressor
         {
             throw new IOException(e);
         }
+    }
+
+    public int uncompress(ByteBuffer input_, ByteBuffer output) throws IOException
+    {
+        if (!output.hasArray())
+            throw new IllegalArgumentException("DeflateCompressor doesn't work with direct byte buffers");
+
+        byte[] input = ByteBufferUtil.getArray(input_);
+        return uncompress(input, 0, input.length, output.array(), output.arrayOffset() + output.position());
+    }
+
+    public boolean useDirectOutputByteBuffers()
+    {
+        return false;
     }
 }

@@ -17,29 +17,24 @@
  */
 package org.apache.cassandra.cql3;
 
-import java.nio.ByteBuffer;
-import java.util.List;
-
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.thrift.CqlResult;
-import org.apache.cassandra.thrift.InvalidRequestException;
-import org.apache.cassandra.thrift.SchemaDisagreementException;
-import org.apache.cassandra.thrift.TimedOutException;
-import org.apache.cassandra.thrift.UnavailableException;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.exceptions.*;
 
 public interface CQLStatement
 {
     /**
      * Returns the number of bound terms in this statement.
      */
-    public int getBoundsTerms();
+    public int getBoundTerms();
 
     /**
      * Perform any access verification necessary for the statement.
      *
      * @param state the current client state
      */
-    public void checkAccess(ClientState state) throws InvalidRequestException;
+    public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException;
 
     /**
      * Perform additional validation required by the statment.
@@ -47,14 +42,22 @@ public interface CQLStatement
      *
      * @param state the current client state
      */
-    public void validate(ClientState state) throws InvalidRequestException, SchemaDisagreementException;
+    public void validate(ClientState state) throws RequestValidationException;
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
      *
-     * @param state the current client state
-     * @param variables the values for bounded variables. The implementation
-     * can assume that each bound term have a corresponding value.
+     * @param state the current query state
+     * @param options options for this query (consistency, variables, pageSize, ...)
      */
-    public CqlResult execute(ClientState state, List<ByteBuffer> variables) throws InvalidRequestException, UnavailableException, TimedOutException, SchemaDisagreementException;
+    public ResultMessage execute(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException;
+
+    /**
+     * Variante of execute used for internal query against the system tables, and thus only query the local node.
+     *
+     * @param state the current query state
+     */
+    public ResultMessage executeInternal(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException;
+
+    boolean usesFunction(String ksName, String functionName);
 }

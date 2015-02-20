@@ -19,7 +19,7 @@ package org.apache.cassandra.db;
 
 import java.net.UnknownHostException;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.ExecutionException;
 
 public interface HintedHandOffManagerMBean
 {
@@ -30,20 +30,20 @@ public interface HintedHandOffManagerMBean
     public void deleteHintsForEndpoint(final String host);
 
     /**
+     *  Truncate all the hints
+     */
+    public void truncateAllHints() throws ExecutionException, InterruptedException;
+
+    /**
      * List all the endpoints that this node has hints for.
      * @return set of endpoints; as Strings
      */
     public List<String> listEndpointsPendingHints();
 
-    /**
-     * List all the endpoints that this node has hints for, and
-     *  count the number of hints for each such endpoint.
-     *
-     * @return map of endpoint -> hint count
-     */
-    public Map<String, Integer> countPendingHints();
-
     /** force hint delivery to an endpoint **/
     public void scheduleHintDelivery(String host) throws UnknownHostException;
+
+    /** pause hints delivery process **/
+    public void pauseHintsDelivery(boolean b);
 }
 

@@ -26,30 +26,43 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 
-import org.apache.cassandra.config.Schema;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.config.KSMetaData;
-import org.apache.cassandra.db.Table;
+import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.*;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
+import org.apache.cassandra.dht.OrderPreservingPartitioner.StringToken;
+import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageServiceAccessor;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.*;
 
-public class SimpleStrategyTest extends SchemaLoader
+public class SimpleStrategyTest
 {
-    @Test
-    public void tryValidTable()
+    public static final String KEYSPACE1 = "SimpleStrategyTest";
+
+    @BeforeClass
+    public static void defineSchema() throws Exception
     {
-        assert Table.open("Keyspace1").getReplicationStrategy() != null;
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    SimpleStrategy.class,
+                                    KSMetaData.optsWithRF(1));
     }
 
     @Test
-    public void testBigIntegerEndpoints() throws UnknownHostException, ConfigurationException
+    public void tryValidKeyspace()
+    {
+        assert Keyspace.open(KEYSPACE1).getReplicationStrategy() != null;
+    }
+
+    @Test
+    public void testBigIntegerEndpoints() throws UnknownHostException
     {
         List<Token> endpointTokens = new ArrayList<Token>();
         List<Token> keyTokens = new ArrayList<Token>();
@@ -61,9 +74,9 @@ public class SimpleStrategyTest extends SchemaLoader
     }
 
     @Test
-    public void testStringEndpoints() throws UnknownHostException, ConfigurationException
+    public void testStringEndpoints() throws UnknownHostException
     {
-        IPartitioner partitioner = new OrderPreservingPartitioner();
+        IPartitioner partitioner = OrderPreservingPartitioner.instance;
 
         List<Token> endpointTokens = new ArrayList<Token>();
         List<Token> keyTokens = new ArrayList<Token>();
@@ -76,14 +89,14 @@ public class SimpleStrategyTest extends SchemaLoader
 
     // given a list of endpoint tokens, and a set of key tokens falling between the endpoint tokens,
     // make sure that the Strategy picks the right endpoints for the keys.
-    private void verifyGetNaturalEndpoints(Token[] endpointTokens, Token[] keyTokens) throws UnknownHostException, ConfigurationException
+    private void verifyGetNaturalEndpoints(Token[] endpointTokens, Token[] keyTokens) throws UnknownHostException
     {
         TokenMetadata tmd;
         AbstractReplicationStrategy strategy;
-        for (String table : Schema.instance.getNonSystemTables())
+        for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
         {
             tmd = new TokenMetadata();
-            strategy = getStrategy(table, tmd);
+            strategy = getStrategy(keyspaceName, tmd);
             List<InetAddress> hosts = new ArrayList<InetAddress>();
             for (int i = 0; i < endpointTokens.length; i++)
             {
@@ -105,7 +118,7 @@ public class SimpleStrategyTest extends SchemaLoader
     }
 
     @Test
-    public void testGetEndpointsDuringBootstrap() throws UnknownHostException, ConfigurationException
+    public void testGetEndpointsDuringBootstrap() throws UnknownHostException
     {
         // the token difference will be RING_SIZE * 2.
         final int RING_SIZE = 10;
@@ -135,17 +148,17 @@ public class SimpleStrategyTest extends SchemaLoader
         tmd.addBootstrapToken(bsToken, bootstrapEndpoint);
 
         AbstractReplicationStrategy strategy = null;
-        for (String table : Schema.instance.getNonSystemTables())
+        for (String keyspaceName : Schema.instance.getNonSystemKeyspaces())
         {
-            strategy = getStrategy(table, tmd);
+            strategy = getStrategy(keyspaceName, tmd);
 
-            StorageService.calculatePendingRanges(strategy, table);
+            PendingRangeCalculatorService.calculatePendingRanges(strategy, keyspaceName);
 
             int replicationFactor = strategy.getReplicationFactor();
 
             for (int i = 0; i < keyTokens.length; i++)
             {
-                Collection<InetAddress> endpoints = tmd.getWriteEndpoints(keyTokens[i], table, strategy.getNaturalEndpoints(keyTokens[i]));
+                Collection<InetAddress> endpoints = tmd.getWriteEndpoints(keyTokens[i], keyspaceName, strategy.getNaturalEndpoints(keyTokens[i]));
                 assertTrue(endpoints.size() >= replicationFactor);
 
                 for (int j = 0; j < replicationFactor; j++)
@@ -165,21 +178,11 @@ public class SimpleStrategyTest extends SchemaLoader
         StorageServiceAccessor.setTokenMetadata(oldTmd);
     }
 
-    private AbstractReplicationStrategy getStrategyWithNewTokenMetadata(AbstractReplicationStrategy strategy, TokenMetadata newTmd) throws ConfigurationException
+    private AbstractReplicationStrategy getStrategy(String keyspaceName, TokenMetadata tmd)
     {
+        KSMetaData ksmd = Schema.instance.getKSMetaData(keyspaceName);
         return AbstractReplicationStrategy.createReplicationStrategy(
-                strategy.table,
-                strategy.getClass().getName(),
-                newTmd,
-                strategy.snitch,
-                strategy.configOptions);
-    }
-
-    private AbstractReplicationStrategy getStrategy(String table, TokenMetadata tmd) throws ConfigurationException
-    {
-        KSMetaData ksmd = Schema.instance.getKSMetaData(table);
-        return AbstractReplicationStrategy.createReplicationStrategy(
-                table,
+                keyspaceName,
                 ksmd.strategyClass,
                 tmd,
                 new SimpleSnitch(),

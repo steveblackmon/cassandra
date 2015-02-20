@@ -18,55 +18,57 @@
 package org.apache.cassandra.io.util;
 
 import java.io.File;
-import java.io.IOError;
-import java.io.IOException;
+
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
 
 public class BufferedSegmentedFile extends SegmentedFile
 {
     public BufferedSegmentedFile(String path, long length)
     {
-        super(path, length);
+        super(new Cleanup(path), path, length);
+    }
+
+    private BufferedSegmentedFile(BufferedSegmentedFile copy)
+    {
+        super(copy);
+    }
+
+    private static class Cleanup extends SegmentedFile.Cleanup
+    {
+        protected Cleanup(String path)
+        {
+            super(path);
+        }
+        public void tidy() throws Exception
+        {
+
+        }
     }
 
     public static class Builder extends SegmentedFile.Builder
     {
-        /**
-         * Adds a position that would be a safe place for a segment boundary in the file. For a block/row based file
-         * format, safe boundaries are block/row edges.
-         * @param boundary The absolute position of the potential boundary in the file.
-         */
         public void addPotentialBoundary(long boundary)
         {
             // only one segment in a standard-io file
         }
 
-        /**
-         * Called after all potential boundaries have been added to apply this Builder to a concrete file on disk.
-         * @param path The file on disk.
-         */
-        public SegmentedFile complete(String path)
+        public SegmentedFile complete(String path, long overrideLength, boolean isFinal)
         {
-            long length = new File(path).length();
+            assert !isFinal || overrideLength <= 0;
+            long length = overrideLength > 0 ? overrideLength : new File(path).length();
             return new BufferedSegmentedFile(path, length);
         }
     }
 
     public FileDataInput getSegment(long position)
     {
-        try
-        {
-            RandomAccessReader file = RandomAccessReader.open(new File(path));
-            file.seek(position);
-            return file;
-        }
-        catch (IOException e)
-        {
-            throw new IOError(e);
-        }
+        RandomAccessReader reader = RandomAccessReader.open(new File(path));
+        reader.seek(position);
+        return reader;
     }
 
-    public void cleanup()
+    public BufferedSegmentedFile sharedCopy()
     {
-        // nothing to do
+        return new BufferedSegmentedFile(this);
     }
 }

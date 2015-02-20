@@ -27,33 +27,27 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.*;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.ConfigurationException;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.net.sink.IMessageSink;
-import org.apache.cassandra.net.sink.SinkManager;
-import org.apache.cassandra.streaming.StreamUtil;
+import org.apache.cassandra.sink.SinkManager;
 import org.apache.cassandra.utils.FBUtilities;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class RemoveTest
 {
-    static final IPartitioner partitioner = new RandomPartitioner();
+    static final IPartitioner partitioner = RandomPartitioner.instance;
     StorageService ss = StorageService.instance;
     TokenMetadata tmd = ss.getTokenMetadata();
     static IPartitioner oldPartitioner;
@@ -65,7 +59,7 @@ public class RemoveTest
     UUID removalId;
 
     @BeforeClass
-    public static void setupClass() throws IOException
+    public static void setupClass() throws ConfigurationException
     {
         oldPartitioner = StorageService.instance.setPartitionerUnsafe(partitioner);
         SchemaLoader.loadSchema();
@@ -75,7 +69,6 @@ public class RemoveTest
     public static void tearDownClass()
     {
         StorageService.instance.setPartitionerUnsafe(oldPartitioner);
-        SchemaLoader.stopGossiper();
     }
 
     @Before
@@ -88,10 +81,6 @@ public class RemoveTest
 
         MessagingService.instance().listen(FBUtilities.getBroadcastAddress());
         Gossiper.instance.start(1);
-        for (int i = 0; i < 6; i++)
-        {
-            Gossiper.instance.initializeNodeUnsafe(hosts.get(i), 1);
-        }
         removalhost = hosts.get(5);
         hosts.remove(removalhost);
         removalId = hostIds.get(5);
@@ -123,9 +112,6 @@ public class RemoveTest
     @Test
     public void testRemoveHostId() throws InterruptedException
     {
-        ReplicationSink rSink = new ReplicationSink();
-        SinkManager.add(rSink);
-
         // start removal in background and send replication confirmations
         final AtomicBoolean success = new AtomicBoolean(false);
         Thread remover = new Thread()
@@ -162,26 +148,5 @@ public class RemoveTest
 
         assertTrue(success.get());
         assertTrue(tmd.getLeavingEndpoints().isEmpty());
-    }
-
-    /**
-     * sink that captures STREAM_REQUEST messages and calls finishStreamRequest on it
-     */
-    class ReplicationSink implements IMessageSink
-    {
-        public MessageIn handleMessage(MessageIn msg, String id, InetAddress to)
-        {
-            if (!msg.verb.equals(MessagingService.Verb.STREAM_REQUEST))
-                return msg;
-
-            StreamUtil.finishStreamRequest(msg, to);
-
-            return null;
-        }
-
-        public MessageOut handleMessage(MessageOut msg, String id, InetAddress to)
-        {
-            return msg;
-        }
     }
 }

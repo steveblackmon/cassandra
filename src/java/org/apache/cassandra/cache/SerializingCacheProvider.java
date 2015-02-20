@@ -18,38 +18,34 @@
 package org.apache.cassandra.cache;
 
 import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOError;
 import java.io.IOException;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
 
-public class SerializingCacheProvider implements IRowCacheProvider
+public class SerializingCacheProvider implements CacheProvider<RowCacheKey, IRowCacheEntry>
 {
-    public ICache<RowCacheKey, IRowCacheEntry> create(int capacity, boolean useMemoryWeigher)
+    public ICache<RowCacheKey, IRowCacheEntry> create()
     {
-        return new SerializingCache<RowCacheKey, IRowCacheEntry>(capacity, useMemoryWeigher, new RowCacheSerializer());
+        return SerializingCache.create(DatabaseDescriptor.getRowCacheSizeInMB() * 1024 * 1024, new RowCacheSerializer());
     }
 
-    private static class RowCacheSerializer implements ISerializer<IRowCacheEntry>
+    // Package protected for tests
+    static class RowCacheSerializer implements ISerializer<IRowCacheEntry>
     {
-        public void serialize(IRowCacheEntry cf, DataOutput out)
+        public void serialize(IRowCacheEntry entry, DataOutputPlus out) throws IOException
         {
-            assert cf != null; // unlike CFS we don't support nulls, since there is no need for that in the cache
-            try
-            {
-                out.writeBoolean(cf instanceof RowCacheSentinel);
-                if (cf instanceof RowCacheSentinel)
-                    out.writeLong(((RowCacheSentinel) cf).sentinelId);
-                else
-                    ColumnFamily.serializer.serialize((ColumnFamily) cf, out);
-            }
-            catch (IOException e)
-            {
-                throw new IOError(e);
-            }
+            assert entry != null; // unlike CFS we don't support nulls, since there is no need for that in the cache
+            boolean isSentinel = entry instanceof RowCacheSentinel;
+            out.writeBoolean(isSentinel);
+            if (isSentinel)
+                out.writeLong(((RowCacheSentinel) entry).sentinelId);
+            else
+                ColumnFamily.serializer.serialize((ColumnFamily) entry, out, MessagingService.current_version);
         }
 
         public IRowCacheEntry deserialize(DataInput in) throws IOException
@@ -57,16 +53,16 @@ public class SerializingCacheProvider implements IRowCacheProvider
             boolean isSentinel = in.readBoolean();
             if (isSentinel)
                 return new RowCacheSentinel(in.readLong());
-            return ColumnFamily.serializer.deserialize(in);
+            return ColumnFamily.serializer.deserialize(in, MessagingService.current_version);
         }
 
-        public long serializedSize(IRowCacheEntry cf, TypeSizes typeSizes)
+        public long serializedSize(IRowCacheEntry entry, TypeSizes typeSizes)
         {
             int size = typeSizes.sizeof(true);
-            if (cf instanceof RowCacheSentinel)
-                size += typeSizes.sizeof(((RowCacheSentinel) cf).sentinelId);
+            if (entry instanceof RowCacheSentinel)
+                size += typeSizes.sizeof(((RowCacheSentinel) entry).sentinelId);
             else
-                size += ColumnFamily.serializer.serializedSize((ColumnFamily) cf, typeSizes);
+                size += ColumnFamily.serializer.serializedSize((ColumnFamily) entry, typeSizes, MessagingService.current_version);
             return size;
         }
     }

@@ -19,25 +19,26 @@
 package org.apache.cassandra.gms;
 
 import org.apache.cassandra.AbstractSerializationsTester;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.DataOutputStreamAndChannel;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.junit.Test;
 
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 public class SerializationsTest extends AbstractSerializationsTester
 {
     private void testEndpointStateWrite() throws IOException
     {
-        DataOutputStream out = getOutput("gms.EndpointState.bin");
+        DataOutputStreamAndChannel out = getOutput("gms.EndpointState.bin");
         HeartBeatState.serializer.serialize(Statics.HeartbeatSt, out, getVersion());
         EndpointState.serializer.serialize(Statics.EndpointSt, out, getVersion());
         VersionedValue.serializer.serialize(Statics.vv0, out, getVersion());
@@ -72,9 +73,9 @@ public class SerializationsTest extends AbstractSerializationsTester
         states.put(InetAddress.getByName("127.0.0.2"), Statics.EndpointSt);
         GossipDigestAck ack = new GossipDigestAck(Statics.Digests, states);
         GossipDigestAck2 ack2 = new GossipDigestAck2(states);
-        GossipDigestSyn syn = new GossipDigestSyn("Not a real cluster name", Statics.Digests);
+        GossipDigestSyn syn = new GossipDigestSyn("Not a real cluster name", StorageService.getPartitioner().getClass().getCanonicalName(), Statics.Digests);
 
-        DataOutputStream out = getOutput("gms.Gossip.bin");
+        DataOutputStreamAndChannel out = getOutput("gms.Gossip.bin");
         for (GossipDigest gd : Statics.Digests)
             GossipDigest.serializer.serialize(gd, out, getVersion());
         GossipDigestAck.serializer.serialize(ack, out, getVersion());
@@ -112,7 +113,7 @@ public class SerializationsTest extends AbstractSerializationsTester
         private static EndpointState EndpointSt = new EndpointState(HeartbeatSt);
         private static VersionedValue.VersionedValueFactory vvFact = new VersionedValue.VersionedValueFactory(StorageService.getPartitioner());
         private static VersionedValue vv0 = vvFact.load(23d);
-        private static VersionedValue vv1 = vvFact.bootstrapping(StorageService.getPartitioner().getRandomToken(), UUID.randomUUID());
+        private static VersionedValue vv1 = vvFact.bootstrapping(Collections.<Token>singleton(StorageService.getPartitioner().getRandomToken()));
         private static List<GossipDigest> Digests = new ArrayList<GossipDigest>();
 
         {

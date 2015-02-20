@@ -22,18 +22,10 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.AbstractType;
 
-public interface IPartitioner<T extends Token>
+public interface IPartitioner
 {
-    /**
-     * @deprecated Used by SSTables before version 'e'.
-     *
-     * Convert the on disk representation to a DecoratedKey object
-     * @param key On disk representation
-     * @return DecoratedKey object
-     */
-    public DecoratedKey convertFromDiskFormat(ByteBuffer key);
-
     /**
      * Transform key to object representation of the on-disk format.
      *
@@ -51,21 +43,22 @@ public interface IPartitioner<T extends Token>
     public Token midpoint(Token left, Token right);
 
     /**
-     * @return The minimum possible Token in the range that is being partitioned.
+     * @return A Token smaller than all others in the range that is being partitioned.
+     * Not legal to assign to a node or key.  (But legal to use in range scans.)
      */
-    public T getMinimumToken();
+    public Token getMinimumToken();
 
     /**
      * @return a Token that can be used to route a given key
      * (This is NOT a method to create a Token from its string representation;
      * for that, use TokenFactory.fromString.)
      */
-    public T getToken(ByteBuffer key);
+    public Token getToken(ByteBuffer key);
 
     /**
      * @return a randomly generated token
      */
-    public T getRandomToken();
+    public Token getRandomToken();
 
     public Token.TokenFactory getTokenFactory();
 
@@ -84,5 +77,5 @@ public interface IPartitioner<T extends Token>
      */
     public Map<Token, Float> describeOwnership(List<Token> sortedTokens);
 
-    public <T extends RingPosition> T minValue(Class<T> klass);
+    public AbstractType<?> getTokenValidator();
 }
